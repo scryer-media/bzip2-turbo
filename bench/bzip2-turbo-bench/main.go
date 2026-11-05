@@ -33,32 +33,34 @@ type codecPolicy struct {
 	Policy             string `json:"policy"`
 }
 type row struct {
-	Settings             string      `json:"settings"`
-	ReferencePolicy      codecPolicy `json:"reference_settings"`
-	OursPolicy           codecPolicy `json:"ours_settings"`
-	SettingsMatch        bool        `json:"block_and_pass_settings_match"`
-	ReferenceName        string      `json:"reference_name"`
-	ReferenceThreads     int         `json:"reference_threads"`
-	Corpus               string      `json:"corpus"`
-	API                  string      `json:"api"`
-	Level                int         `json:"level"`
-	Mode                 string      `json:"mode"`
-	Threads              int         `json:"threads"`
-	Input                identity    `json:"input"`
-	InputBytes           int64       `json:"input_bytes"`
-	ReferenceOutput      identity    `json:"reference_encoded_output"`
-	OursOutput           identity    `json:"ours_encoded_output"`
-	ReferenceOutputBytes int64       `json:"reference_encoded_bytes"`
-	OursOutputBytes      int64       `json:"ours_encoded_bytes"`
-	Validation           string      `json:"validation"`
-	Reference            []sample    `json:"reference_runs"`
-	Ours                 []sample    `json:"ours_runs"`
-	ReferenceMedian      float64     `json:"reference_median_wall_seconds"`
-	OursMedian           float64     `json:"ours_median_wall_seconds"`
-	ReferenceOverOurs    float64     `json:"reference_over_ours_wall_seconds"`
-	ReferenceRSSMedian   *float64    `json:"reference_median_peak_rss_bytes,omitempty"`
-	OursRSSMedian        *float64    `json:"ours_median_peak_rss_bytes,omitempty"`
-	ReferenceOverOursRSS *float64    `json:"reference_over_ours_peak_rss,omitempty"`
+	Settings                 string      `json:"settings"`
+	ReferencePolicy          codecPolicy `json:"reference_settings"`
+	OursPolicy               codecPolicy `json:"ours_settings"`
+	SettingsMatch            bool        `json:"block_and_pass_settings_match"`
+	ReferenceName            string      `json:"reference_name"`
+	ReferenceThreads         int         `json:"reference_threads"`
+	Corpus                   string      `json:"corpus"`
+	API                      string      `json:"api"`
+	Level                    int         `json:"level"`
+	Mode                     string      `json:"mode"`
+	Threads                  int         `json:"threads"`
+	Input                    identity    `json:"input"`
+	InputBytes               int64       `json:"input_bytes"`
+	ReferenceOutput          identity    `json:"reference_encoded_output"`
+	OursOutput               identity    `json:"ours_encoded_output"`
+	ReferenceOutputBytes     int64       `json:"reference_encoded_bytes"`
+	OursOutputBytes          int64       `json:"ours_encoded_bytes"`
+	ReferenceEncodedFraction float64     `json:"reference_encoded_fraction,omitempty"`
+	OursEncodedFraction      float64     `json:"ours_encoded_fraction,omitempty"`
+	Validation               string      `json:"validation"`
+	Reference                []sample    `json:"reference_runs"`
+	Ours                     []sample    `json:"ours_runs"`
+	ReferenceMedian          float64     `json:"reference_median_wall_seconds"`
+	OursMedian               float64     `json:"ours_median_wall_seconds"`
+	ReferenceOverOurs        float64     `json:"reference_over_ours_wall_seconds"`
+	ReferenceRSSMedian       *float64    `json:"reference_median_peak_rss_bytes,omitempty"`
+	OursRSSMedian            *float64    `json:"ours_median_peak_rss_bytes,omitempty"`
+	ReferenceOverOursRSS     *float64    `json:"reference_over_ours_peak_rss,omitempty"`
 }
 type report struct {
 	Settings                                                                              string `json:"settings"`
@@ -68,6 +70,7 @@ type report struct {
 	Repeats, Warmups                                                                      int
 	RSSSupported                                                                          bool
 	PerformanceCounters                                                                   string
+	Fixtures                                                                              []fixtureInfo `json:"fixtures,omitempty"`
 	Rows                                                                                  []row
 	Skipped                                                                               []scenario
 }
@@ -77,6 +80,8 @@ func main() {
 	args := os.Args[1:]
 	if len(args) > 0 && args[0] == "legacy-corpus" {
 		command, args = legacyCorpus, args[1:]
+	} else if len(args) > 0 && args[0] == "fixture" {
+		command, args = fixture, args[1:]
 	} else if len(args) > 0 && args[0] == "json-corpus" {
 		command, args = jsonCorpus, args[1:]
 	} else if len(args) > 0 && args[0] == "legacy-compare" {

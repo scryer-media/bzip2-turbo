@@ -23,6 +23,86 @@ To keep an external fixture: `go run . json-corpus --output /tmp/text.json
 --bytes 33554432`. Historical `legacy-corpus` text remains repeated-sentence
 periodic stress for reproducing old evidence, not the main text workload.
 
+The expanded comparison uses five explicitly selected fixtures:
+
+| Kind | Workload | Extent |
+| --- | --- | --- |
+| `json` | The varied JSON generator above (`text` remains its suite alias) | Exact requested bytes |
+| `repeated-text` | One continuous 71-byte sentence, retained as periodic stress | Exact requested bytes |
+| `logs` | Seeded logfmt records with varied UTC times, severity, services, request IDs, paths, status, sizes and messages | Complete records, at least the requested bytes |
+| `mkv` | Real Big Buck Bunny H.264/AAC footage, stream-copy remuxed to Matroska | Fixed 150-second excerpt; actual container bytes |
+| `elf` | A real Go standard-library JSON event summarizer, cross-compiled for Linux AMD64 v1 | Actual linked ELF bytes |
+
+Generate each once outside the checkout, keeping its JSON receipt:
+
+```sh
+mkdir -p /tmp/bzip2-fixtures
+go run . fixture --kind json --output /tmp/bzip2-fixtures/json.json --bytes 16777216 > /tmp/bzip2-fixtures/json.receipt.json
+go run . fixture --kind repeated-text --output /tmp/bzip2-fixtures/repeated.txt --bytes 16777216 > /tmp/bzip2-fixtures/repeated.receipt.json
+go run . fixture --kind logs --output /tmp/bzip2-fixtures/logs.log --bytes 16777216 > /tmp/bzip2-fixtures/logs.receipt.json
+go run . fixture --kind mkv --source-file /tmp/bbb-source.zip --output /tmp/bzip2-fixtures/film.mkv > /tmp/bzip2-fixtures/film.receipt.json
+go run . fixture --kind elf --output /tmp/bzip2-fixtures/program.elf > /tmp/bzip2-fixtures/program.receipt.json
+```
+
+The primary MKV source is the pinned official Blender ZIP or its verified MP4
+member. Without `--source-file`, downloading requires explicit `--download-source`;
+no generator installs tools or downloads a toolchain. Only the exact ZIP member
+is extracted, with bounded sizes and SHA-256 checks for archive, MP4 and canonical
+MKV. The excerpt starts at 30 seconds, lasts 150 seconds, and copies video/audio
+without re-encoding. It retains attribution in container metadata and the receipt:
+Copyright 2008 Blender Foundation / www.bigbuckbunny.org;
+[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
+See the [film project](https://peach.blender.org/about/) for source attribution.
+The changed work is a trimmed, remuxed excerpt with replaced metadata.
+The canonical MKV SHA-256 is
+`a88533696bc7ff1bb9847af06ccf37aafa7c781ea7d94eefbd7c8ff10d34525a`.
+The canonical remux was verified with FFmpeg 8.1.1. A different output is
+rejected; use canonical bytes or a matching FFmpeg build.
+
+`--kind mkv --source noise` retains an optional synthetic alternative: a fixed
+xorshift64* stream becomes 256x256 grayscale frames, FFV1 level 3 with range
+coding, then a metadata-free Matroska container. Explicit bitexact flags, one
+thread and disabled CPU dispatch avoid incidental run-to-run variation. ffprobe
+checks codec, dimensions, frame count and actual byte extent; a full FFmpeg
+lossless decode must match the seeded raw SHA-256. Both media modes undergo full
+decode validation. Neither container nor ELF is truncated or padded to a target.
+
+ELF generation uses existing Go with `GOTOOLCHAIN=local`, no external modules,
+CGO disabled, Linux AMD64 v1, `-trimpath`, `-buildvcs=false` and an empty build ID.
+The Go version, fixed build flags and embedded program source hash are recorded;
+reproducing an ELF requires that same Go version. Tests build in two independent
+temporary directories and require equal hashes, valid ELF text/load segments,
+no build ID or private build paths, and material compressibility. The generated
+ELF is parsed, never executed by the generator.
+
+Copy the canonical fixture **and its receipt** unchanged to each benchmark host.
+Receipts record actual size/hash and applicable seeds, generator versions,
+commands, media validation and public-source licensing. Bind them to timed runs:
+
+```sh
+go run . run --input /tmp/bzip2-fixtures/film.mkv --fixture-manifest /tmp/bzip2-fixtures/film.receipt.json --level 5 --threads 1 --repeats 4 --out /tmp/film-run.json
+```
+
+The receipt SHA-256 and actual bytes must match before measurement. Imported ELF
+is parsed and imported MKV needs a bounded Matroska header check; the primary
+movie also must match its pinned canonical SHA-256 and source attribution.
+Receipts record provenance, not a trusted attestation of arbitrary user files.
+No FFmpeg installation is required to benchmark copied canonical inputs. Reports retain
+fixture provenance and `reference_encoded_fraction` / `ours_encoded_fraction`
+(encoded bytes divided by actual input bytes). MKV rows require a measured 7zz
+fraction of at least 0.99; ELF rows require at most 0.90. These are measured
+compressibility checks, not assumptions based on file extensions. Compare the
+same fixture hashes across architectures rather than regenerating with different
+FFmpeg or Go releases. Raw fixture bytes, generated sources and binaries remain
+outside Git; only generator source and tests are checked in.
+
+Suite defaults stay `text,random,periodic,runs` and do not require extra tools.
+The generic `periodic` corpus is a 256-byte pattern, distinct from the 71-byte
+`repeated-text` stress case. To generate the expanded suite explicitly, use
+`--corpora json,repeated-text,logs,mkv,elf --mkv-source-file /tmp/bbb-source.zip`;
+`--mkv-source noise` explicitly selects synthetic media instead. Canonical
+single-generation plus receipt-bound `run` commands is preferred across hosts.
+
 Build the native example and both isolated reference builds as documented in
 `../../tools/bzip2-reference/README.md`, then run from this directory:
 
