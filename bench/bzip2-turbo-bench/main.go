@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -68,6 +67,7 @@ type report struct {
 	Platform, StartedUTC, SourceSHA256, Revision, ReferenceVersion, RSSScope, TimingScope string
 	Driver, Reference, Pure, C                                                            identity
 	Repeats, Warmups                                                                      int
+	RSSMethod                                                                             string
 	RSSSupported                                                                          bool
 	PerformanceCounters                                                                   string
 	Fixtures                                                                              []fixtureInfo `json:"fixtures,omitempty"`
@@ -201,7 +201,16 @@ func outside(path, root string) error {
 	}
 	return nil
 }
+
+type processUsage struct {
+	UserSeconds, SystemSeconds float64
+	RSSBytes                   *uint64
+}
+
 func process(ctx context.Context, args []string, input, output string) (sample, error) {
+	if len(args) == 0 {
+		return sample{}, errors.New("empty process command")
+	}
 	in, e := os.Open(input)
 	if e != nil {
 		return sample{}, e
@@ -212,7 +221,11 @@ func process(ctx context.Context, args []string, input, output string) (sample, 
 		return sample{}, e
 	}
 	defer out.Close()
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd, collect, cleanup, e := measuredCommand(ctx, args)
+	if e != nil {
+		return sample{}, e
+	}
+	defer cleanup()
 	cmd.Stdin = in
 	cmd.Stdout = out
 	var stderr bytes.Buffer
@@ -221,9 +234,16 @@ func process(ctx context.Context, args []string, input, output string) (sample, 
 	e = cmd.Run()
 	elapsed := time.Since(started).Seconds()
 	if e != nil {
+		if ctx.Err() != nil {
+			return sample{}, fmt.Errorf("%s failed: %w: %w: %s", filepath.Base(args[0]), ctx.Err(), e, stderr.String())
+		}
 		return sample{}, fmt.Errorf("%s failed: %w: %s", filepath.Base(args[0]), e, stderr.String())
 	}
-	return sample{Seconds: elapsed, UserSeconds: cmd.ProcessState.UserTime().Seconds(), SystemSeconds: cmd.ProcessState.SystemTime().Seconds(), RSSBytes: peakRSS(cmd.ProcessState)}, nil
+	usage, e := collect(cmd.ProcessState)
+	if e != nil {
+		return sample{}, fmt.Errorf("%s resource report failed: %w", filepath.Base(args[0]), e)
+	}
+	return sample{Seconds: elapsed, UserSeconds: usage.UserSeconds, SystemSeconds: usage.SystemSeconds, RSSBytes: usage.RSSBytes}, nil
 }
 func equal(a, b string) error {
 	ha, e := digest(a)

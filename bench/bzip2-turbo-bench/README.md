@@ -154,9 +154,30 @@ encoded sizes and identities, binary identities, and a digest of codec, driver,
 reference manifests/lockfiles and Go harness source. Values above one favor turbo.
 The optional turbo compatibility API retains the turbo contender identity.
 
-Wall time includes process startup and I/O. RSS measures one child, excluding
-descendants; macOS bytes and Linux KiB are normalized to bytes. Unsupported
-platforms omit RSS. Hardware counters and host idleness are not assessed.
+Linux schema-5 reports require `RSSMethod: gnu-time-child-v1`. Each command is
+launched through the installed GNU `/usr/bin/time`; RSS and CPU come from that
+reporter's **own child report**, written to a private 0600 file in a 0700 temporary
+directory. Linux KiB are converted to bytes. Do not read the Go `ProcessState`
+RSS of either codec or reporter: Linux can retain the Go parent's pre-exec
+address-space high-water mark across exec, creating an artificial RSS floor.
+GNU time's command resource accounting is not simultaneous aggregate tree RSS;
+these codec commands do not launch subprocess workloads.
+
+Wall timing remains Go's high-resolution monotonic clock and includes GNU time
+startup, codec startup and I/O. GNU time's codec user/system CPU fields have
+hundredth-second precision and may be zero for short commands. Codec errors
+remain failures. Missing, malformed, zero or overflowing RSS fails closed; no
+fallback uses the old direct-rusage measurement. A deadline kills the reporter
+and codec's entire task-owned process group. Temporary reports are removed.
+
+Darwin retains native byte-unit child rusage. Unsupported platforms omit RSS.
+Schema-4 Linux RSS from direct Go rusage is invalid for codec-memory comparisons;
+preserve those raw reports with that label, never subtract a floor or replace
+fields in place. Corrected runs require the new method and source provenance.
+The Linux regression keeps 64/128 MiB resident in the Go parent, verifies a small
+child stays small, and also checks a genuinely large child and timeout teardown:
+`go test -v -run 'TestGNUTimeReport|TestLinuxRSS|TestLinuxReporter|TestLinuxProcess' .`.
+Hardware counters and host idleness are not assessed.
 Tiny inputs only verify the harness and correctness; they are not performance
 evidence. Raw reports and corpus files must remain outside the repository,
 including through symlink aliases. No optimization is performed by this harness.

@@ -500,7 +500,7 @@ func run(args []string) error {
 	if b, e := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output(); e == nil {
 		revision = strings.TrimSpace(string(b))
 	}
-	r := report{Schema: 4, Settings: *settings, Pure: pureID, C: cID, Platform: runtime.GOOS + "/" + runtime.GOARCH, StartedUTC: time.Now().UTC().Format(time.RFC3339), SourceSHA256: source, Revision: revision, ReferenceVersion: strings.TrimSpace(string(version)), Driver: driverID, Reference: referenceID, Repeats: *repeats, Warmups: *warmups, RSSSupported: rssSupported, RSSScope: rssDescription, TimingScope: "wall seconds including process startup and I/O; CPU seconds from ProcessState; host idleness not assessed", PerformanceCounters: "not collected: architecture/OS hardware counters require a separate diagnostic collector", Skipped: skipped}
+	r := report{Schema: 5, Settings: *settings, Pure: pureID, C: cID, Platform: runtime.GOOS + "/" + runtime.GOARCH, StartedUTC: time.Now().UTC().Format(time.RFC3339), SourceSHA256: source, Revision: revision, ReferenceVersion: strings.TrimSpace(string(version)), Driver: driverID, Reference: referenceID, Repeats: *repeats, Warmups: *warmups, RSSMethod: rssMethod, RSSSupported: rssSupported, RSSScope: rssDescription, TimingScope: processTimingDescription, PerformanceCounters: "not collected: architecture/OS hardware counters require a separate diagnostic collector", Skipped: skipped}
 	if command == "toolchain" {
 		b, e := json.MarshalIndent(r, "", "  ")
 		if e == nil {
