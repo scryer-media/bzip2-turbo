@@ -2,7 +2,7 @@
 
 Use `bench/bzip2-turbo-bench`, the same Go harness pattern as the other codec
 repositories. Build the Rust example in release mode and use the pinned 7-Zip
-reference from `.github/scripts/build-bzip2-oracle.sh`. The four contenders are
+reference built with `go run .github/scripts/tool.go oracle`. The four contenders are
 7zz, turbo, standard Rust bzip2 with its pure Rust backend, and standard Rust
 bzip2 with its bundled static C backend. See the harness README
 for commands. Keep generated inputs, JSON and profiles outside the checkout.
@@ -55,8 +55,15 @@ The first-pass baseline is frozen by operator instruction. No further parity
 optimization is required for this preparation. Full cross-platform 0% regression
 parity remains an unachieved future objective; selected passing smoke rows do not
 establish it. Preserve every validated improvement and unsuccessful experiment's
-evidence. Existing Python corpus/comparison tools are retained under `bench/`
-for reproducibility of the pre-extraction work.
+evidence. The Go harness retains `legacy-corpus` and `legacy-compare` commands
+for the pre-extraction two-process protocol. Run from
+`bench/bzip2-turbo-bench`: `go run . legacy-corpus DESTINATION --mib 32`
+and `go run . legacy-compare --codec EXE --oracle EXE --input FILE --results JSON`.
+The corpus bytes, CLI options, report keys, alternating order, Darwin resource
+counters and strict unrounded parity criterion match the historical tools.
+Platform identity fields use Go OS/architecture names; supply `--hardware` for
+a precise machine description. Four 1 MiB corpus SHA-256 characterizations and
+a tiny comparison schema/identity smoke check verified the migration.
 
 ## ARM CRC correction
 

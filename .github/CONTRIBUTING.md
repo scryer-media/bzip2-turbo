@@ -3,7 +3,7 @@
 Read AGENTS.md before editing. Use a GitFlow work branch and SSH-signed
 commits, enable the repository hooks, and keep private paths and credentials
 out of all tracked files and messages. Required tools are Rust from
-rust-toolchain.toml, Python 3, gitleaks and cargo-nextest 0.9.143.
+rust-toolchain.toml, Go, gitleaks and cargo-nextest 0.9.143.
 
 Run formatting, Clippy, native tests with --no-fail-fast and doctests as
 specified in AGENTS.md. Native conformance tests require 7-Zip; set

@@ -73,7 +73,14 @@ type report struct {
 }
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	command := run
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "legacy-corpus" {
+		command, args = legacyCorpus, args[1:]
+	} else if len(args) > 0 && args[0] == "legacy-compare" {
+		command, args = legacyCompare, args[1:]
+	}
+	if err := command(args); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

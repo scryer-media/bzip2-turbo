@@ -21,15 +21,17 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - run: python3 .github/scripts/privacy.py
+      - run: go test .github/scripts/tool.go .github/scripts/tool_test.go
+      - run: go vet .github/scripts/tool.go .github/scripts/tool_test.go
+      - run: go run .github/scripts/tool.go privacy
       - name: Commit message privacy
         shell: bash
         run: |
           git log --format=%B > "$RUNNER_TEMP/messages"
-          python3 .github/scripts/privacy.py --message "$RUNNER_TEMP/messages"
+          go run .github/scripts/tool.go privacy --message "$RUNNER_TEMP/messages"
       - name: Secret scanning
         run: |
-          python3 .github/scripts/scan-secrets.py --docker
+          go run .github/scripts/tool.go scan-secrets --docker
           docker run --rm -v "$PWD:/repo:ro" zricethezav/gitleaks:v8.30.1 git /repo --redact --config=/repo/.gitleaks.toml
           git log --format=%B | docker run --rm -i -v "$PWD:/repo:ro" zricethezav/gitleaks:v8.30.1 stdin --redact --config=/repo/.gitleaks.toml
   fmt:
@@ -67,7 +69,7 @@ jobs:
           tool: cargo-nextest@0.9.143
       - name: Build pinned 7-Zip 26.04 reference (Linux and macOS)
         if: runner.os != 'Windows'
-        run: bash .github/scripts/build-bzip2-oracle.sh
+        run: go run .github/scripts/tool.go oracle
       - name: Locate installed interoperability reference (Windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -80,6 +82,8 @@ jobs:
             echo 'Required 7-Zip interoperability oracle unavailable' >&2
             exit 1
           fi
+          # Native Rust processes need a Windows path, not Git Bash /c/... paths.
+          oracle="$(cygpath -m "$oracle")"
           echo "BZIP2_TURBO_7ZZ=$oracle" >> "$GITHUB_ENV"
           "$oracle" i
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings

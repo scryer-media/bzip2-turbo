@@ -1,6 +1,14 @@
 # BZip2 process benchmark harness
 
 Standard-library-only Go harness with `toolchain`, `run`, and `suite` commands.
+`legacy-corpus DESTINATION --mib 32` and `legacy-compare --codec EXE --oracle
+EXE --input FILE --results JSON` preserve the historical two-process tools,
+including byte-identical xorshift corpora and the original JSON report keys.
+The latter accepts the historical level, block-size, passes, runs, warmups,
+hardware, revision, profile, darwin-resources and require-parity options.
+Platform identity values use Go OS/architecture names. These legacy commands
+keep their candidate/reference ratio direction; four-contender reports use
+reference/ours. All raw outputs stay outside the checkout.
 Four contenders run in rotating order: 7zz, turbo, Rust bzip2 with its pure Rust
 backend, and Rust bzip2 with its C backend. Every encoded output is decoded by
 every contender before timing. Native turbo output must match 7zz byte for byte;

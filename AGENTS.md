@@ -21,7 +21,7 @@ adapters. Keep source reference identities and required legal notices intact.
   under .worktrees/. Never reset, clean, restore or stash a shared checkout.
 - Commits and tags must be SSH-signed. Never bypass signing. Do not push unless
   explicitly instructed. Release and publication require separate authorization.
-- Enable hooks with git config core.hooksPath .githooks. Python 3 and gitleaks
+- Enable hooks with git config core.hooksPath .githooks. Go and gitleaks
   are required. The hooks check complete staged blobs and commit messages.
 - Never commit credentials, personal home paths, account names or private
   contact details. Keep machine-specific blocked terms in the external file

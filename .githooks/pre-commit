@@ -1,5 +1,5 @@
 #!/bin/sh
 set -eu
 root="$(git rev-parse --show-toplevel)"
-python3 "$root/.github/scripts/privacy.py" --staged
+go run "$root/.github/scripts/tool.go" privacy --staged
 "$root/.githooks/scan-secrets"

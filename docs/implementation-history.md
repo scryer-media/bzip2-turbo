@@ -210,15 +210,17 @@ Build the `codec-bench` example in release mode before timing. It streams raw
 input from a file and writes either to a file or, for output `-`, a discard
 sink. Its arguments are `encode|decode LEVEL THREADS INPUT OUTPUT|-`
 followed optionally by `[BLOCK_SIZE|-] [PASSES|-]`.
-`bench/corpus.py DESTINATION --mib 32` generates deterministic text, random,
-mixed, and RLE-heavy inputs. `bench/compare.py --codec EXE --oracle EXE
+The historical Python tools are now preserved as Go commands in
+`bench/bzip2-turbo-bench`. From that directory,
+`go run . legacy-corpus DESTINATION --mib 32` generates byte-identical text, random,
+mixed, and RLE-heavy inputs. `go run . legacy-compare --codec EXE --oracle EXE
 --input FILE --results JSON` first verifies bytes, then records three-run
 medians at 1/2/4/8 threads after one untimed warmup. Reference/candidate order
 alternates for each repetition. It reports both median time and throughput
 ratios, executable SHA-256 digests, host architecture, logical CPU count,
 and configuration. Supply `--hardware`, `--revision`, and `--profile` to
 record the hardware and source/build identities. `--block-size` and `--passes` override the codec
-defaults for both implementations. Both scripts require artifact destinations outside
+defaults for both implementations. Both commands require artifact destinations outside
 the repository. The random corpus repeats a deterministic 1 MiB xorshift32
 block, seeded with `0x12345678`; the period exceeds a BZip2 block.
 
