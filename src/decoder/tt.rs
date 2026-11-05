@@ -115,10 +115,21 @@ pub(super) fn build_links<W: LinkWord>(
         let mut counts = starts(counts);
         let mut links = links.resized(last.len());
         let words: &mut [W] = &mut links;
-        for (index, &byte) in last.iter().enumerate() {
-            let slot = &mut counts[byte as usize];
-            words[*slot].set_low(((index as u32) << 8) | u32::from(last[*slot]));
-            *slot += 1;
+        // DecodeBlock1 carries the current byte while fetching its successor
+        // before the current bucket/scatter chain. The tail is explicit: no
+        // sentinel byte is read beyond the supplied last column.
+        if let Some((&first, tail)) = last.split_first() {
+            let mut byte = first;
+            for (index, &next) in tail.iter().enumerate() {
+                let bucket = usize::from(byte);
+                let destination = counts[bucket];
+                byte = next;
+                counts[bucket] = destination + 1;
+                words[destination].set_low(((index as u32) << 8) | u32::from(last[destination]));
+            }
+            let destination = counts[usize::from(byte)];
+            words[destination]
+                .set_low((((last.len() - 1) as u32) << 8) | u32::from(last[destination]));
         }
         return W::finish(links);
     }
