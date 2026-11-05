@@ -691,7 +691,7 @@ impl<R: Read> Parser<R> {
             #[cfg(target_arch = "x86_64")]
             let mut mtf = {
                 let mut bytes = [0u8; 256];
-                bytes[..alphabet.len()].copy_from_slice(&alphabet);
+                bytes[..alphabet.len()].copy_from_slice(alphabet);
                 bytes
             };
             #[cfg(not(target_arch = "x86_64"))]
