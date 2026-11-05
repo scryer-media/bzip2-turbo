@@ -18,6 +18,13 @@ go run . suite --sevenzip 7zz --size-kib 32768 --levels 1,5,9 --threads 1,2,4,8 
 go run . run --sevenzip 7zz --input /tmp/corpus.bin --threads 1 --out /tmp/bzip2-run.json
 ```
 
+The turbo example and both reference builds share release fat LTO, one codegen
+unit, optimization level 3 and stripping. Keep the Rust toolchain, profile
+overrides and any target-CPU override identical across those three builds; the
+documented commands use the default target CPU baseline without
+`target-cpu=native`. Record C-backend and 7zz compiler settings separately.
+See the reference-build README for explicit equivalent environment overrides.
+
 `--driver`, `--pure`, and `--c` select alternate driver builds; `--repo` selects
 the source identity root. No tools are built or downloaded automatically.
 `--list` prints the matrix without requiring tools. Corpora are deterministic
