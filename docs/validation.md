@@ -1,6 +1,6 @@
 # Validation
 
-## Native decoder follow-up
+## Native decoder validation (8a2188e)
 
 Runtime commit `8a2188e6b667` passed the macOS ARM64 integrated checks with
 Rust 1.97.1 and cargo-nextest 0.9.143. The all-feature sweep passed 123 tests
@@ -24,9 +24,23 @@ passed five all-feature and two decoding-only doctests.
 Graviton native candidate checks and exact-output benchmarks supplement these
 local tests; they do not substitute for the full platform CI matrix. See the
 [decoder notes](decoder-performance.md) for retained changes and rejected
-experiments. The final benchmark method and runtime identity are recorded in
-the README. The following extraction record is historical, not a claim that
-all of those checks were rerun on this commit.
+experiments. The current full-suite benchmark method and source identity are
+recorded in the [detailed benchmark results](benchmark.md).
+
+## Current four-way benchmark validation (f6cb7d2)
+
+The 2026-11-05 Graviton3 and Intel suites used the same signed source, canonical
+fixtures and protocol. All 120 scenarios completed: 3,840 measured codec
+executions, 960 warmups, 480 validation encodes and 1,920 crossdecodes. Native
+turbo and 7zz encoded bytes matched in all 120 scenarios. Every timed engine
+used the OS null device and GNU time's own-child RSS report. Independent review
+recomputed all 960 unique engine/operation metrics from retained samples and
+verified source, executable and fixture identities. No samples were filtered
+and no cases were restarted. These benchmarks do not rerun the native test
+sweeps above or establish universal performance parity.
+
+The following extraction record is historical, not a claim that all of those
+checks were rerun on this commit.
 
 ## Extraction baseline
 
@@ -79,5 +93,6 @@ CI configuration alone does not establish that those jobs ran.
 The pre-extraction signed baseline is sevenz-turbo `e704d1e`. Its historical
 verification and performance results are preserved in
 [implementation history](implementation-history.md); they do not certify the
-new compatibility code. The first-pass performance baseline remains frozen;
-no full ARM/x86 single-threaded or multithreaded parity claim is made.
+new compatibility code. Historical performance runs remain preserved separately
+from the current full-suite results; no full ARM/x86 single-threaded or
+multithreaded parity claim is made.

@@ -75,15 +75,17 @@ win; the last failed its intended assembly check because per-symbol state
 traffic moved to the stack instead of registers. Their patches and raw evidence
 remain preserved outside Git.
 
-See the [README measurements](../README.md#benchmarks) for the source identities,
+See the [detailed measurements](benchmark.md) for the source identities,
 output method and remaining workload-specific gaps. Earlier diagnostic runs
-used Rust's in-memory sink while 7zz wrote to the null device. The final
-four-way follow-up uses the operating-system null device for every engine;
-measurements from those two protocols must not be combined.
+used Rust's in-memory sink while 7zz wrote to the null device. The `8a2188e`
+decoder-only follow-up used the operating-system null device for every engine.
+The current `f6cb7d2` full-suite results are reported separately; samples from
+different sources or protocols must not be combined.
 
-## Additional block-size checks
+## Historical decoder regression checks (8a2188e)
 
-The signed runtime was compared with the previous turbo runtime at `92a4610`
+Before the current full-suite run, runtime `8a2188e` was compared with the
+previous turbo runtime at `92a4610`
 and 7zz on all five canonical fixtures at 100,000-byte (L1) and 900,000-byte
 (L9) blocks, with one and two threads. All 60 pre-timing output hashes matched;
 360 measured runs covered 20 scenarios. Six runs per engine and scenario used
@@ -115,6 +117,6 @@ medians; negative is faster and positive is slower.
 
 Repeated-text medians increased by at most 0.32 ms. Small differences and
 outliers remain in the raw evidence; they are not rounded away into a zero
-regression claim. Correctness passed, but the strict zero-regression and
-universal 7zz parity goals have not been met. This change preserves the measured
-improvements and records the remaining work.
+regression claim. Correctness passed, but those checks did not meet the strict
+zero-regression or universal 7zz parity goals. These historical comparisons
+preserve the measured improvements and remaining work.
