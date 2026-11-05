@@ -1,16 +1,20 @@
-name: Release existing signed tag
+name: release
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing SSH-signed annotated vX.Y.Z tag to validate
+      version:
+        description: Version in Cargo.toml with an existing SSH-signed vX.Y.Z tag
         required: true
         type: string
-      publish:
-        description: Publish the verified tag to crates.io
+      dry_run:
+        description: Run checks only; publish nothing
         required: true
         type: boolean
-        default: false
+        default: true
+concurrency:
+  group: bzip2-turbo-release
+  cancel-in-progress: false
+
 permissions:
   contents: read
 jobs:
@@ -22,6 +26,8 @@ jobs:
       actions: read
     outputs:
       commit: ${{ steps.identity.outputs.commit }}
+      tag_object: ${{ steps.identity.outputs.tag_object }}
+      version: ${{ steps.identity.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -29,12 +35,13 @@ jobs:
           persist-credentials: false
       - name: Verify existing tag before checking out its code
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          VERSION: ${{ inputs.version }}
           ALLOWED_SIGNERS: ${{ vars.RELEASE_ALLOWED_SIGNERS }}
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          RELEASE_TAG="v$VERSION"
           test "$GITHUB_REF" = refs/heads/main
           test -n "$ALLOWED_SIGNERS"
           printf '%s\n' "$ALLOWED_SIGNERS" > "$RUNNER_TEMP/allowed-signers"
@@ -48,6 +55,7 @@ jobs:
         id: identity
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -55,20 +63,34 @@ jobs:
           git merge-base --is-ancestor "$commit" origin/main
           gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$commit&event=push&status=success&per_page=100" > "$RUNNER_TEMP/ci.json"
           jq -e --arg sha "$commit" '[.workflow_runs[] | select(.head_sha == $sha and .head_branch == "main" and .conclusion == "success")] | length > 0' "$RUNNER_TEMP/ci.json"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-      - name: Check version matches tag
+          {
+            echo "commit=$commit"
+            echo "version=$VERSION"
+            echo "tag_object=$(git rev-parse "refs/tags/v$VERSION")"
+          } >> "$GITHUB_OUTPUT"
+      - name: Check manifest version and dated changelog
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: python3 -c 'import os, tomllib; assert "v" + tomllib.load(open("Cargo.toml", "rb"))["package"]["version"] == os.environ["RELEASE_TAG"]'
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PYTHON'
+          import datetime, os, re, tomllib
+          version = os.environ["VERSION"]
+          assert tomllib.load(open("Cargo.toml", "rb"))["package"]["version"] == version
+          headings = re.findall(r"^## " + re.escape(version) + r" - (\d{4}-\d{2}-\d{2})$", open("CHANGELOG.md").read(), re.M)
+          assert len(headings) == 1, "require one dated changelog heading: ## X.Y.Z - YYYY-MM-DD"
+          datetime.date.fromisoformat(headings[0])
+          section = re.search(r"^## " + re.escape(version) + r" - \d{4}-\d{2}-\d{2}\n(.*?)(?=^## |\Z)", open("CHANGELOG.md").read(), re.M | re.S)
+          assert section and section[1].strip(), "missing release notes"
+          PYTHON
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.97.1
       # This workflow never creates or changes tags.
-      - run: cargo package --locked -p bzip2-turbo
+      - run: cargo publish --locked -p bzip2-turbo --dry-run
 
   publish:
     needs: validate
-    if: ${{ inputs.publish }}
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: crates-io
@@ -83,9 +105,72 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.97.1
+      - name: Check whether this version is already published
+        id: exists
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          code="$(curl --silent --show-error --retry 3 --output "$RUNNER_TEMP/crate.json" --write-out '%{http_code}' --user-agent 'bzip2-turbo release workflow' "https://crates.io/api/v1/crates/bzip2-turbo/$VERSION")"
+          case "$code" in
+            200)
+              jq -e --arg version "$VERSION" ' .version.crate == "bzip2-turbo" and .version.num == $version' "$RUNNER_TEMP/crate.json"
+              echo "published=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Unexpected crates.io response: $code" >&2; exit 1 ;;
+          esac
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        if: steps.exists.outputs.published != 'true'
         id: auth
       - name: Publish verified source through trusted publishing
+        if: steps.exists.outputs.published != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked -p bzip2-turbo
+
+  github-release:
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare changelog notes and confirm the original tag
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse "refs/tags/v$VERSION")" = "$TAG_OBJECT"
+          test "$(git ls-remote --tags origin "refs/tags/v$VERSION" | cut -f1)" = "$TAG_OBJECT"
+          python3 - <<'PYTHON'
+          import os, pathlib, re
+          version = os.environ["VERSION"]
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          pattern = r"^## " + re.escape(version) + r" - \d{4}-\d{2}-\d{2}\n(.*?)(?=^## |\Z)"
+          match = re.search(pattern, text, re.M | re.S)
+          assert match and match[1].strip(), "missing release notes"
+          pathlib.Path(os.environ["RUNNER_TEMP"], "notes.md").write_text(match[1].strip() + "\n")
+          PYTHON
+      - name: Create or update release notes for the verified signed tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Listing fails closed on authentication and API failures.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name' > "$RUNNER_TEMP/releases"
+          if grep -Fxq "v$VERSION" "$RUNNER_TEMP/releases"; then
+            gh release edit "v$VERSION" --title "bzip2-turbo $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          else
+            gh release create "v$VERSION" --verify-tag --title "bzip2-turbo $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          fi

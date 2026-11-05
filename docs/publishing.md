@@ -13,12 +13,35 @@ and register the crates.io trusted publisher for this repository's
 ownership and registration must be established with crates.io before relying on
 that workflow. Do not place private signing material in the repository.
 
-The existing release workflow accepts an existing SSH-signed annotated `vX.Y.Z`
-tag. It verifies both the tag and source commit against the allowed signers,
-requires stable ancestry and successful push CI for that exact commit on `main`,
-and checks that the manifest version matches the tag. Validation packages the
-crate; the separate environment-gated publishing job runs only when explicitly
-selected and uses trusted publishing. The workflow never creates or moves tags.
+Run the `release` workflow manually from the Actions tab on `main`. Enter
+`version` exactly as in `Cargo.toml` (for example, `0.1.0`). `dry_run` defaults
+to true and performs validation without uploading or creating a GitHub release.
+After separate release authorization, set `dry_run` to false to publish through
+the protected `crates-io` environment and create the GitHub release.
+
+An existing, remotely pushed SSH-signed annotated `vX.Y.Z` tag is required even
+for validation. The workflow has no private signing key and never creates or
+moves tags; the operator must prepare that signed tag separately after release
+authorization. Both tag and source commit are verified against the allowed
+signers. The exact source commit must be on `main` and have a successful push
+run of `ci.yml` on `main`. All later jobs check out that immutable commit.
+
+The manifest must match the requested version. `CHANGELOG.md` must contain
+exactly one heading `## X.Y.Z - YYYY-MM-DD` with a valid calendar date and
+nonempty release notes. The initial `## 0.1.0` heading is deliberately undated
+and must be dated separately during authorized release preparation. Validation
+runs `cargo publish --locked --dry-run`; platform tests are covered by the
+required exact-commit CI run. There is no published semver baseline for the
+first release, so this workflow does not assume one exists.
+
+Publication retries skip an already uploaded crates.io version. Any registry
+response other than success or not-found stops publication. A subsequent GitHub
+release step checks that the remote tag object still matches the verified tag,
+then uses `--verify-tag`; it never asks GitHub to create an unsigned tag. Release
+notes come only from the matching dated changelog section. Retrying updates
+notes on an existing release. Runs are serialized, including across versions.
+These controls do not bootstrap a first crates.io publication: crate ownership
+and trusted publisher registration must already be established separately.
 Do not bypass signature verification when any prerequisite fails.
 
 The operator's next steps are to review the implementation and validation,
