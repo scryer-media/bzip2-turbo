@@ -1,5 +1,35 @@
 # Validation
 
+## Native decoder follow-up
+
+Runtime commit `8a2188e6b667` passed the macOS ARM64 integrated checks with
+Rust 1.97.1 and cargo-nextest 0.9.143. The all-feature sweep passed 123 tests
+with zero skips; the decoding-only sweep passed 49 with zero skips. The pinned
+7-Zip 26.04 oracle was enabled. Nextest reported one process-cleanup warning
+on the table-rebuild test; its isolated rerun passed without the warning. The
+broad run is therefore not described as cleanup-warning-free.
+
+Formatting, strict all-target Clippy in both feature configurations, doctests
+and strict rustdoc passed. A local `cargo package --locked` verified the crate
+without publishing it. Both feature configurations compiled for Wasm using the
+installed Rust 1.97.1 rustup target; the same-version Homebrew compiler lacked
+that target. Privacy and redacted gitleaks checks passed before the SSH-signed
+commit. No new unsafe code or dependency change was introduced.
+
+The subsequent documentation pass changed comments and examples without
+changing runtime behavior. Strict rustdoc with both `-D warnings` and
+`-D missing_docs` passed in both feature configurations; the final examples
+passed five all-feature and two decoding-only doctests.
+
+Graviton native candidate checks and exact-output benchmarks supplement these
+local tests; they do not substitute for the full platform CI matrix. See the
+[decoder notes](decoder-performance.md) for retained changes and rejected
+experiments. The final benchmark method and runtime identity are recorded in
+the README. The following extraction record is historical, not a claim that
+all of those checks were rerun on this commit.
+
+## Extraction baseline
+
 The standalone crate was checked locally on macOS. Completed native sweeps used
 cargo-nextest 0.9.143 with `--no-fail-fast`: 116 all-feature tests passed with no
 skips, and 43 decoding-only tests passed with no skips. The local sevenz-turbo

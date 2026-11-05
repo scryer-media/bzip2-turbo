@@ -12,7 +12,8 @@ bzip2 = { package = "bzip2-turbo", version = "0.1" }
 ```
 
 ```rust
-use bzip2_turbo::{Compression, read::BzDecoder, write::BzEncoder};
+# use bzip2_turbo as bzip2;
+use bzip2::{Compression, read::BzDecoder, write::BzEncoder};
 use std::io::{Read, Write};
 
 let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
@@ -25,8 +26,8 @@ assert_eq!(restored, b"a streaming codec");
 # Ok::<(), std::io::Error>(())
 ```
 
-With the Cargo rename above, imports remain `bzip2::...`; without renaming,
-use `bzip2_turbo::...` as in the example. The adapter surface targets bzip2
+The examples use the Cargo rename above, so imports remain `bzip2::...`.
+Without renaming the dependency, use `bzip2_turbo::...` instead. The adapter surface targets bzip2
 0.6.1: `read`, `write`, `bufread`, `Compression`, `Compress`, `Decompress`,
 `Action`, `Status`, and `Error`. Ordinary `BzDecoder` reads one member;
 `MultiBzDecoder` reads concatenated members. Use `bufread` when bytes after the
@@ -43,7 +44,8 @@ features are not carried over. The default `compress` feature enables encoding;
 ## Explicit 7-Zip settings
 
 ```rust
-use bzip2_turbo::{Encoder, EncoderOptions};
+# use bzip2_turbo as bzip2;
+use bzip2::{Encoder, EncoderOptions};
 use std::io::Write;
 
 let options = EncoderOptions { threads: 4, level: 5, ..Default::default() };
@@ -57,8 +59,8 @@ let compressed = encoder.finish()?;
 Native `Encoder` and `Decoder` default to one thread. Encoding preserves output
 order across bounded worker slots. Decoding uses a parser/reconstruction
 pipeline when threading is requested; requesting eight threads does not imply
-eight reconstruction workers. `Decoder::with_low_memory` selects compact TT
-storage. Memory estimates cover codec allocations, not whole-process RSS.
+eight reconstruction workers. `Decoder::with_low_memory` selects a compact inverse-BWT
+lookup table. Memory estimates cover codec allocations, not whole-process RSS.
 Native `EncoderOptions` follows 7-Zip's level/pass mapping, which differs from
 compatibility `Compression` levels. Native `Decoder` defaults to concatenated
 streams; `set_multistream(false)` selects one member.
@@ -71,6 +73,126 @@ CI coverage. [Benchmarking](https://github.com/scryer-media/bzip2-turbo/blob/mai
 verified output, alternating rounds, medians and RSS.
 
 ## Benchmarks
+
+### Current Graviton decoder
+
+Measured on 2026-11-05 on a c7g.2xlarge (Graviton3, 8 physical cores, 16 GiB RAM, Ubuntu 24.04). Single-threaded runs use one pinned core; the two-thread budget uses two pinned cores. Rust 1.97.1 uses O3, fat LTO and one codegen unit. The reference is pinned 7-Zip 26.04 with its stock GCC O2 build. Standard `bzip2` 0.6.1 uses `libbz2-rs-sys` 0.2.6 or libbz2 1.0.8.
+
+These are native `Decoder` measurements, not compatibility-adapter timings. Turbo beats both standard bzip2 backends on these fixtures, but full parity with 7zz is **not** achieved. The remaining differences are explicit below. Positive percentages mean turbo takes longer; negative percentages mean it is faster. Differences near zero should be read alongside run-to-run variation.
+
+| Fixture | 1 thread | 2 threads |
+|---|---:|---:|
+| JSON | +0.30% | +1.47% |
+| Logs | -0.74% | +3.12% |
+| Repeated text | -41.38% | -38.48% |
+| MKV | +3.56% | +0.86% |
+| ELF | +0.59% | -3.10% |
+
+Additional 100,000-byte-block checks still show larger gaps versus 7zz:
+JSON takes 12.4–16.2% longer, logs 14.8–22.8%, and single-threaded MKV 10.6%.
+Across the level-1 and level-9 comparisons with the previous turbo runtime,
+most cases improved, while repeated-text medians were 0.11–0.41% slower.
+The [full regression comparison](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/decoder-performance.md#additional-block-size-checks) retains both wins and losses.
+
+Final signed Graviton decode comparison, source `8a2188e6b667`. Level 5, 500,000-byte blocks, six measured runs per engine after one warmup, with execution order balanced between each pair. All engines write to the operating-system null device. Elapsed time includes GNU time startup; RSS is its reported peak for the codec process. Two-thread runs use two physical cores; the standard Rust and C backends remain single-threaded. Throughput uses original input bytes. These results are separate from the earlier ARM/Intel matrix.
+
+### Varied JSON, thread budget 1
+
+| Engine | Decode MiB/s | RSS MiB |
+|---|---:|---:|
+| bzip2-turbo | 41.2 | 5.4 |
+| 7zz | 41.4 | 9.7 |
+| bzip2 (Rust) | 32.2 | 3.5 |
+| bzip2 (C) | 31.4 | 3.5 |
+
+### Varied JSON, thread budget 2
+
+| Engine | Decode MiB/s | RSS MiB |
+|---|---:|---:|
+| bzip2-turbo | 48.3 | 5.2 |
+| 7zz | 49.0 | 9.8 |
+| bzip2 (Rust) | 32.1 | 3.5 |
+| bzip2 (C) | 31.4 | 3.5 |
+
+### Structured logs, thread budget 1
+
+| Engine | Decode MiB/s | RSS MiB |
+|---|---:|---:|
+| bzip2-turbo | 66.5 | 5.4 |
+| 7zz | 66.0 | 9.7 |
+| bzip2 (Rust) | 50.6 | 3.5 |
+| bzip2 (C) | 47.2 | 3.5 |
+
+### Structured logs, thread budget 2
+
+| Engine | Decode MiB/s | RSS MiB |
+|---|---:|---:|
+| bzip2-turbo | 75.6 | 5.1 |
+| 7zz | 78.0 | 9.8 |
+| bzip2 (Rust) | 50.2 | 3.5 |
+| bzip2 (C) | 47.0 | 3.5 |
+
+### Repeated-text stress, thread budget 1
+
+| Engine | Decode MiB/s | RSS MiB |
+|---|---:|---:|
+| bzip2-turbo | 339.4 | 5.4 |
+| 7zz | 199.0 | 9.6 |
+| bzip2 (Rust) | 147.7 | 3.5 |
+| bzip2 (C) | 133.0 | 3.5 |
+
+### Repeated-text stress, thread budget 2
+
+| Engine | Decode MiB/s | RSS MiB |
+|---|---:|---:|
+| bzip2-turbo | 336.6 | 5.2 |
+| 7zz | 207.1 | 9.7 |
+| bzip2 (Rust) | 148.0 | 3.5 |
+| bzip2 (C) | 133.2 | 3.5 |
+
+### H.264/AAC MKV, thread budget 1
+
+| Engine | Decode MiB/s | RSS MiB |
+|---|---:|---:|
+| bzip2-turbo | 22.8 | 5.4 |
+| 7zz | 23.6 | 9.7 |
+| bzip2 (Rust) | 17.2 | 3.5 |
+| bzip2 (C) | 19.5 | 3.5 |
+
+### H.264/AAC MKV, thread budget 2
+
+| Engine | Decode MiB/s | RSS MiB |
+|---|---:|---:|
+| bzip2-turbo | 41.6 | 5.5 |
+| 7zz | 41.9 | 9.8 |
+| bzip2 (Rust) | 17.2 | 3.5 |
+| bzip2 (C) | 19.5 | 3.5 |
+
+### Generated ELF, thread budget 1
+
+| Engine | Decode MiB/s | RSS MiB |
+|---|---:|---:|
+| bzip2-turbo | 36.1 | 5.4 |
+| 7zz | 36.4 | 9.7 |
+| bzip2 (Rust) | 24.5 | 3.5 |
+| bzip2 (C) | 26.1 | 3.5 |
+
+### Generated ELF, thread budget 2
+
+| Engine | Decode MiB/s | RSS MiB |
+|---|---:|---:|
+| bzip2-turbo | 54.1 | 5.5 |
+| 7zz | 52.4 | 9.8 |
+| bzip2 (Rust) | 24.6 | 3.5 |
+| bzip2 (C) | 26.1 | 3.5 |
+
+The canonical fixture identities and generation details appear with the earlier matrix below. Raw reports, frozen binary identities and a signed-source build receipt are retained outside Git. These results use uniform null-device output; earlier measurements used Rust in-memory sinks. Do not combine their medians or attribute the entire difference between batches to code changes.
+
+See the [decoder implementation notes](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/decoder-performance.md) for retained improvements and verification. Intel decoder timings below belong to the earlier runtime; the latest decoder has not been rebenchmarked on Intel.
+
+## Earlier four-way baseline
+
+The following encoding and decoding matrix is preserved at its original source identity (`92a46108a726`, runtime `5a6c6cb7ded96`). Its decoder predates the improvements above. Rust codecs used their in-memory sink while 7zz wrote to the operating-system null device.
 
 Measured 2026-11-05: four complete codec processes, four balanced measured rounds after one warmup. Primary tables use level 5, 500,000-byte blocks, one pass and one thread. Throughput uses original uncompressed input bytes; RSS is median peak codec-process RSS from GNU time's own child report (`gnu-time-child-v1`). Wall time includes GNU time wrapper startup, codec startup and I/O. Values are per workload, without an aggregate score.
 

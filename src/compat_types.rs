@@ -1,44 +1,47 @@
 // API definitions adapted from bzip2-rs, MIT OR Apache-2.0.
 use std::{error, fmt};
 
-/// Possible actions to take on compression.
+/// Operation requested from the incremental compressor.
 #[derive(PartialEq, Eq, Copy, Debug, Clone)]
 pub enum Action {
-    /// Normal compression.
+    /// Accept input and emit available compressed output.
     Run = 0,
-    /// Flush any existing output, but do not read any more input
+    /// Consume the supplied input and finish the current block without ending the stream.
     Flush = 1,
     /// Request that the compression stream be finalized.
     Finish = 2,
 }
 
-/// Result of compression or decompression
+/// Progress reported by the incremental compatibility APIs.
+///
+/// Use the cumulative input/output counters to determine how many bytes a call
+/// consumed and produced. A successful status does not imply either buffer was filled.
 #[derive(PartialEq, Eq, Copy, Debug, Clone)]
 pub enum Status {
-    /// Decompression went fine, nothing much to report.
+    /// Decompression needs more input or output space to continue.
     Ok,
 
-    /// The Flush action on a compression went ok.
+    /// A compression flush is still in progress.
     FlushOk,
 
-    /// The Run action on compression went ok.
+    /// Compression can accept another run operation; a requested flush may be complete.
     RunOk,
 
-    /// The Finish action on compression went ok.
+    /// Compression is finishing; continue until `StreamEnd`.
     FinishOk,
 
-    /// The stream's end has been met, meaning that no more data can be input.
+    /// The stream trailer has been completed or validated.
     StreamEnd,
 
-    /// There was insufficient memory in the input or output buffer to complete
-    /// the request, but otherwise everything went normally.
+    /// Reserved for compatibility; this implementation does not return this status.
     MemNeeded,
 }
 
-/// Fatal errors encountered when compressing/decompressing bytes.
+/// Errors returned by incremental compression or decompression.
 ///
-/// These errors indicate that progress could not be made in any form due to
-/// input or output parameters.
+/// Counters may have advanced before a data/codec failure, which poisons the
+/// codec. A rejected compression action sequence does not itself poison it;
+/// the caller can resume the pending operation with its correct action/input.
 #[derive(PartialEq, Eq, Copy, Debug, Clone)]
 pub enum Error {
     /// The sequence of operations called on a decompression/compression stream
@@ -56,8 +59,9 @@ pub enum Error {
     Param,
 }
 
-/// When compressing data, the compression level can be specified by a value in
-/// this enum.
+/// Compression level for the compatibility adapters, normally `1..=9`.
+///
+/// Native compression uses `EncoderOptions` when `compress` is enabled.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Compression(u32);
 
@@ -66,7 +70,7 @@ impl Compression {
     ///
     /// # Panics
     ///
-    /// A level outside of the `1..=9` range will throw a panic. Use [`Self::try_new`] to
+    /// A level outside of the `1..=9` range panics. Use [`Self::try_new`] to
     /// gracefully handle invalid levels (e.g. from user input).
     #[track_caller]
     pub const fn new(level: u32) -> Self {
@@ -84,18 +88,20 @@ impl Compression {
         }
     }
 
-    /// Do not compress.
+    /// Returns the legacy invalid level zero.
+    ///
+    /// Compressor constructors reject this value; BZip2 has no stored-data level.
     #[deprecated(since = "0.5.1", note = "libbz2 does not support compression level 0")]
     pub fn none() -> Self {
         Self(0)
     }
 
-    /// Optimize for the best speed of encoding.
+    /// Selects level one and a 100,000-byte compatibility block size.
     pub const fn fast() -> Self {
         Self(1)
     }
 
-    /// Optimize for smallest output size.
+    /// Selects level nine and a 900,000-byte compatibility block size.
     pub const fn best() -> Self {
         Self(9)
     }

@@ -1178,9 +1178,17 @@ impl Drop for Worker {
     }
 }
 
-/// A bounded, block-streaming BZip2 decoder, including concatenated streams.
-/// Thread counts default to one. As in the reference decoder, counts above one
-/// select a pipeline overlapping entropy parsing with block reconstruction.
+/// A bounded [`Read`] decoder that accepts concatenated BZip2 streams by default.
+///
+/// Construction is lazy: headers are parsed on the first nonempty read. One
+/// thread runs on the caller; larger budgets overlap caller-side entropy parsing
+/// with one reconstruction worker. Input and output may be read ahead. Dropping
+/// the decoder cancels its pipeline and joins its worker.
+///
+/// Read through EOF to validate every block and the combined stream checksum.
+/// Earlier output chunks may already have been delivered when a later checksum
+/// or I/O error is found. Any read error poisons the decoder; subsequent nonempty
+/// reads return an error rather than resuming. Empty reads return zero.
 pub struct Decoder<R: Read> {
     parser: Parser<R>,
     mode: Mode,
@@ -1201,7 +1209,10 @@ impl<R: Read> Decoder<R> {
     pub fn new(reader: R) -> Self {
         Self::with_threads(reader, 1)
     }
-    /// Creates a decoder with a bounded reconstruction thread budget.
+    /// Creates a decoder with a total thread budget including the caller.
+    ///
+    /// Budgets are clamped to `1..=2`; WebAssembly always uses one thread. A
+    /// budget above two does not add more reconstruction workers.
     pub fn with_threads(reader: R, threads: usize) -> Self {
         Self::with_mode(reader, threads, Mode::platform())
     }
@@ -1238,6 +1249,13 @@ impl<R: Read> Decoder<R> {
     /// With multiple threads the callback runs on the reconstruction worker;
     /// single-threaded decoding invokes it on the caller. It may observe read-ahead
     /// bytes before they are delivered, including bytes discarded on early drop.
+    /// Callback chunks contain at most 65,536 bytes and preserve stream order.
+    /// A callback is an observer, not a guarantee that the complete stream or
+    /// current block has passed its final checksum.
+    ///
+    /// A caller-thread callback panic propagates and leaves the decoder failed
+    /// if caught. A worker callback panic is reported as a read error. Callbacks
+    /// must not wait for progress that depends on the same decoder.
     pub fn with_output_callback(
         reader: R,
         threads: usize,
@@ -1267,8 +1285,12 @@ impl<R: Read> Decoder<R> {
     pub fn set_multistream(&mut self, multistream: bool) {
         self.parser.multistream = multistream;
     }
-    /// Conservative peak codec allocation, excluding the reader, OS thread stacks,
-    /// and allocations owned or performed by an output callback.
+    /// Conservative peak requested codec allocation, in bytes.
+    ///
+    /// This is an allocation bound, not a measured resident-set size. It excludes
+    /// the reader, allocator overhead, OS thread stacks, and storage owned or
+    /// allocated by an output callback. Reusable scratch and output/TT capacity
+    /// are included. Thread budgets follow [`Self::with_threads`].
     pub const fn memory_usage(threads: usize) -> u64 {
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             if threads > 1 {
@@ -1289,7 +1311,11 @@ impl<R: Read> Decoder<R> {
             6 * 1024 * 1024
         }
     }
-    /// Returns the input reader. Buffered compressed bytes are discarded.
+    /// Cancels and joins any worker, then returns the input reader.
+    ///
+    /// Buffered compressed bytes and undelivered output are discarded; this does
+    /// not validate an unread trailer. The returned reader may be ahead of the
+    /// last byte delivered to the caller because of input buffering/read-ahead.
     pub fn into_inner(mut self) -> R {
         self.worker.take();
         self.parser.bits.reader

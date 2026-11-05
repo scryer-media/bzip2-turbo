@@ -66,5 +66,7 @@ trailing data and errors. Generated fixtures are not committed.
 ownership has focused Miri coverage. Miri does not verify OS FFI or crc-turbo's
 architecture kernels. See [validation](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/validation.md) for actual results
 and [implementation history](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/implementation-history.md) for preserved
-pre-extraction evidence. Current performance is the first-pass baseline;
-full cross-platform performance parity has not been established.
+pre-extraction evidence. The [native decoder notes](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/decoder-performance.md) describe later
+state and storage improvements and their differential tests. Benchmark tables
+identify the measured runtime and protocol; full cross-platform performance
+parity has not been established.

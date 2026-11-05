@@ -17,19 +17,28 @@ mod trial;
 use baseline::{Bits, codes, encode_symbols, lengths, symbols, tables};
 pub use slot::Encoder;
 
-/// Compression settings. Worker results are always written in input order.
+/// Native compression settings; results are written in input order.
+///
+/// Defaults are level five, one thread and level-selected block size/pass count.
+/// These settings follow the 7-Zip encoder rather than the compatibility
+/// [`crate::Compression`] block-size mapping.
 #[derive(Clone, Debug)]
 pub struct EncoderOptions {
-    /// Compression level, from zero through nine.
+    /// Compression level, clamped to zero through nine.
+    /// Zero still emits compressed BZip2 data; it is not a stored-data mode.
     pub level: u32,
     /// Thread budget including the calling thread, clamped to 1..=64.
     /// WebAssembly targets always use one thread.
     pub threads: usize,
     /// Requested block size in bytes, rounded down to a 100,000-byte step.
-    /// `None` selects the level's block size; values are clamped to 1..=9 steps.
+    /// `None` selects 100,000 bytes at levels zero/one, 300,000 at two,
+    /// 500,000 at three, 700,000 at four, and 900,000 at five through nine.
+    /// Explicit sizes are clamped to `1..=9` steps. This bounds the run-encoded
+    /// block, not necessarily the number of original input bytes.
     pub block_size: Option<u32>,
     /// Recursive block optimization passes, clamped to 1..=10.
-    /// `None` selects the level's pass count.
+    /// `None` selects seven passes at level nine, two at seven/eight, and one
+    /// at all other levels.
     pub passes: Option<u32>,
 }
 

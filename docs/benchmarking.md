@@ -61,8 +61,13 @@ Use CPU sampling, instructions retired where supported, and assembly to diagnose
 costs before changing algorithms. Do not infer CRC throughput from fused decoder
 samples.
 
-The extraction's first pass froze the performance baseline. On 2026-11-05, the
-operator authorized a focused ARM encoder followup from public base `f68b3ab`.
+The extraction baseline and the later ARM encoder and decoder measurements
+are recorded separately. The encoder follow-up starts from public base `f68b3ab`;
+[decoder notes](decoder-performance.md) describe the subsequent parsing and
+storage changes. Current timed commands all write to the operating-system
+null device, identified by `OutputSink` in new harness reports. Earlier
+measurements used the special Rust in-memory sink; do not combine their
+medians with the uniform-output follow-up.
 Full cross-platform 0% regression parity remains unachieved pending complete
 measurements. Selected passing rows do not establish that gate. Keep raw evidence
 for validated improvements and unsuccessful experiments outside the repository.

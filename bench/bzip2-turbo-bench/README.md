@@ -148,7 +148,12 @@ must not be interpreted as equal-setting performance comparisons.
 At least three measured rounds are required; four rounds balance all four
 starting positions. Warmups are discarded. Each encode/decode scenario produces
 three reference-versus-turbo rows from the same four-contender timing rounds.
-Decode timings use the same 7zz stream for all contenders. Reports contain raw
+Decode timings use the same 7zz stream for all contenders. All timed codecs
+write to the operating-system null device, recorded in `OutputSink`; Rust
+drivers open that output path instead of using their special `-` in-memory
+sink. This retains buffering and output writes for every contender. Earlier
+reports without `OutputSink` used the special Rust sink and must remain
+separate when comparing complete-process results. Reports contain raw
 wall/CPU samples, median wall and peak RSS, reference-over-turbo wall/RSS ratios,
 encoded sizes and identities, binary identities, and a digest of codec, driver,
 reference manifests/lockfiles and Go harness source. Values above one favor turbo.

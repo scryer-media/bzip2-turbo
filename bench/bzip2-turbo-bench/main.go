@@ -68,6 +68,7 @@ type report struct {
 	Driver, Reference, Pure, C                                                            identity
 	Repeats, Warmups                                                                      int
 	RSSMethod                                                                             string
+	OutputSink                                                                            string
 	RSSSupported                                                                          bool
 	PerformanceCounters                                                                   string
 	Fixtures                                                                              []fixtureInfo `json:"fixtures,omitempty"`

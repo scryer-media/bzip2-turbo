@@ -6,7 +6,10 @@ use std::mem::MaybeUninit;
 #[cfg(feature = "compress")]
 use std::{io::Write, sync::Mutex};
 
-/// An incremental in-memory BZip2 compressor.
+/// An incremental, single-threaded BZip2 compressor using caller-owned buffers.
+///
+/// Compute consumed and produced lengths from changes in [`Self::total_in`] and
+/// [`Self::total_out`], then advance both slices before calling again.
 #[cfg(feature = "compress")]
 pub struct Compress {
     // Exclusive access avoids locking; the wrapper preserves the upstream raw
@@ -26,6 +29,11 @@ pub struct Compress {
 impl Compress {
     /// Creates a compressor. The sorting engine accepts but does not use the
     /// reference implementation's `work_factor` tuning value (0 through 250).
+    /// Compression uses one pass and a block size of `level * 100_000` bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics for level zero or `work_factor > 250`.
     pub fn new(level: Compression, work_factor: u32) -> Self {
         assert!(
             (1..=9).contains(&level.level()),
@@ -81,6 +89,11 @@ impl Compress {
         }
     }
     /// Processes input and fills at most the supplied output slice.
+    ///
+    /// Repeat `Flush` until `RunOk`, or `Finish` until `StreamEnd`. During either
+    /// operation, keep the same action and supply exactly the unconsumed suffix
+    /// of its original input; a changed action or remaining length is a sequence
+    /// error. Empty `Run` calls return `RunOk`, including after stream end.
     pub fn compress(
         &mut self,
         input: &[u8],
@@ -154,6 +167,9 @@ impl Compress {
         Ok(self.status(action))
     }
     /// Processes input into uninitialized storage; only produced bytes are written.
+    ///
+    /// A temporary buffer limits each call to at most 65,536 output bytes. Only
+    /// the prefix measured by the output-counter delta becomes initialized.
     pub fn compress_uninit(
         &mut self,
         input: &[u8],
@@ -169,7 +185,10 @@ impl Compress {
         }
         result
     }
-    /// Fills spare vector capacity without growing its allocation.
+    /// Appends to spare vector capacity without growing the supplied allocation.
+    ///
+    /// The vector must have spare capacity to receive output. A temporary buffer
+    /// limits each call to at most 65,536 output bytes; existing elements remain.
     pub fn compress_vec(
         &mut self,
         input: &[u8],
@@ -192,7 +211,29 @@ impl Compress {
     }
 }
 
-/// An incremental in-memory BZip2 decompressor.
+/// An incremental single-stream BZip2 decompressor using caller-owned buffers.
+///
+/// Exhausting an input slice is not end-of-stream: provide more input until
+/// [`Status::StreamEnd`] validates the trailer. Stop at that status; subsequent
+/// calls return [`Error::Sequence`]. Bytes after the first stream remain unconsumed.
+///
+/// ```
+/// use bzip2_turbo::{Decompress, Status};
+/// // A complete, empty BZip2 stream.
+/// let encoded = b"BZh9\x17\x72\x45\x38\x50\x90\0\0\0\0";
+/// let mut decoder = Decompress::new(true);
+/// let mut input = encoded.as_slice();
+/// let mut output = [0; 16];
+/// loop {
+///     let before = decoder.total_in();
+///     let status = decoder.decompress(input, &mut output)?;
+///     input = &input[(decoder.total_in() - before) as usize..];
+///     if status == Status::StreamEnd { break; }
+///     assert!(!input.is_empty(), "truncated stream");
+/// }
+/// assert_eq!(decoder.total_out(), 0);
+/// # Ok::<(), bzip2_turbo::Error>(())
+/// ```
 pub struct Decompress {
     decoder: crate::decoder::Incremental,
     total_in: u64,
@@ -203,6 +244,8 @@ pub struct Decompress {
 impl Decompress {
     /// Creates a decompressor. `small` selects compact 32-bit reconstruction
     /// storage; this differs from libbz2's slower 16-bit small-memory algorithm.
+    /// `false` uses the platform default, paired words only on macOS ARM64.
+    /// No worker thread is started.
     pub fn new(small: bool) -> Self {
         Self {
             decoder: crate::decoder::Incremental::new(small),
@@ -213,6 +256,13 @@ impl Decompress {
         }
     }
     /// Processes input and fills at most the supplied output slice.
+    ///
+    /// Counter deltas identify the consumed and produced prefixes, including
+    /// progress before an error. `Ok` may mean more input or output is needed;
+    /// continue draining pending output even after input is exhausted. If no
+    /// progress remains possible at input EOF before `StreamEnd`, the caller
+    /// must report truncation.
+    /// Malformed input produces `Data` or `DataMagic`; errors poison the decoder.
     pub fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<Status, Error> {
         if self.failed || self.ended {
             return Err(Error::Sequence);
@@ -250,6 +300,9 @@ impl Decompress {
         }
     }
     /// Processes input into uninitialized storage; only produced bytes are written.
+    ///
+    /// A temporary buffer limits each call to at most 65,536 output bytes. Only
+    /// the prefix measured by the output-counter delta becomes initialized.
     pub fn decompress_uninit(
         &mut self,
         input: &[u8],
@@ -264,7 +317,10 @@ impl Decompress {
         }
         result
     }
-    /// Fills spare vector capacity without growing its allocation.
+    /// Appends to spare vector capacity without growing the supplied allocation.
+    ///
+    /// The vector must have spare capacity to receive output. A temporary buffer
+    /// limits each call to at most 65,536 output bytes; existing elements remain.
     pub fn decompress_vec(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<Status, Error> {
         let mut scratch = vec![0; (output.capacity() - output.len()).min(65536)];
         let before = self.total_out;
