@@ -113,12 +113,20 @@ func generate(path, kind string, size int64) error {
 	if kind != "text" && kind != "random" && kind != "periodic" && kind != "runs" {
 		return fmt.Errorf("unknown corpus %q", kind)
 	}
+	if kind == "text" && size < 256 {
+		return errors.New("JSON text corpus requires at least 256 bytes")
+	}
 	f, e := os.Create(path)
 	if e != nil {
 		return e
 	}
 	defer f.Close()
-	text := []byte("A reproducible compression corpus: records, words, numbers 0123456789.\n")
+	if kind == "text" {
+		if e := generateJSON(f, size); e != nil {
+			return e
+		}
+		return f.Close()
+	}
 	state := uint32(0x12345678)
 	buffer := make([]byte, 65536)
 	for base := int64(0); base < size; {
@@ -129,8 +137,6 @@ func generate(path, kind string, size int64) error {
 		for i := int64(0); i < n; i++ {
 			position := base + i
 			switch kind {
-			case "text":
-				buffer[i] = text[position%int64(len(text))]
 			case "random":
 				state ^= state << 13
 				state ^= state >> 17

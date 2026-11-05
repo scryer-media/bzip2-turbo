@@ -14,6 +14,15 @@ backend, and Rust bzip2 with its C backend. Every encoded output is decoded by
 every contender before timing. Native turbo output must match 7zz byte for byte;
 other encoders need decoded-byte parity, not compressed-byte identity.
 
+The main `text` corpus is exact-sized valid JSON with recurring attribute
+keys and diverse seeded values: variable text, numbers, booleans, arrays and
+nested objects. A fixed xorshift64* seed drives values continuously; no global
+text block repeats. Generation keeps one record and a 64 KiB buffer in memory.
+Final string padding is shorter than the next record. Minimum size is 256 bytes.
+To keep an external fixture: `go run . json-corpus --output /tmp/text.json
+--bytes 33554432`. Historical `legacy-corpus` text remains repeated-sentence
+periodic stress for reproducing old evidence, not the main text workload.
+
 Build the native example and both isolated reference builds as documented in
 `../../tools/bzip2-reference/README.md`, then run from this directory:
 

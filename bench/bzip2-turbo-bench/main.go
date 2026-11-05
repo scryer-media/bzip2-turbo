@@ -77,6 +77,8 @@ func main() {
 	args := os.Args[1:]
 	if len(args) > 0 && args[0] == "legacy-corpus" {
 		command, args = legacyCorpus, args[1:]
+	} else if len(args) > 0 && args[0] == "json-corpus" {
+		command, args = jsonCorpus, args[1:]
 	} else if len(args) > 0 && args[0] == "legacy-compare" {
 		command, args = legacyCompare, args[1:]
 	}

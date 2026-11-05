@@ -7,6 +7,16 @@ reference built with `go run .github/scripts/tool.go oracle`. The four contender
 bzip2 with its bundled static C backend. See the harness README
 for commands. Keep generated inputs, JSON and profiles outside the checkout.
 
+The main `text` input is a valid randomized JSON payload: recurring record
+attributes contain varied seeded text, numbers, booleans, arrays and nested
+objects. Generation streams bounded records and produces the exact requested
+byte count; final padding is shorter than one record. The fixed xorshift64*
+seed makes output reproducible without repeating a global text block.
+From the harness directory, `go run . json-corpus --output /tmp/text.json
+--bytes 33554432` retains a fixture outside the checkout. Inputs must contain
+at least 256 bytes. Earlier repeated-sentence measurements remain historical
+periodic stress results and do not represent this JSON text workload.
+
 Build the two reference drivers independently; never enable both features:
 
 ```sh
@@ -56,7 +66,9 @@ optimization is required for this preparation. Full cross-platform 0% regression
 parity remains an unachieved future objective; selected passing smoke rows do not
 establish it. Preserve every validated improvement and unsuccessful experiment's
 evidence. The Go harness retains `legacy-corpus` and `legacy-compare` commands
-for the pre-extraction two-process protocol. Run from
+for the pre-extraction two-process protocol. Its repeated-sentence text corpus
+is historical periodic stress, retained byte for byte rather than used as the
+main text workload. Run from
 `bench/bzip2-turbo-bench`: `go run . legacy-corpus DESTINATION --mib 32`
 and `go run . legacy-compare --codec EXE --oracle EXE --input FILE --results JSON`.
 The corpus bytes, CLI options, report keys, alternating order, Darwin resource
