@@ -61,11 +61,24 @@ Use CPU sampling, instructions retired where supported, and assembly to diagnose
 costs before changing algorithms. Do not infer CRC throughput from fused decoder
 samples.
 
-The first-pass baseline is frozen by operator instruction. No further parity
-optimization is required for this preparation. Full cross-platform 0% regression
-parity remains an unachieved future objective; selected passing smoke rows do not
-establish it. Preserve every validated improvement and unsuccessful experiment's
-evidence. The Go harness retains `legacy-corpus` and `legacy-compare` commands
+The extraction's first pass froze the performance baseline. On 2026-11-05, the
+operator authorized a focused ARM encoder followup from public base `f68b3ab`.
+Full cross-platform 0% regression parity remains unachieved, and repeated-sentence
+encoding remains an open performance gap. Selected passing rows do not establish
+that gate. Keep raw evidence for validated improvements and unsuccessful
+experiments outside the repository.
+
+Mac ARM64 sampling attributed 13.8% of JSON encoding samples to Huffman table
+fitting, concentrated in selector price sums. `Entropy::fit` now packs all six
+table costs into independent 10-bit lanes of one `u64`. A selector contains at
+most 50 symbols with code lengths at most 16, so each lane totals at most 800,
+below its 1,024 carry boundary; all six lanes fit in 60 bits. This replaces six
+indexed price loads per symbol with one. Table traversal and strict comparison
+preserve the earliest-table tie rule and encoded output. Scratch remains fixed
+on the stack, with no new heap allocations or API changes. Differential checks
+use the pinned [7-Zip 26.04 source](https://github.com/ip7z/7zip/tree/9128b80e3a471108678e2b3ec3c985861c8d7b0f).
+
+The Go harness retains `legacy-corpus` and `legacy-compare` commands
 for the pre-extraction two-process protocol. Its repeated-sentence text corpus
 is historical periodic stress, retained byte for byte rather than used as the
 main text workload. Run from

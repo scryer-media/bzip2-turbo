@@ -244,6 +244,15 @@ impl Entropy {
             for frequency in &mut self.frequencies[..groups] {
                 frequency[..alphabet].fill(0);
             }
+            // A selector sums at most 50 lengths, each <= 16, so every
+            // 10-bit lane totals <= 800 without carrying into its neighbor.
+            // All six table prices therefore fit independently in 60 bits.
+            let mut packed_lens = [0u64; ALPHABET];
+            for (symbol, packed) in packed_lens[..alphabet].iter_mut().enumerate() {
+                for table in 0..groups {
+                    *packed |= u64::from(self.lens[table][symbol]) << (10 * table);
+                }
+            }
             let mut symbols = Symbols {
                 bytes: self.mtf.iter(),
             };
@@ -254,13 +263,14 @@ impl Entropy {
                     chunk[size] = symbol;
                     size += 1;
                 }
-                let mut best_price = u32::MAX;
+                let prices: u64 = chunk[..size]
+                    .iter()
+                    .map(|&symbol| packed_lens[usize::from(symbol)])
+                    .sum();
+                let mut best_price = u64::MAX;
                 let mut best = 0;
                 for table in 0..groups {
-                    let price: u32 = chunk[..size]
-                        .iter()
-                        .map(|&symbol| u32::from(self.lens[table][usize::from(symbol)]))
-                        .sum();
+                    let price = (prices >> (10 * table)) & 0x3ff;
                     if price < best_price {
                         best_price = price;
                         best = table;
