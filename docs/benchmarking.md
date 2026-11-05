@@ -63,10 +63,9 @@ samples.
 
 The extraction's first pass froze the performance baseline. On 2026-11-05, the
 operator authorized a focused ARM encoder followup from public base `f68b3ab`.
-Full cross-platform 0% regression parity remains unachieved, and repeated-sentence
-encoding remains an open performance gap. Selected passing rows do not establish
-that gate. Keep raw evidence for validated improvements and unsuccessful
-experiments outside the repository.
+Full cross-platform 0% regression parity remains unachieved pending complete
+measurements. Selected passing rows do not establish that gate. Keep raw evidence
+for validated improvements and unsuccessful experiments outside the repository.
 
 Mac ARM64 sampling attributed 13.8% of JSON encoding samples to Huffman table
 fitting, concentrated in selector price sums. `Entropy::fit` now packs all six
@@ -77,6 +76,16 @@ indexed price loads per symbol with one. Table traversal and strict comparison
 preserve the earliest-table tie rule and encoded output. Scratch remains fixed
 on the stack, with no new heap allocations or API changes. Differential checks
 use the pinned [7-Zip 26.04 source](https://github.com/ip7z/7zip/tree/9128b80e3a471108678e2b3ec3c985861c8d7b0f).
+
+Non-timing instrumentation of a 16 MiB repeated-sentence input with a 71-byte
+period, 500,000-byte blocks, one thread and one pass counted 1.857 billion of
+2.266 billion partition rank reads in empty midpoint passes. After the first
+empty partition, `SortGroup` now scans exact minimum and maximum ranks once.
+An empty partition has made no swaps or rank writes, so those bounds can skip
+the original binary midpoint decisions until the first midpoint that divides
+the keys. That midpoint uses the existing partition loop, preserving its order,
+ties, flags and subsequent rank writes. These operation counts identify wasted
+scanning; they are not elapsed-time results.
 
 The Go harness retains `legacy-corpus` and `legacy-compare` commands
 for the pre-extraction two-process protocol. Its repeated-sentence text corpus
