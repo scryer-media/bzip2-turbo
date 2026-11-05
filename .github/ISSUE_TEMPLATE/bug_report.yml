@@ -1,0 +1,21 @@
+name: Bug report
+description: Report an encoding, decoding or integration defect
+title: "[bug] "
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Use invented data and filenames. Remove private paths, contacts and credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Crate version, features, platform and reference codec version

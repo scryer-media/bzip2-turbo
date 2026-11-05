@@ -1,0 +1,85 @@
+# bzip2-turbo
+
+Streaming BZip2 compression and decompression using a Rust port of the 7-Zip
+codec. Includes familiar `bzip2`-compatible adapters and explicit native APIs
+for multithreading and memory policy. CRC-32/BZIP2 uses `crc-turbo`.
+
+## Familiar streaming API
+
+```toml
+[dependencies]
+bzip2 = { package = "bzip2-turbo", version = "0.1" }
+```
+
+```rust
+use bzip2_turbo::{Compression, read::BzDecoder, write::BzEncoder};
+use std::io::{Read, Write};
+
+let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
+encoder.write_all(b"a streaming codec")?;
+let compressed = encoder.finish()?;
+let mut decoder = BzDecoder::new(compressed.as_slice());
+let mut restored = Vec::new();
+decoder.read_to_end(&mut restored)?;
+assert_eq!(restored, b"a streaming codec");
+# Ok::<(), std::io::Error>(())
+```
+
+With the Cargo rename above, imports remain `bzip2::...`; without renaming,
+use `bzip2_turbo::...` as in the example. The adapter surface targets bzip2
+0.6.1: `read`, `write`, `bufread`, `Compression`, `Compress`, `Decompress`,
+`Action`, `Status`, and `Error`. Ordinary `BzDecoder` reads one member;
+`MultiBzDecoder` reads concatenated members. Use `bufread` when bytes after the
+compressed member must remain available in the underlying reader.
+
+Compatibility covers the source interface and stream behavior, with explicit
+backend differences: `work_factor` is validated but does not tune the 7-Zip
+sorter, compact decoding uses a different memory representation, and compressed
+bytes can differ from libbz2. Read the [compatibility contract](https://github.com/scryer-media/bzip2-turbo/blob/main/PORTING.md)
+before relying on backend-specific behavior. Existing backend/linkage Cargo
+features are not carried over. The default `compress` feature enables encoding;
+`default-features = false` provides decoding only. The library requires `std`.
+
+## Explicit 7-Zip settings
+
+```rust
+use bzip2_turbo::{Encoder, EncoderOptions};
+use std::io::Write;
+
+let options = EncoderOptions { threads: 4, level: 5, ..Default::default() };
+let mut encoder = Encoder::new(Vec::new(), options);
+encoder.write_all(b"explicit worker budget")?;
+let compressed = encoder.finish()?;
+# assert!(!compressed.is_empty());
+# Ok::<(), std::io::Error>(())
+```
+
+Native `Encoder` and `Decoder` default to one thread. Encoding preserves output
+order across bounded worker slots. Decoding uses a parser/reconstruction
+pipeline when threading is requested; requesting eight threads does not imply
+eight reconstruction workers. `Decoder::with_low_memory` selects compact TT
+storage. Memory estimates cover codec allocations, not whole-process RSS.
+Native `EncoderOptions` follows 7-Zip's level/pass mapping, which differs from
+compatibility `Compression` levels. Native `Decoder` defaults to concatenated
+streams; `set_multistream(false)` selects one member.
+
+## Validation and measurements
+
+The [porting notes](https://github.com/scryer-media/bzip2-turbo/blob/main/PORTING.md) map behavior and tests. The
+[validation record](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/validation.md) separates completed local checks from
+CI coverage. [Benchmarking](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmarking.md) compares 7zz, turbo, and isolated standard Rust bzip2 pure Rust/C backends with
+verified output, alternating rounds, medians and RSS.
+
+Performance work is paused at the first-pass baseline. Full ARM/x86 ST/MT
+performance parity is **not claimed**. Existing improvements and diagnostic
+evidence are preserved for subsequent work.
+
+## License
+
+The translated codec is LGPL-2.1-or-later: [COPYING](https://github.com/scryer-media/bzip2-turbo/blob/main/COPYING) and
+[7-Zip notices](https://github.com/scryer-media/bzip2-turbo/blob/main/LICENSE-7ZIP). The compatibility adapters and API definitions
+retain [MIT notices](https://github.com/scryer-media/bzip2-turbo/blob/main/LICENSE-BZIP2-MIT). Package metadata declares both.
+No libbz2 runtime or C codec build is required by the library. Standard bzip2
+is a dev-only oracle; optional standalone benchmark tools can build either its
+pure Rust or bundled C backend. See the [publishing prerequisites](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/publishing.md)
+for the operator-owned first publication and downstream integration steps.

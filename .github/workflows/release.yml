@@ -1,0 +1,91 @@
+name: Release existing signed tag
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing SSH-signed annotated vX.Y.Z tag to validate
+        required: true
+        type: string
+      publish:
+        description: Publish the verified tag to crates.io
+        required: true
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      commit: ${{ steps.identity.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify existing tag before checking out its code
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          ALLOWED_SIGNERS: ${{ vars.RELEASE_ALLOWED_SIGNERS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$GITHUB_REF" = refs/heads/main
+          test -n "$ALLOWED_SIGNERS"
+          printf '%s\n' "$ALLOWED_SIGNERS" > "$RUNNER_TEMP/allowed-signers"
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = tag
+          git cat-file tag "refs/tags/$RELEASE_TAG" | grep -q '^-----BEGIN SSH SIGNATURE-----$'
+          git -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed-signers" verify-tag "refs/tags/$RELEASE_TAG"
+          git switch --detach "refs/tags/$RELEASE_TAG"
+          git cat-file commit HEAD | grep -q '^gpgsig -----BEGIN SSH SIGNATURE-----$'
+          git -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed-signers" verify-commit HEAD
+      - name: Require stable ancestry and successful CI on the exact source commit
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$commit" origin/main
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$commit&event=push&status=success&per_page=100" > "$RUNNER_TEMP/ci.json"
+          jq -e --arg sha "$commit" '[.workflow_runs[] | select(.head_sha == $sha and .head_branch == "main" and .conclusion == "success")] | length > 0' "$RUNNER_TEMP/ci.json"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Check version matches tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python3 -c 'import os, tomllib; assert "v" + tomllib.load(open("Cargo.toml", "rb"))["package"]["version"] == os.environ["RELEASE_TAG"]'
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.97.1
+      # This workflow never creates or changes tags.
+      - run: cargo package --locked -p bzip2-turbo
+
+  publish:
+    needs: validate
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.97.1
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      - name: Publish verified source through trusted publishing
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked -p bzip2-turbo

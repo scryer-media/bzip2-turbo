@@ -1,0 +1,53 @@
+[package]
+name = "bzip2-turbo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+description = "Streaming BZip2 encoding and decoding based on the 7-Zip codec"
+license = "LGPL-2.1-or-later AND MIT"
+repository = "https://github.com/scryer-media/bzip2-turbo"
+homepage = "https://github.com/scryer-media/bzip2-turbo"
+readme = "README.md"
+keywords = ["bzip2", "compression", "decompression", "streaming"]
+categories = ["compression"]
+exclude = [".github/", ".githooks/", ".gitleaks.toml", "AGENTS.md", "renovate.json", "rust-toolchain.toml", "fuzz/", "bench/", "tools/", ".worktrees/"]
+
+[workspace]
+exclude = ["fuzz", "tools/bzip2-reference", "tools/bzip2-large"]
+resolver = "3"
+
+[dependencies]
+crc-turbo = { version = "1.11.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+bzip2 = "=0.6.1"
+
+[features]
+default = ["compress"]
+compress = []
+
+[[example]]
+name = "codec-bench"
+required-features = ["compress"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = 1
+
+[profile.test]
+debug = 0
+split-debuginfo = "off"
+incremental = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

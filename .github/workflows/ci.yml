@@ -1,0 +1,207 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  RUST_TOOLCHAIN: 1.97.1
+  NIGHTLY_TOOLCHAIN: nightly-2026-09-01
+  CARGO_TERM_COLOR: always
+jobs:
+  hygiene:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: python3 .github/scripts/privacy.py
+      - name: Commit message privacy
+        shell: bash
+        run: |
+          git log --format=%B > "$RUNNER_TEMP/messages"
+          python3 .github/scripts/privacy.py --message "$RUNNER_TEMP/messages"
+      - name: Secret scanning
+        run: |
+          python3 .github/scripts/scan-secrets.py --docker
+          docker run --rm -v "$PWD:/repo:ro" zricethezav/gitleaks:v8.30.1 git /repo --redact --config=/repo/.gitleaks.toml
+          git log --format=%B | docker run --rm -i -v "$PWD:/repo:ro" zricethezav/gitleaks:v8.30.1 stdin --redact --config=/repo/.gitleaks.toml
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - run: cargo fmt --manifest-path tools/bzip2-reference/Cargo.toml -- --check
+      - run: cargo fmt --manifest-path tools/bzip2-large/Cargo.toml -- --check
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Build pinned 7-Zip 26.04 reference (Linux and macOS)
+        if: runner.os != 'Windows'
+        run: bash .github/scripts/build-bzip2-oracle.sh
+      - name: Locate installed interoperability reference (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if command -v 7z >/dev/null; then
+            oracle="$(command -v 7z)"
+          elif [ -f '/c/Program Files/7-Zip/7z.exe' ]; then
+            oracle='C:/Program Files/7-Zip/7z.exe'
+          else
+            echo 'Required 7-Zip interoperability oracle unavailable' >&2
+            exit 1
+          fi
+          echo "BZIP2_TURBO_7ZZ=$oracle" >> "$GITHUB_ENV"
+          "$oracle" i
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
+      - run: cargo nextest run --locked --workspace --all-features --no-fail-fast
+      - run: cargo nextest run --locked --workspace --no-default-features --no-fail-fast
+      - run: cargo test --locked --doc --all-features --no-fail-fast
+      - run: cargo test --locked --doc --no-default-features --no-fail-fast
+  docs-package:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+      - run: cargo doc --locked --no-deps --all-features
+      - run: cargo package --locked -p bzip2-turbo
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: msrv
+        run: python3 -c 'import tomllib, os; v=tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"]; open(os.environ["GITHUB_OUTPUT"], "a").write("version="+v+"\n")'
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - run: cargo check --locked --all-features
+      - run: cargo check --locked --no-default-features
+  wasm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+      - run: cargo check --locked --target wasm32-unknown-unknown --all-features
+      - run: cargo check --locked --target wasm32-unknown-unknown --no-default-features
+  portable-miri:
+    runs-on: ubuntu-24.04
+    env:
+      MIRIFLAGS: -Zmiri-strict-provenance
+      RUSTUP_TOOLCHAIN: nightly-2026-09-01
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+          components: miri, rust-src
+      # This verifies portable ownership only, not native allocation/advice FFI.
+      - run: 'cargo "+$NIGHTLY_TOOLCHAIN" miri test --locked --lib tt_storage::tests:: --no-fail-fast'
+  fuzz:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-09-01
+      FUZZ_TARGET: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [decode, roundtrip]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo "+$NIGHTLY_TOOLCHAIN" fuzz run "$FUZZ_TARGET" -- -runs=2000 -seed=1 -max_len=16384 -rss_limit_mb=2048
+  benchmark-tool:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: bench/bzip2-turbo-bench
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: go version
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+  reference-tools:
+    runs-on: ubuntu-24.04
+    env:
+      REFERENCE_BACKEND: ${{ matrix.backend }}
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [pure, c]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - run: cargo check --locked --manifest-path tools/bzip2-large/Cargo.toml
+      # Backend features are mutually exclusive and must stay separate.
+      - run: cargo clippy --locked --manifest-path tools/bzip2-reference/Cargo.toml --all-targets --no-default-features --features "$REFERENCE_BACKEND" -- -D warnings
+      - run: cargo build --locked --manifest-path tools/bzip2-reference/Cargo.toml --release --no-default-features --features "$REFERENCE_BACKEND"
+  ci-complete:
+    if: always()
+    needs: [hygiene, fmt, native, docs-package, msrv, wasm, portable-miri, fuzz, benchmark-tool, reference-tools]
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: python3 -c 'import json, os; assert all(j["result"] == "success" for j in json.loads(os.environ["RESULTS"]).values()), os.environ["RESULTS"]'

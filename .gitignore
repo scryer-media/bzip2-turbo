@@ -1,0 +1,16 @@
+/target/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+/.worktrees/
+/bench/results/
+*.profraw
+.DS_Store
+__pycache__/
+*.pyc
+/bench/bzip2-turbo-bench/bzip2-turbo-bench
+/bench/bzip2-turbo-bench/bzip2-turbo-bench.exe
+
+/tools/bzip2-reference/target/
+/tools/bzip2-large/target/

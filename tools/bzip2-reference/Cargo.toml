@@ -1,0 +1,15 @@
+[package]
+name = "bzip2-reference-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+pure = ["bzip2/default"]
+c = ["bzip2/bzip2-sys", "bzip2/static"]
+
+[dependencies]
+bzip2 = { version = "=0.6.1", default-features = false }

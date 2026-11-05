@@ -1,0 +1,4 @@
+title = "bzip2-turbo secret scanning"
+
+[extend]
+useDefault = true
