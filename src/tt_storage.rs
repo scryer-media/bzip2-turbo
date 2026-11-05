@@ -13,7 +13,7 @@ mod sealed {
 }
 
 /// Only the two fixed, all-zero-valid TT representations may own native storage.
-pub(crate) trait Word: sealed::Sealed + Copy + Default + Send {
+pub(crate) trait Word: sealed::Sealed + Copy + Default + Send + Sync {
     const MAX_ALLOCATION: usize;
 }
 impl Word for u32 {
@@ -183,6 +183,10 @@ mod native {
     // SAFETY: Buffer uniquely owns its C allocation; moving it never creates aliases.
     // Word is sealed to the two Send integer representations, with no borrowed data.
     unsafe impl<W: Word> Send for Buffer<W> {}
+    // SAFETY: Word is sealed to Sync integers with no interior mutability. Shared
+    // access exposes only immutable slices; mutation and length changes require
+    // &mut self, and deallocation requires ownership. Shared access exposes no pointer.
+    unsafe impl<W: Word> Sync for Buffer<W> {}
     impl<W: Word> Buffer<W> {
         pub(super) fn new(bytes: usize) -> Option<Self> {
             Self::allocate(bytes, |pointer, length| {
@@ -249,6 +253,30 @@ mod native {
     }
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn shared_native_words_are_read_only_until_all_borrows_end() {
+            let mut compact = super::Buffer::<u32>::new(2 << 20).unwrap();
+            compact.set_len(257);
+            compact.as_mut_slice().fill(17);
+            let mut paired = super::Buffer::<[u32; 2]>::new(2 << 20).unwrap();
+            paired.set_len(257);
+            paired.as_mut_slice().fill([19, 31]);
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    let compact = &compact;
+                    let paired = &paired;
+                    scope.spawn(move || {
+                        assert_eq!(compact.as_slice(), [17; 257]);
+                        assert_eq!(paired.as_slice(), [[19, 31]; 257]);
+                    });
+                }
+            });
+            // Exclusive access and eventual destruction resume after every join.
+            compact.as_mut_slice()[0] = 47;
+            paired.as_mut_slice()[0] = [53, 59];
+            assert_eq!(compact.as_slice()[0], 47);
+            assert_eq!(paired.as_slice()[0], [53, 59]);
+        }
         #[test]
         fn advice_is_inside_the_owned_alignment_and_failure_keeps_zeroed_storage() {
             let mut buffer = super::Buffer::<u32>::allocate(4 << 20, |pointer, bytes| {
