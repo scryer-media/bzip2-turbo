@@ -41,7 +41,8 @@
   version, `Cargo.lock` and changelog in the same PR, sized by
   `cargo semver-checks`, under a released `## <version>` heading.
 - Present the README benchmarks as one table per platform with MiB/s in the
-  column headers.
+  column headers, and show the serial `bzip2` references at every thread
+  budget instead of only at 1T.
 
 ## 0.1.0
 
