@@ -58,6 +58,17 @@ flow, table construction and storage lifetime together.
   more branch misses. Native differential tests compare every position and
   evolving MTF state for each variant. Other platforms retain their previous
   MTF selection.
+- Refill the bit reservoir the way `ReadBlock2` does: up to three bytes before
+  each symbol, each load behind its own count test, in place of a 32-bit word
+  loaded whenever fewer than 20 bits remained. The word refill's branch fired
+  on a pattern the predictor missed on high-entropy input: 22 million branch
+  misses against 17 million for 7zz on film at level 5 on Graviton3, with the
+  parser taking 99 percent of them. A branch-free 64-bit refill removed the
+  misses but added 12 percent more instructions and was slower; the byte-wise
+  shape matches 7zz's miss count and brings film at one thread to within one
+  percent of 7zz at every level, ahead at two threads, while the logs and json
+  cases give up 2 to 3 percent of their lead and stay within one percent of
+  7zz. Four-byte run stores, also tried, were neutral and were not kept.
 - Scatter inverse-BWT links as `DecodeBlock1` does, with each bucket counter
   loaded and stored through one plain address register. The ordinary scatter
   builds a table of references to the 256 counter cells once per block, walks
