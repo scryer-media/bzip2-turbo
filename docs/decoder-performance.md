@@ -158,27 +158,32 @@ timing. Ratios are this crate's time over 7zz's; below 1.0 is faster.
 
 | case | Graviton3 1T | Graviton3 2T | Intel 1T | Intel 2T |
 | --- | --- | --- | --- | --- |
-| logs L1 | 0.97 | 1.00 | 1.01 | 0.96 |
-| json L1 | 0.97 | 0.97 | 1.01 | 0.83 |
-| film L1 | 1.07 | 1.02 | 0.72 | 0.52 |
-| program L1 | 1.01 | 0.93 | 0.85 | 0.63 |
-| logs L5 | 0.98 | 1.03 | 1.02 | 1.00 |
-| json L5 | 0.99 | 1.01 | 1.02 | 1.03 |
-| film L5 | 1.04 | 1.01 | 0.74 | 0.57 |
-| logs L9 | 0.98 | 1.04 | 1.02 | 0.99 |
+| logs L1 | 0.97 | 0.99 | 1.01 | 0.98 |
+| json L1 | 0.98 | 0.97 | 1.01 | 0.84 |
+| film L1 | 1.07 | 1.03 | 0.72 | 0.52 |
+| program L1 | 1.02 | 0.93 | 0.86 | 0.64 |
+| logs L5 | 0.98 | 1.04 | 1.01 | 1.01 |
+| json L5 | 0.99 | 1.02 | 1.02 | 1.03 |
+| film L5 | 1.05 | 1.02 | 0.74 | 0.56 |
+| logs L9 | 1.00 | 1.02 | 1.01 | 1.00 |
 | json L9 | 0.99 | 1.00 | 1.01 | 1.01 |
-| film L9 | 1.06 | 1.00 | 0.81 | 0.89 |
-| repeated L9 | 0.56 | 0.58 | 0.79 | 0.84 |
+| film L9 | 1.00 | 1.01 | 0.82 | 0.91 |
+| repeated L9 | 0.56 | 0.59 | 0.80 | 0.84 |
 
 Relative to the previous main build on the same hosts, the logs and json
-level 1 cases improved by 13 to 19 percent on Graviton3 and by 18 to 21
-percent at 2T on Intel, and the Intel level 5 and 9 cases by 1 to 13 percent.
+level 1 cases improved by 12 to 19 percent on Graviton3 and by 15 to 21
+percent at 2T on Intel, and the Intel level 5 and 9 cases by 1 to 12 percent.
+The Intel film cases read about 1 percent slower than main, the same size as
+the base build's own run-to-run spread; a reshaped reconstruction loop that
+measured 1.5 percent slower on those cases in isolation, and no faster
+anywhere, was removed from the series.
 TLB refill counts
 now match 7zz on both hosts (previously 150 times higher on Graviton3), and the
 `mmap` storage path makes these results independent of the process allocator.
 
-Remaining gaps, all on Graviton3: the film cases at 1T are 4 to 7 percent
-behind, entirely in the parser, where this crate executes fewer instructions
+Remaining gaps, all on Graviton3: the film cases at levels 1 and 5 at 1T are
+5 to 7 percent behind (level 9 is at parity in the final run and 5 percent
+behind in earlier runs, within that case's spread), entirely in the parser, where this crate executes fewer instructions
 than `ReadBlock2` but takes about 22 percent more branch misses; the CDecoder
 Huffman port did not change that count, so the source is elsewhere in the
 parser and is not yet diagnosed. The level 5 and 9 cases at 2T are 1 to 4
