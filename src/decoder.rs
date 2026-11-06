@@ -4,6 +4,7 @@
 //! Modified: safe Rust ownership, standard I/O, and bounded reconstruction jobs.
 use super::tt_storage::TtBuffer;
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -1125,6 +1126,9 @@ struct Worker {
     jobs: Option<std::sync::mpsc::SyncSender<Block>>,
     receiver: Option<std::sync::mpsc::Receiver<WorkerMessage>>,
     returned: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    /// Set on drop before the job queue closes, so a block still buffered in
+    /// the queue is discarded instead of reconstructed for nobody.
+    cancelled: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 impl Worker {
@@ -1134,6 +1138,8 @@ impl Worker {
         // its successor, without expanding an RLE-heavy block into one allocation.
         let (sender, receiver) = std::sync::mpsc::sync_channel(16);
         let (returned, buffers) = std::sync::mpsc::sync_channel(OUTPUT_OWNERS);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::clone(&cancelled);
         let handle = std::thread::Builder::new()
             .name("bzip2-reconstruct".into())
             .spawn(move || {
@@ -1143,6 +1149,11 @@ impl Worker {
                     allocated: 0,
                 };
                 while let Ok(block) = blocks.recv() {
+                    // A closed queue still yields its buffered block; skip the
+                    // table build and callback once the decoder is dropping.
+                    if cancel.load(Ordering::Acquire) {
+                        return;
+                    }
                     let mut output = BlockOutput::new(&block, links.take());
                     // The column travels back with Finished, so the caller never
                     // waits for an owner and the in-flight count bounds them.
@@ -1181,6 +1192,7 @@ impl Worker {
             jobs: Some(jobs),
             receiver: Some(receiver),
             returned: Some(returned),
+            cancelled,
             handle: Some(handle),
         })
     }
@@ -1206,19 +1218,21 @@ impl Worker {
             .send(block)
             .map_err(|_| io::Error::other("BZip2 worker stopped before accepting a block"))
     }
-    /// Queues a block without waiting; returns it when the one-slot queue is
-    /// occupied or the worker has exited. The caller keeps it staged and then
-    /// drains output, where an exited worker reports its own error.
-    fn try_submit(&self, block: Block) -> Option<Block> {
+    /// Queues the successor of the one in-flight block; returns it only when
+    /// the worker has exited. The caller keeps it staged and then drains
+    /// output, where an exited worker reports its own error.
+    ///
+    /// A full slot still holds the in-flight block: the worker is between
+    /// blocks (in `recv` or `into_links`), never waiting on output delivery or
+    /// an owner, since every earlier Finished has been received. It takes that
+    /// block promptly, so waiting for the slot cannot deadlock.
+    fn submit_successor(&self, block: Block) -> Option<Block> {
         use std::sync::mpsc::TrySendError;
-        match self
-            .jobs
-            .as_ref()
-            .expect("live worker job queue")
-            .try_send(block)
-        {
+        let jobs = self.jobs.as_ref().expect("live worker job queue");
+        match jobs.try_send(block) {
             Ok(()) => None,
-            Err(TrySendError::Full(block) | TrySendError::Disconnected(block)) => Some(block),
+            Err(TrySendError::Full(block)) => jobs.send(block).err().map(|error| error.0),
+            Err(TrySendError::Disconnected(block)) => Some(block),
         }
     }
     fn receive(&mut self) -> io::Result<WorkerMessage> {
@@ -1240,8 +1254,10 @@ impl Worker {
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        // Close every channel before joining: the worker can wait for output
-        // delivery, a returned owner, or the next block.
+        // Cancel a still-queued block first, then close every channel before
+        // joining: the worker can wait for output delivery, a returned owner,
+        // or the next block.
+        self.cancelled.store(true, Ordering::Release);
         self.receiver.take();
         self.returned.take();
         self.jobs.take();
@@ -1495,10 +1511,11 @@ impl<R: Read> Decoder<R> {
                     self.in_flight = 1;
                     continue;
                 }
-                // The worker may be waiting on output delivery; never block here.
-                // A full slot holds the in-flight block the worker has not yet
-                // taken; keep this one staged and retry after the next message.
-                match worker.try_submit(block) {
+                // Exactly one block is in flight. If it still fills the slot,
+                // the worker has not taken it, so it is between blocks rather
+                // than waiting on output: wait for the slot. Only an exited
+                // worker leaves this one staged, and receive then reports why.
+                match worker.submit_successor(block) {
                     None => self.in_flight += 1,
                     Some(block) => self.staged = Some(block),
                 }

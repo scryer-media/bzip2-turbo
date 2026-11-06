@@ -475,8 +475,10 @@ fn parser_error_after_queued_blocks_delivers_their_output_first() {
     assert!(blocks.len() >= 5);
     let prefix = blocks[0] + blocks[1];
     let mut corrupt = encoded.clone();
-    // Break the third block's marker: the parser fails there while the first
-    // two blocks are queued or being reconstructed.
+    // Break the third block's marker. With two threads the parser reaches it
+    // only after Finished for the first block (at most two blocks are in
+    // flight), so only the second block is in flight when the error is hit;
+    // its output must still be delivered before the error.
     let bit = after_block_magic(&corrupt, 3) - 1;
     flip_bit(&mut corrupt, bit);
     for threads in [1, 2, 4] {
@@ -513,13 +515,63 @@ fn worker_crc_error_never_delivers_the_queued_successor() {
                 Decoder::with_output_callback(corrupt.as_slice(), threads, move |bytes| {
                     *state.lock().unwrap() += bytes.len();
                 });
-            let (decoded, error) = read_until_error(&mut decoder, 4096);
+            // With a worker, the first read returns only after the successor
+            // is queued (or the worker has already stopped on the bad CRC); the
+            // pause lets the worker reach the bad CRC with it still waiting,
+            // so a worker that carried on would deliver it before the error.
+            let mut first = [0; 1];
+            decoder.read_exact(&mut first).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let (rest, error) = read_until_error(&mut decoder, 4096);
+            let decoded = [first.as_slice(), &rest].concat();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
             assert!(error.to_string().contains("block CRC"), "{error}");
             drop(decoder);
             assert!(decoded.len() >= start && decoded.len() < limit);
             assert_eq!(decoded, data[..decoded.len()]);
             assert!(*observed.lock().unwrap() < limit);
+        }
+    }
+}
+
+#[test]
+fn worker_reconstructs_the_queued_successor_while_the_caller_waits() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, Instant};
+    // Full 100k blocks, then one-block streams small enough that the caller
+    // parses the successor before the worker has taken the first block.
+    let full = compress_level(&random_bytes(350_000, 0x0a5c_ade5), 1);
+    let mut tiny = Vec::new();
+    for text in [b"first".as_slice(), b"second", b"third"] {
+        tiny.extend(compress_level(text, 1));
+    }
+    for (encoded, rounds) in [(&full, 1), (&tiny, 20)] {
+        let blocks = block_lengths(encoded);
+        assert!(blocks.len() >= 3);
+        let target = blocks[0] + blocks[1];
+        for _ in 0..rounds {
+            let observed = Arc::new(AtomicUsize::new(0));
+            let state = Arc::clone(&observed);
+            let mut decoder = Decoder::with_output_callback(encoded.as_slice(), 2, move |bytes| {
+                state.fetch_add(bytes.len(), Ordering::SeqCst);
+            });
+            decoder.read_exact(&mut [0; 1]).unwrap();
+            // The caller stays paused: only a successor queued during the
+            // first read can be reconstructed now. The output ring holds both
+            // blocks' chunks, so the worker never waits for this thread.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while observed.load(Ordering::SeqCst) < target && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                observed.load(Ordering::SeqCst),
+                target,
+                "the second block was not reconstructed ahead of the caller"
+            );
+            drop(decoder);
         }
     }
 }

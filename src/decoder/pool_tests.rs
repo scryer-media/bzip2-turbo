@@ -63,6 +63,7 @@ fn worker_drop_disconnects_a_blocked_output_send_before_join() {
         jobs: Some(jobs),
         receiver: Some(receiver),
         returned: Some(returned),
+        cancelled: Default::default(),
         handle: Some(handle),
     });
 }
@@ -86,6 +87,7 @@ fn worker_drop_disconnects_a_blocked_owner_receive_before_join() {
         jobs: Some(jobs),
         receiver: Some(receiver),
         returned: Some(returned),
+        cancelled: Default::default(),
         handle: Some(handle),
     });
 }
@@ -108,6 +110,7 @@ fn returning_an_owner_never_waits_for_the_worker() {
         jobs: Some(jobs),
         receiver: Some(receiver),
         returned: Some(returned),
+        cancelled: Default::default(),
         handle: None,
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -126,6 +129,7 @@ fn oversized_allocation_capacity_keeps_its_output_owner_credit() {
         jobs: Some(jobs),
         receiver: Some(receiver),
         returned: Some(returned),
+        cancelled: Default::default(),
         handle: None,
     };
     let bytes = Vec::with_capacity(OUTPUT_CHUNK + 1);
@@ -141,6 +145,30 @@ fn oversized_allocation_capacity_keeps_its_output_owner_credit() {
     assert_eq!(bytes.len(), OUTPUT_CHUNK);
     assert_eq!(pool.allocated, OUTPUT_OWNERS);
     drop_with_deadline(worker);
+}
+
+#[test]
+fn a_cancelled_worker_never_starts_a_queued_block() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    let (encoded, _) = members(&[1], 1000);
+    let mut parser = super::Parser::new(encoded.as_slice());
+    let block = parser.next().unwrap().expect("one block");
+    let observed = Arc::new(AtomicUsize::new(0));
+    let state = Arc::clone(&observed);
+    let callback: super::OutputCallback = Arc::new(Mutex::new(Box::new(move |bytes: &[u8]| {
+        state.fetch_add(bytes.len(), Ordering::SeqCst);
+    })));
+    let worker = Worker::start(Some(callback), super::Mode::platform()).unwrap();
+    // Drop sets the flag before closing the queue; set it first here so the
+    // worker sees it on the buffered block whether or not drop has run yet.
+    worker.cancelled.store(true, Ordering::Release);
+    worker.submit(block).unwrap();
+    // Give an uncancelled worker time to reach the callback before drop
+    // closes the owner queue, which would also stop it.
+    std::thread::sleep(Duration::from_millis(50));
+    drop_with_deadline(worker);
+    assert_eq!(observed.load(Ordering::SeqCst), 0);
 }
 
 fn members(levels: &[u32], length: usize) -> (Vec<u8>, Vec<u8>) {

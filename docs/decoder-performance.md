@@ -15,8 +15,12 @@ reconstruction worker. Increasing the requested thread count above two does
 not create more reconstruction workers. As in `RunScout`, the parser queues
 the next block as soon as it is parsed, so the worker can start it at a block
 boundary without waiting for the caller to observe the previous block's end.
-The pipeline still holds at most two parsed blocks at once, counting the one
-being reconstructed.
+When the worker has not yet taken the block in flight, the parser waits for
+the one-slot queue instead of holding the successor back; the worker is then
+between blocks, so that wait cannot depend on the caller. The pipeline still
+holds at most two parsed blocks at once, counting the one being reconstructed.
+Dropping the decoder discards a block still waiting in the queue before the
+worker builds its table.
 
 The Graviton baseline profile placed most of the MKV difference in entropy
 parsing, even though inverse-BWT reconstruction was also a large hotspot in
