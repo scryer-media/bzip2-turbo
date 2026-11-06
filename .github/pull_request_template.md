@@ -6,5 +6,6 @@ Validation:
 - Portable Miri versus native FFI coverage:
 - Platform or tooling limitations:
 
-Dependency changes require explicit approval. Performance changes are paused
-for the extraction pass. Do not include release or publication actions.
+Dependency changes require explicit approval. Performance changes need byte
+parity and interleaved median measurements. Do not include release or
+publication actions.

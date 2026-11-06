@@ -1,12 +1,10 @@
 # Contributor rules for bzip2-turbo
 
-This is a standalone BZip2 codec extracted from sevenz-turbo. Preserve the
-existing stream behavior and compatibility API while introducing standard I/O
-adapters. Keep source reference identities and required legal notices intact.
+This is a standalone BZip2 codec translated from 7-Zip. Preserve the existing
+stream behavior and compatibility API. Keep source reference identities and
+required legal notices intact.
 
-- First pass: API extraction, correctness, ownership and repository hygiene.
-  Performance changes are paused. Record the inherited performance baseline;
-  any future optimization needs differential byte parity and interleaved median
+- Performance changes need differential byte parity and interleaved median
   measurements. Do not claim a performance gate passed without measurements.
 - Malformed input returns an error rather than panicking or reading beyond bounds.
   Preserve reference encoder byte parity and verify against 7-Zip.
@@ -20,8 +18,8 @@ adapters. Keep source reference identities and required legal notices intact.
 - main is stable. Work on feature/, bugfix/ or hotfix/ branches; worktrees belong
   under .worktrees/. Never reset, clean, restore or stash a shared checkout.
 - Commits and operator-created tags must be SSH-signed. The manually dispatched
-  release workflow is authorized to create its release tag through GitHub, as
-  sevenz-turbo does; that workflow-created tag does not require SSH signing.
+  release workflow is authorized to create its release tag through GitHub;
+  that workflow-created tag does not require SSH signing.
   Do not bypass commit signing or push unless explicitly instructed. Release
   and publication require separate authorization.
 - Any code change bumps the crate version, `Cargo.lock` and `CHANGELOG.md` in

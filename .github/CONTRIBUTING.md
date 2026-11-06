@@ -11,6 +11,6 @@ BZIP2_TURBO_7ZZ to the reference executable. Report the source revision or
 installed reference version with validation results. Miri's portable storage
 checks do not validate native allocation or advice FFI.
 
-The extraction pass freezes performance work. Dependency changes need explicit
-approval. Never commit generated fixtures, fuzz inputs or raw benchmark data.
+Performance changes need byte parity and interleaved median measurements.
+Dependency changes need explicit approval. Never commit generated fixtures, fuzz inputs or raw benchmark data.
 Release and publication remain separate operator actions.

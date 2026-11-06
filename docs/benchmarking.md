@@ -63,7 +63,7 @@ Use CPU sampling, instructions retired where supported, and assembly to diagnose
 costs before changing algorithms. Do not infer CRC throughput from fused decoder
 samples.
 
-The extraction baseline and the later ARM encoder and decoder measurements
+The initial baseline and the later ARM encoder and decoder measurements
 are recorded separately. The encoder follow-up starts from public base `f68b3ab`;
 [decoder notes](decoder-performance.md) describe the subsequent parsing and
 storage changes. Current timed commands all write to the operating-system
@@ -95,7 +95,7 @@ ties, flags and subsequent rank writes. These operation counts identify wasted
 scanning; they are not elapsed-time results.
 
 The Go harness retains `legacy-corpus` and `legacy-compare` commands
-for the pre-extraction two-process protocol. Its repeated-sentence text corpus
+for the original two-process protocol. Its repeated-sentence text corpus
 is historical periodic stress, retained byte for byte rather than used as the
 main text workload. Run from
 `bench/bzip2-turbo-bench`: `go run . legacy-corpus DESTINATION --mib 32`
