@@ -89,12 +89,52 @@ impl<R: Read> Bits<R> {
     }
 }
 
+/// Longest BZip2 code, CDecoder's kNumBitsMax (BZip2Decoder's kMaxHuffmanLen).
+const MAX_CODE_BITS: u32 = 20;
+/// Largest BZip2 alphabet (256 MTF values, RUNA/RUNB, EOB), CDecoder's
+/// m_NumSymbols.
+const MAX_SYMBOLS: usize = 258;
+/// Direct-table width of `Huffman::symbol`, CDecoder's kNumTableBits. 7-Zip
+/// uses 9 for BZip2; any width in `1..MAX_CODE_BITS` is valid.
+const TABLE_BITS: u32 = 9;
+const TABLE_LEN: usize = 1 << TABLE_BITS;
+// One limit per long length plus the table bound and the sentinel.
+const LIMITS_LEN: usize = (MAX_CODE_BITS + 2 - TABLE_BITS) as usize;
+// One position bias per long length.
+const POSES_LEN: usize = (MAX_CODE_BITS - TABLE_BITS) as usize;
+// Short-code table entries, then the long-code symbols in canonical order. The
+// long run starts at the first table index no short code covers; for an
+// alphabet of at most 258 symbols that start minus the short-symbol count is
+// largest for short lengths 1..=TABLE_BITS, which bounds the array at
+// CDecoder's _symbols size.
+const TABLE_SYMBOLS_LEN: usize = TABLE_LEN + MAX_SYMBOLS - (TABLE_BITS as usize + 1);
+
+/// One canonical BZip2 Huffman table.
+///
+/// `first`/`counts`/`offsets`/`symbols` are the canonical code description the
+/// suspendable bit-serial decoder in `incremental` walks. `limits`, `poses`,
+/// `lens` and `table_symbols` are the lookup structure of 7-Zip's
+/// `NHuffman::CDecoder` (HuffmanDecoder.h, `Build` and `Z7_HUFF_DECODE_BASE`)
+/// used by `symbol`: codes of at most `TABLE_BITS` bits resolve through a
+/// direct table, and longer codes are found by comparing one 20-bit window
+/// against per-length code limits, with no bit-serial reads.
 struct Huffman {
     first: [u32; 21],
     counts: [u32; 21],
     offsets: [usize; 21],
     symbols: Vec<u16>,
-    fast: [u32; 1024],
+    // limits[0]: number of TABLE_BITS-bit prefixes owned by short codes, so a
+    // direct lookup is valid iff the window's top TABLE_BITS bits are below it.
+    // limits[len - TABLE_BITS] for long `len`: one past the last code of
+    // length `len`, left-aligned to 20 bits. The last entry is the 1 << 20
+    // sentinel that stops the length search past the longest code.
+    limits: [u32; LIMITS_LEN],
+    // poses[len - TABLE_BITS - 1]: subtracted from a length-`len` code value to
+    // index its symbol in `table_symbols`.
+    poses: [u32; POSES_LEN],
+    // Code length for each direct-table index below limits[0].
+    lens: [u8; TABLE_LEN],
+    table_symbols: [u16; TABLE_SYMBOLS_LEN],
 }
 impl Huffman {
     fn new(lengths: &[u8]) -> io::Result<Self> {
@@ -103,7 +143,10 @@ impl Huffman {
             counts: [0; 21],
             offsets: [0; 21],
             symbols: Vec::with_capacity(lengths.len()),
-            fast: [0; 1024],
+            limits: [0; LIMITS_LEN],
+            poses: [0; POSES_LEN],
+            lens: [0; TABLE_LEN],
+            table_symbols: [0; TABLE_SYMBOLS_LEN],
         };
         table.rebuild(lengths)?;
         Ok(table)
@@ -112,8 +155,14 @@ impl Huffman {
         self.first.fill(0);
         self.counts.fill(0);
         self.offsets.fill(0);
-        self.fast.fill(0);
+        self.limits.fill(0);
+        self.poses.fill(0);
+        self.lens.fill(0);
+        self.table_symbols.fill(0);
         self.symbols.clear();
+        if lengths.len() > MAX_SYMBOLS {
+            return Err(invalid("too many Huffman symbols"));
+        }
         self.symbols.reserve_exact(lengths.len());
         for &len in lengths {
             if !(1..=20).contains(&len) {
@@ -137,42 +186,86 @@ impl Huffman {
                 }
             }
         }
-        for len in 1..=10 {
+        // CDecoder::Build. Short codes fill their direct-table ranges: a
+        // length-`len` code owns 1 << (TABLE_BITS - len) consecutive indices.
+        let table_bits = TABLE_BITS as usize;
+        for len in 1..=table_bits {
+            let span = 1 << (table_bits - len);
             for index in 0..self.counts[len] {
                 let symbol = self.symbols[self.offsets[len] + index as usize];
-                let prefix = ((self.first[len] + index) as usize) << (10 - len);
-                for slot in &mut self.fast[prefix..prefix + (1 << (10 - len))] {
-                    *slot = (u32::from(symbol) << 8) | len as u32;
-                }
+                let prefix = ((self.first[len] + index) as usize) << (table_bits - len);
+                self.lens[prefix..prefix + span].fill(len as u8);
+                self.table_symbols[prefix..prefix + span].fill(symbol);
             }
         }
+        // `start` is the canonical code value at the current length and `next`
+        // the number of `table_symbols` slots used so far. Long symbols reuse
+        // the table indices at and above limits[0], which direct lookups never
+        // read. The tree is not oversubscribed, so start <= 1 << len.
+        let short = self.first[table_bits] + self.counts[table_bits];
+        self.limits[0] = short;
+        let mut start = short;
+        let mut next = short;
+        for len in table_bits + 1..=MAX_CODE_BITS as usize {
+            start <<= 1;
+            // start >= next: every used slot is a short-table prefix or an
+            // earlier long code, and each covers two or more values here.
+            self.poses[len - table_bits - 1] = start - next;
+            let count = self.counts[len];
+            let offset = self.offsets[len];
+            self.table_symbols[next as usize..(next + count) as usize]
+                .copy_from_slice(&self.symbols[offset..offset + count as usize]);
+            next += count;
+            start += count;
+            self.limits[len - table_bits] = start << (MAX_CODE_BITS as usize - len);
+        }
+        self.limits[LIMITS_LEN - 1] = 1 << MAX_CODE_BITS;
         Ok(())
     }
+    /// Decodes one symbol from a 20-bit window (Z7_HUFF_DECODE_BASE as
+    /// BZip2Decoder.cpp uses it through Z7_HUFF_DECODE_VAL_IN_HIGH32).
+    ///
+    /// The window needs 20 available bits even for a short code. A valid
+    /// stream always has them: the 80-bit end-of-stream footer follows the
+    /// last block. A stream cut closer than that returns UnexpectedEof.
+    /// Codes absent from an incomplete tree walk past the 20-bit limit and are
+    /// rejected as invalid, where CDecoder returns SZ_ERROR_DATA.
     #[inline(always)]
     fn symbol<R: Read>(&self, bits: &mut Bits<R>) -> io::Result<usize> {
-        let entry = self.fast[bits.peek(10)? as usize];
-        let len = entry & 255;
-        if len != 0 {
-            bits.consume(len);
-            return Ok((entry >> 8) as usize);
-        }
-        let mut code = bits.take(10)?;
-        for len in 11..=20 {
-            code = (code << 1) | bits.take(1)?;
-            let index = code.wrapping_sub(self.first[len]);
-            if index < self.counts[len] {
-                return Ok(usize::from(
-                    self.symbols[self.offsets[len] + index as usize],
-                ));
+        let window = bits.peek(MAX_CODE_BITS)?;
+        let prefix = window >> (MAX_CODE_BITS - TABLE_BITS);
+        if prefix >= self.limits[0] {
+            let mut len = TABLE_BITS + 1;
+            if window >= self.limits[1] {
+                // limits[LIMITS_LEN - 1] exceeds every window, so the search
+                // stops at MAX_CODE_BITS + 1 at the latest.
+                loop {
+                    len += 1;
+                    if window < self.limits[(len - TABLE_BITS) as usize] {
+                        break;
+                    }
+                }
+                if len > MAX_CODE_BITS {
+                    return Err(invalid("invalid Huffman code"));
+                }
             }
+            // The window is at or above the previous length's limit, so the
+            // code is at least this length's first code and the index lands
+            // in this length's run of `table_symbols`.
+            let code = window >> (MAX_CODE_BITS - len);
+            let index = code - self.poses[(len - TABLE_BITS - 1) as usize];
+            bits.consume(len);
+            return Ok(usize::from(self.table_symbols[index as usize]));
         }
-        Err(invalid("invalid Huffman code"))
+        let prefix = prefix as usize;
+        bits.consume(u32::from(self.lens[prefix]));
+        Ok(usize::from(self.table_symbols[prefix]))
     }
 }
 
 #[cfg(test)]
 mod high_reservoir_tests {
-    use super::{Bits, Huffman, invalid};
+    use super::{Bits, Huffman, TABLE_BITS, TABLE_LEN, invalid};
     use std::io::{self, Read};
     struct OriginalBits<R> {
         reader: R,
@@ -344,6 +437,13 @@ mod high_reservoir_tests {
     fn outcome<T>(result: io::Result<T>) -> Result<T, (io::ErrorKind, String)> {
         result.map_err(|error| (error.kind(), error.to_string()))
     }
+    // Bits consumed from a `Fragmented` input of `total` bytes.
+    fn consumed(bits: &Bits<Fragmented<'_>>, total: usize) -> usize {
+        (total - bits.reader.bytes.len() - (bits.end - bits.pos)) * 8 - bits.count as usize
+    }
+    fn original_consumed(bits: &OriginalBits<Fragmented<'_>>, total: usize) -> usize {
+        (total - bits.reader.bytes.len() - (bits.end - bits.pos)) * 8 - bits.count as usize
+    }
     #[test]
     fn high_aligned_huffman_matches_original_symbols_errors_and_refill_edges() {
         let trees = [
@@ -364,7 +464,23 @@ mod high_reservoir_tests {
             assert_eq!(packed.counts, original.counts);
             assert_eq!(packed.offsets, original.offsets);
             assert_eq!(packed.symbols, original.symbols);
-            assert_eq!(packed.fast, original.fast);
+            // The direct table holds exactly the original fast table's codes
+            // of at most TABLE_BITS bits.
+            for prefix in 0..TABLE_LEN {
+                let entry = original.fast[(prefix << 10) >> TABLE_BITS];
+                let len = entry & 255;
+                if (prefix as u32) < packed.limits[0] {
+                    assert_eq!(
+                        (
+                            u32::from(packed.lens[prefix]),
+                            u32::from(packed.table_symbols[prefix])
+                        ),
+                        (len, entry >> 8)
+                    );
+                } else {
+                    assert!(len == 0 || len > TABLE_BITS);
+                }
+            }
             let mut words = vec![0u32, u32::MAX, 0xaaaa_aaaa, 0x5555_5555];
             for length in 1..=20 {
                 for index in 0..packed.counts[length] {
@@ -384,12 +500,24 @@ mod high_reservoir_tests {
                             bytes: &bytes[..end],
                             width,
                         });
-                        assert_eq!(
-                            outcome(packed.symbol(&mut left)),
-                            outcome(original.symbol(&mut right))
-                        );
-                        assert_state(&left, &right);
-                        assert_eq!(left.reader.bytes.len(), right.reader.bytes.len());
+                        let got = outcome(packed.symbol(&mut left));
+                        // The CDecoder window always needs 20 bits, even
+                        // where the original resolved a short code early.
+                        if end * 8 < 20 {
+                            assert_eq!(
+                                got.map_err(|(kind, _)| kind),
+                                Err(io::ErrorKind::UnexpectedEof)
+                            );
+                            continue;
+                        }
+                        let want = outcome(original.symbol(&mut right));
+                        assert_eq!(got, want);
+                        // Refill granularity differs (a 20-bit window versus
+                        // 10-bit and single-bit reads), so compare the bits
+                        // each consumed rather than the reservoir state.
+                        if want.is_ok() {
+                            assert_eq!(consumed(&left, end), original_consumed(&right, end));
+                        }
                     }
                 }
             }
@@ -424,8 +552,10 @@ mod high_reservoir_tests {
                 for &symbol in &symbols {
                     assert_eq!(packed.symbol(&mut left).unwrap(), symbol);
                     assert_eq!(original.symbol(&mut right).unwrap(), symbol);
-                    assert_state(&left, &right);
-                    assert_eq!(left.reader.bytes.len(), right.reader.bytes.len());
+                    assert_eq!(
+                        consumed(&left, encoded.len()),
+                        original_consumed(&right, encoded.len())
+                    );
                 }
             }
         }
@@ -2110,7 +2240,10 @@ mod parser_workspace_tests {
         assert_eq!(actual.counts, expected.counts);
         assert_eq!(actual.offsets, expected.offsets);
         assert_eq!(actual.symbols, expected.symbols);
-        assert_eq!(actual.fast, expected.fast);
+        assert_eq!(actual.limits, expected.limits);
+        assert_eq!(actual.poses, expected.poses);
+        assert_eq!(actual.lens, expected.lens);
+        assert_eq!(actual.table_symbols, expected.table_symbols);
     }
 
     #[test]
@@ -2211,6 +2344,250 @@ mod parser_workspace_tests {
             let mut output = Vec::new();
             decoder.read_to_end(&mut output).unwrap();
             assert_eq!(output, [0, b'A', 0, b'A']);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cdecoder_tests {
+    use super::{Bits, Decoder, Huffman, MAX_CODE_BITS, MAX_SYMBOLS, Parser, TABLE_BITS};
+    use std::io::{self, Read, Write};
+
+    struct Rng(u32);
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+        fn below(&mut self, bound: usize) -> usize {
+            self.next() as usize % bound
+        }
+    }
+
+    /// Canonical (code, length) per symbol, assigned independently of
+    /// `Huffman`: codes ascend in (length, symbol) order.
+    fn canonical(lengths: &[u8]) -> Vec<(u32, u32)> {
+        let mut order: Vec<usize> = (0..lengths.len()).collect();
+        order.sort_by_key(|&symbol| (lengths[symbol], symbol));
+        let mut codes = vec![(0, 0); lengths.len()];
+        let mut previous: Option<(u32, u32)> = None;
+        for symbol in order {
+            let len = u32::from(lengths[symbol]);
+            let code = previous.map_or(0, |(code, prev)| (code + 1) << (len - prev));
+            codes[symbol] = (code, len);
+            previous = Some((code, len));
+        }
+        codes
+    }
+
+    /// Straightforward bit-serial reference: extend the code one bit at a time
+    /// and search every symbol for an exact (code, length) match.
+    fn reference(codes: &[(u32, u32)], bits: &[u8], mut position: usize) -> Option<(usize, u32)> {
+        let mut code = 0;
+        for len in 1..=MAX_CODE_BITS {
+            let bit = (bits[position / 8] >> (7 - position % 8)) & 1;
+            position += 1;
+            code = (code << 1) | u32::from(bit);
+            if let Some(symbol) = codes.iter().position(|&entry| entry == (code, len)) {
+                return Some((symbol, len));
+            }
+        }
+        None
+    }
+
+    fn put(bytes: &mut Vec<u8>, position: &mut usize, code: u32, len: u32) {
+        for shift in (0..len).rev() {
+            if position.is_multiple_of(8) {
+                bytes.push(0);
+            }
+            *bytes.last_mut().unwrap() |= (((code >> shift) & 1) as u8) << (7 - *position % 8);
+            *position += 1;
+        }
+    }
+
+    fn consumed(bits: &Bits<&[u8]>, total: usize) -> usize {
+        (total - bits.reader.len() - (bits.end - bits.pos)) * 8 - bits.count as usize
+    }
+
+    /// Complete trees from random leaf splits, with lengths permuted across
+    /// symbols, plus an incomplete variant missing one leaf.
+    fn random_trees(rng: &mut Rng) -> Vec<Vec<u8>> {
+        let mut trees = Vec::new();
+        for size in [2, 3, 7, 50, 200, 257, 258] {
+            let mut depths = vec![1u8, 1];
+            while depths.len() < size {
+                let index = rng.below(depths.len());
+                if depths[index] < MAX_CODE_BITS as u8 {
+                    depths[index] += 1;
+                    depths.push(depths[index]);
+                }
+            }
+            for index in (1..depths.len()).rev() {
+                depths.swap(index, rng.below(index + 1));
+            }
+            let mut incomplete = depths.clone();
+            incomplete.remove(rng.below(incomplete.len()));
+            trees.push(depths);
+            if incomplete.len() >= 2 {
+                trees.push(incomplete);
+            }
+        }
+        // Deep trees: always split the deepest leaf so lengths reach 20.
+        for size in [21, 40, 258] {
+            let mut depths = vec![1u8, 1];
+            while depths.len() < size {
+                let index = if rng.below(2) == 0 {
+                    (0..depths.len())
+                        .filter(|&i| depths[i] < MAX_CODE_BITS as u8)
+                        .max_by_key(|&i| depths[i])
+                        .unwrap()
+                } else {
+                    rng.below(depths.len())
+                };
+                if depths[index] < MAX_CODE_BITS as u8 {
+                    depths[index] += 1;
+                    depths.push(depths[index]);
+                }
+            }
+            trees.push(depths);
+        }
+        trees
+    }
+
+    #[test]
+    fn limits_decode_matches_bit_serial_reference_for_every_symbol_and_window() {
+        let mut rng = Rng(0x9e37_79b9);
+        let mut every_length: Vec<u8> = (1..=20).collect();
+        every_length.push(20);
+        let long = TABLE_BITS as u8 + 1;
+        let mut trees = vec![
+            every_length,
+            vec![1, 1],
+            vec![2, 2],
+            vec![1, 2, 3, 3],
+            vec![1, 20, 20],
+            vec![8; 256],
+            vec![TABLE_BITS as u8; 258],
+            // Every code longer than the direct table.
+            vec![long; 258],
+            vec![long, long, 20, 20],
+            vec![12; 258],
+            vec![20; 258],
+            (0..258)
+                .map(|i| long + (i % (21 - u16::from(long))) as u8)
+                .collect(),
+        ];
+        trees.extend(random_trees(&mut rng));
+        for lengths in trees {
+            assert!(lengths.len() <= MAX_SYMBOLS);
+            let table = Huffman::new(&lengths).unwrap();
+            let codes = canonical(&lengths);
+            // Every symbol once, then a random message; 32 zero bits keep a
+            // full window available at the last code.
+            let mut message: Vec<usize> = (0..lengths.len()).collect();
+            message.extend((0..2000).map(|_| rng.below(lengths.len())));
+            let mut bytes = Vec::new();
+            let mut position = 0;
+            for &symbol in &message {
+                let (code, len) = codes[symbol];
+                put(&mut bytes, &mut position, code, len);
+            }
+            bytes.extend([0; 4]);
+            let mut bits = Bits::new(bytes.as_slice());
+            let mut expected_position = 0;
+            for &symbol in &message {
+                let (want, len) = reference(&codes, &bytes, expected_position).unwrap();
+                assert_eq!(want, symbol);
+                expected_position += len as usize;
+                assert_eq!(table.symbol(&mut bits).unwrap(), symbol, "{lengths:?}");
+                assert_eq!(consumed(&bits, bytes.len()), expected_position);
+            }
+            // Single windows: each code's first and last 20-bit extension,
+            // the value just past each code, and random values. Windows
+            // outside an incomplete tree must be errors, not panics.
+            let mut windows: Vec<u32> = (0..4096).map(|_| rng.next() >> 12).collect();
+            for &(code, len) in &codes {
+                let low = code << (MAX_CODE_BITS - len);
+                let high = low | ((1 << (MAX_CODE_BITS - len)) - 1);
+                windows.extend([low, high, high + 1]);
+            }
+            windows.extend([0, (1 << MAX_CODE_BITS) - 1]);
+            for window in windows {
+                if window >= 1 << MAX_CODE_BITS {
+                    continue;
+                }
+                let mut bytes = (window << 12).to_be_bytes().to_vec();
+                bytes.extend([0; 4]);
+                let mut bits = Bits::new(bytes.as_slice());
+                match reference(&codes, &bytes, 0) {
+                    Some((symbol, len)) => {
+                        assert_eq!(table.symbol(&mut bits).unwrap(), symbol);
+                        assert_eq!(consumed(&bits, bytes.len()), len as usize);
+                    }
+                    None => {
+                        let error = table.symbol(&mut bits).unwrap_err();
+                        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                        assert_eq!(error.to_string(), "invalid Huffman code");
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            Huffman::new(&[1; MAX_SYMBOLS + 1])
+                .err()
+                .map(|e| e.to_string()),
+            Some("too many Huffman symbols".to_owned())
+        );
+    }
+
+    #[test]
+    fn streams_cut_inside_the_symbol_area_are_truncation_errors() {
+        let mut rng = Rng(0x2545_f491);
+        // Skewed bytes give a spread of code lengths, some past the table.
+        let data: Vec<u8> = (0..60_000)
+            .map(|_| {
+                let r = rng.next();
+                if r & 7 == 0 {
+                    (r >> 8) as u8
+                } else {
+                    ((r >> 8) % 24) as u8
+                }
+            })
+            .collect();
+        let mut encoder = crate::write::BzEncoder::new(Vec::new(), crate::Compression::fast());
+        encoder.write_all(&data).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let mut whole = Vec::new();
+        Decoder::new(encoded.as_slice())
+            .read_to_end(&mut whole)
+            .unwrap();
+        assert_eq!(whole, data);
+        // The coding tables end well inside the first few hundred bytes; cut
+        // every 61 bytes through the symbol area and at every one of the
+        // final 16 bytes, which hold the last codes and the footer.
+        let cuts = (400..encoded.len() - 16)
+            .step_by(61)
+            .chain(encoded.len() - 16..encoded.len());
+        for cut in cuts {
+            let mut parser = Parser::new(&encoded[..cut]);
+            let error = loop {
+                match parser.next() {
+                    Ok(Some(block)) => parser.columns.give(block.last),
+                    Ok(None) => panic!("prefix {cut} parsed to the end"),
+                    Err(error) => break error,
+                }
+            };
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "prefix {cut}");
+            for threads in [1, 2] {
+                assert!(
+                    Decoder::with_threads(&encoded[..cut], threads)
+                        .read_to_end(&mut Vec::new())
+                        .is_err(),
+                    "accepted prefix {cut} at {threads} threads"
+                );
+            }
         }
     }
 }

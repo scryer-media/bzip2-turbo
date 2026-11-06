@@ -12,6 +12,11 @@
   platform CI and benchmark tooling.
 - Improve encoder table pricing and block-sort partition scans while preserving
   reference output bytes.
+- Decode native parser Huffman symbols with 7-Zip's `CDecoder` structure: one
+  20-bit window, a 9-bit direct table for short codes and per-length code limits
+  for longer codes, with no bit-serial reads. Incomplete and oversubscribed
+  trees keep their existing acceptance and rejection, and decoded bytes are
+  unchanged.
 - Reduce native decoder parsing and output-storage work, reuse bounded parser
   scratch, and retain source-faithful Linux ARM64 MTF traversal.
 - Reshape the compact inverse-BWT reconstruction loop after

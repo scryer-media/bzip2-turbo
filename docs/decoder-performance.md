@@ -31,8 +31,22 @@ flow, table construction and storage lifetime together.
 ## Retained changes
 
 - Keep active bits at the high end of the reservoir, allowing a constant shift
-  for the fast Huffman index. Preserve the existing 32-bit refill policy and
+  for the Huffman window. Preserve the existing 32-bit refill policy and
   reader/error behavior, including fragmented input and `WouldBlock`.
+- Decode parser symbols with the structure of 7-Zip's `NHuffman::CDecoder`
+  (HuffmanDecoder.h `Build` and `Z7_HUFF_DECODE_BASE`, as BZip2Decoder.cpp uses
+  it): each symbol reads one 20-bit window. If its top `TABLE_BITS` bits (9, as
+  in 7-Zip) fall below the short-code bound, a direct table gives the code
+  length and symbol. Otherwise the window is compared against per-length code
+  limits, left-aligned to 20 bits, to find the length, and a per-length position
+  bias indexes the long-code symbols, which are stored in canonical order after
+  the table region. There are no bit-serial reads. All arrays are fixed-size and
+  rebuilt in place per block. A window past the last code of an incomplete tree
+  is rejected as invalid; oversubscribed trees are still rejected at build time.
+  Every symbol needs 20 available bits, which a valid stream always has because
+  the end-of-stream footer follows the last block; a stream cut closer than that
+  is a truncation error. The suspendable incremental decoder keeps its
+  bit-serial canonical walk.
 - Use the reference's forward word-at-a-time MTF carry loop on Linux ARM64.
   Native differential tests compare every position and evolving MTF state.
   Other platforms retain their previous MTF selection.
@@ -52,7 +66,8 @@ flow, table construction and storage lifetime together.
 - Store validated Huffman selectors as bytes, retaining validation and input
   consumption even beyond the selector storage cap.
 - Retain alphabet, selectors, code lengths and Huffman table allocations across
-  blocks. Rebuilding clears canonical metadata, symbols and fast-table sentinels.
+  blocks. Rebuilding clears canonical metadata, symbols and the CDecoder limit,
+  position and lookup arrays.
   Published blocks own their data and never borrow this scratch storage.
 
 ## Compact reconstruction loop
