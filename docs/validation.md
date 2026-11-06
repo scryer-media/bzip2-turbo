@@ -39,21 +39,14 @@ verified source, executable and fixture identities. No samples were filtered
 and no cases were restarted. These benchmarks do not rerun the native test
 sweeps above or establish universal performance parity.
 
-The following extraction record is historical, not a claim that all of those
+The following initial record is historical, not a claim that all of those
 checks were rerun on this commit.
 
-## Extraction baseline
+## Initial baseline
 
-The standalone crate was checked locally on macOS. Completed native sweeps used
+The crate was checked locally on macOS. Completed native sweeps used
 cargo-nextest 0.9.143 with `--no-fail-fast`: 116 all-feature tests passed with no
-skips, and 43 decoding-only tests passed with no skips. The local sevenz-turbo
-integration sweep passed 613 tests with eight expected ignored tests, using an
-invocation-only Cargo patch to the standalone checkout. That patch is not part
-of the downstream manifest: sevenz-turbo declares registry dependency
-`bzip2-turbo = "0.1.0"`, so an operator-authorized crates.io publication is still
-required for its unpatched packaging and CI. A targeted sevenz-turbo archive
-sweep also passed all six BZip2 tests, including the normally ignored oracle
-case. Its doctests passed three examples with one ignored.
+skips, and 43 decoding-only tests passed with no skips.
 
 Strict rustdoc passed with `RUSTDOCFLAGS=-Dwarnings cargo doc --locked
 --all-features --no-deps`. Default-feature doctests passed both examples;
@@ -65,11 +58,10 @@ decoding-only configurations, and for the fuzz workspace. The isolated
 pure Rust and bundled C reference drivers each passed Clippy, a roundtrip,
 compressed-byte comparison with each other, and five invalid-argument checks.
 Their resolved dependency graphs contain only the selected codec backend.
-Standalone `cargo package` verified a 45-file package that excludes benchmark,
+`cargo package` verified a 45-file package that excludes benchmark,
 fuzz, tool and CI content. Pinned Miri passed four focused tests with strict
 provenance; this verifies portable ownership paths, not native OS FFI or
-architecture CRC kernels. The downstream workspace passed strict all-target,
-all-feature Clippy. The standalone default and decoding-only configurations
+architecture CRC kernels. The default and decoding-only configurations
 compiled for Wasm with the pinned 1.97.1 compiler.
 
 The new decode and roundtrip fuzz targets each completed 100 AddressSanitizer
@@ -89,10 +81,3 @@ multithreaded media callbacks, byte comparisons and independent 7zz decoding.
 See [large-stream validation](large-streams.md) for identities and commands.
 Remote platform CI has not yet been verified.
 CI configuration alone does not establish that those jobs ran.
-
-The pre-extraction signed baseline is sevenz-turbo `e704d1e`. Its historical
-verification and performance results are preserved in
-[implementation history](implementation-history.md); they do not certify the
-new compatibility code. Historical performance runs remain preserved separately
-from the current full-suite results; no full ARM/x86 single-threaded or
-multithreaded parity claim is made.
