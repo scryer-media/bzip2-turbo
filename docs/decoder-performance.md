@@ -2,9 +2,11 @@
 
 The native `Decoder` changes in runtime commit `8a2188e6b667` were selected
 from paired measurements against the pinned 7-Zip 26.04 reference. The
-decode-parity follow-up measured below brings native decoding to 7zz parity or
-better on every measured x86-64 case and on most AArch64 cases, with the
-remaining AArch64 gaps listed. The compatibility adapters retain their
+decode-parity follow-up measured below brings native decoding to 7zz's time or
+better on the film, program and repeated-text cases on both hosts and on the
+two-thread level 1 text cases, and to within 4 percent of 7zz on the other
+text cases. Parity here means 7zz's time or better; every case still behind
+is listed under the measured results. The compatibility adapters retain their
 separate incremental parser; native-parser timings do not measure that API.
 
 ## Follow the complete stream
