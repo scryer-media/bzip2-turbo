@@ -94,10 +94,10 @@ Level-5 combined-corpus throughput in MiB/s: total original bytes divided by the
 | bzip2 (C) / 1T | 8.5 | 35.7 |
 | bzip2-turbo / 2T | 18.0 | 66.0 |
 | 7zz / 2T | 12.0 | 64.8 |
-| bzip2-turbo / 4T | 32.1 | 65.7 |
-| 7zz / 4T | 21.7 | 64.7 |
-| bzip2-turbo / 8T | 54.0 | 65.0 |
-| 7zz / 8T | 38.1 | 64.5 |
+| bzip2-turbo / 4T | 32.1 | — |
+| 7zz / 4T | 21.7 | — |
+| bzip2-turbo / 8T | 54.0 | — |
+| 7zz / 8T | 38.1 | — |
 
 ### x86-64 — Intel Xeon
 
@@ -109,12 +109,12 @@ Level-5 combined-corpus throughput in MiB/s: total original bytes divided by the
 | bzip2 (C) / 1T | 9.8 | 42.5 |
 | bzip2-turbo / 2T | 22.3 | 117.5 |
 | 7zz / 2T | 16.8 | 90.0 |
-| bzip2-turbo / 4T | 39.9 | 112.2 |
-| 7zz / 4T | 30.2 | 88.9 |
-| bzip2-turbo / 8T | 45.9 | 116.5 |
-| 7zz / 8T | 38.0 | 89.1 |
+| bzip2-turbo / 4T | 39.9 | — |
+| 7zz / 4T | 30.2 | — |
+| bzip2-turbo / 8T | 45.9 | — |
+| 7zz / 8T | 38.0 | — |
 
-Budgets are requested thread counts. Native bzip2-turbo decoding uses at most two threads including the caller; its 4T/8T rows retain those requests. The pure Rust and C references are serial and appear once at 1T. See [detailed results and methodology](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmark.md) for every fixture, level, budget, peak RSS and source identity.
+Budgets are requested thread counts. Native bzip2-turbo decoding uses at most two threads (parser and one reconstruction worker), so a 4T or 8T decode request runs the same pipeline as 2T; decode is measured at 1T and 2T only, and the 4T/8T rows report encoding only. The pure Rust and C references are serial and appear once at 1T. See [detailed results and methodology](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmark.md) for every fixture, level, budget, peak RSS and source identity.
 
 Aggregate rates do not imply a lead on every fixture.
 

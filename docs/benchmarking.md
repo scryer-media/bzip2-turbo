@@ -32,7 +32,9 @@ and `bzip2-sys` 0.1.13+1.0.8 for `c`. The pure graph must exclude `bzip2-sys`;
 the C graph must exclude `libbz2-rs-sys`. Both drivers require one thread and
 use the same standard I/O buffering as the turbo compatibility driver. Native
 turbo and 7zz can use matching explicit worker counts; reports retain the
-serial reference thread count. This is benchmark-only isolation, not a library
+serial reference thread count. Native decoding uses at most two threads, so the
+suite times decode at 1 and 2 threads only; higher budgets time encoding and
+record decode as a skipped scenario. This is benchmark-only isolation, not a library
 backend feature or runtime dependency.
 
 The harness defaults to `--settings block-size`: indices 1, 5 and 9 mean

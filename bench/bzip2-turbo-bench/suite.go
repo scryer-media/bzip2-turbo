@@ -21,7 +21,24 @@ type scenario struct {
 	API     string `json:"api"`
 	Level   int    `json:"level"`
 	Threads int    `json:"threads"`
+	Mode    string `json:"mode,omitempty"`
 	Skip    string `json:"skip,omitempty"`
+}
+
+// nativeDecodeThreadCap is the most threads the native decoder uses: one
+// parser and one reconstruction worker. It mirrors the `threads.clamp(1, 2)`
+// in `Decoder::with_mode` (src/decoder.rs); a larger request runs the same
+// two-thread pipeline, so decode is not timed above it.
+const nativeDecodeThreadCap = 2
+
+// modes lists the timed modes for a runnable scenario. Native scenarios above
+// the decoder's thread cap time encoding only; their decode mode is recorded
+// as a skipped scenario by schedule.
+func modes(s scenario) []string {
+	if s.API == "native" && s.Threads > nativeDecodeThreadCap {
+		return []string{"encode"}
+	}
+	return []string{"encode", "decode"}
 }
 
 func integers(text string, maximum int) ([]int, error) {
@@ -60,6 +77,12 @@ func schedule(corpora []string, levels, threads []int, apis []string) ([]scenari
 						skipped = append(skipped, s)
 					} else {
 						ready = append(ready, s)
+						if api == "native" && n > nativeDecodeThreadCap {
+							d := s
+							d.Mode = "decode"
+							d.Skip = "native decoding uses at most two threads (parser and one worker); decode is measured at 1 and 2 threads"
+							skipped = append(skipped, d)
+						}
 					}
 				}
 			}
@@ -280,7 +303,8 @@ func (t tools) measure(s scenario, input, scratch string, repeats, warmups int) 
 			return nil, fmt.Errorf("native 7zz parity: %w", e)
 		}
 	}
-	// Every decoder consumes every encoder's stream before any timing begins.
+	// Every decoder consumes every encoder's stream before any timing begins,
+	// at the scenario's thread count even when decode timing is skipped.
 	for encoder, path := range packed {
 		for decoder, name := range names {
 			output := os.DevNull
@@ -310,7 +334,8 @@ func (t tools) measure(s scenario, input, scratch string, repeats, warmups int) 
 		return nil, errors.New("generated ELF is not materially compressible: 7zz encoded/input fraction exceeds 0.90")
 	}
 	var rows []row
-	for _, mode := range []string{"encode", "decode"} {
+	// 7zz decode is dropped with ours: every row pairs both at one budget.
+	for _, mode := range modes(s) {
 		source := input
 		if mode == "decode" {
 			source = packed[0]

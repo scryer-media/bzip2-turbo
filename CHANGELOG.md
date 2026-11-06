@@ -38,3 +38,6 @@
   at most two last columns; the Linux single-threaded compact estimate is now
   8 MiB. `Vec`-backed TT and column storage zero-fills only growth past the
   largest length it has held.
+- Benchmark harness: decode is measured only at 1 and 2 threads, matching the
+  native decoder's two-thread cap; higher budgets still measure encoding and are
+  recorded as skipped decode scenarios.

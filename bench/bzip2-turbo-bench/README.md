@@ -110,7 +110,8 @@ Build the native example and both isolated reference builds as documented in
 cargo build --manifest-path ../../Cargo.toml --release --example codec-bench
 go run . toolchain --sevenzip 7zz
 go run . suite --sevenzip 7zz --size-kib 16 --levels 1,5,9 --threads 1,2 --api both --repeats 4 --out /tmp/bzip2-smoke.json
-# Full matrix, only when explicitly measuring performance on an idle host:
+# Full matrix, only when explicitly measuring performance on an idle host
+# (native 4T/8T time encoding only; decode is timed at 1T and 2T):
 go run . suite --sevenzip 7zz --size-kib 32768 --levels 1,5,9 --threads 1,2,4,8 --api both --repeats 4 --out /tmp/bzip2-matrix.json
 go run . run --sevenzip 7zz --input /tmp/corpus.bin --threads 1 --out /tmp/bzip2-run.json
 ```
@@ -126,7 +127,12 @@ See the reference-build README for explicit equivalent environment overrides.
 the source identity root. No tools are built or downloaded automatically.
 `--list` prints the matrix without requiring tools. Corpora are deterministic
 text, random, periodic and runs. Compatibility turbo is serial and skipped for
-thread counts above one. Pure Rust and C references always run one real thread;
+thread counts above one. Native decoding uses at most two threads (parser and
+one reconstruction worker, `Decoder::with_mode`'s clamp), so native scenarios
+above two threads time encoding only; their decode mode, for turbo and 7zz
+alike, is listed in `Skipped` with `"mode": "decode"`. Every encoder's stream is
+still cross-decoded by every decoder at the scenario's thread count before
+timing. Pure Rust and C references always run one real thread;
 `reference_threads` records this even when native turbo and 7zz use more threads.
 
 Default `--settings block-size` gives the setting index an explicit meaning:
