@@ -24,10 +24,11 @@
 - Lay out the Linux AArch64 MTF carry loop as GCC lays out 7-Zip's
   `ReadBlock2` loop, two words per iteration with an exit test after each;
   film streams decode 1 to 3 percent faster on Graviton3, bytes unchanged.
-- Refill the bit reservoir as `ReadBlock2` does, up to three bytes each
-  behind its own test, instead of one word when it runs low. The word refill's
-  branch mispredicted on high-entropy streams; film now decodes within one
-  percent of 7zz at one thread on Graviton3 and ahead at two.
+- On Linux AArch64, refill the bit reservoir as `ReadBlock2` does, up to
+  three bytes each behind its own test, instead of one word when it runs low.
+  The word refill's branch mispredicted on high-entropy streams there; film
+  now decodes within 1 to 3 percent of 7zz at one thread on Graviton3 and
+  ahead at two. x86-64 keeps the word refill, which measured faster on it.
 - Reduce native decoder parsing and output-storage work, reuse bounded parser
   scratch, and retain source-faithful Linux ARM64 MTF traversal.
 - Remove per-byte bounds-check branches from the inverse-BWT link scatter and

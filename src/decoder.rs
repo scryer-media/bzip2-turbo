@@ -55,15 +55,18 @@ impl<R: Read> Bits<R> {
             return Ok(0);
         }
         // CBitDecoder keeps active bits high-aligned. A refill starts with
-        // fewer than n <= 32 bits and adds at most three bytes, so at most 55
+        // fewer than n <= 32 bits and adds at most one word, so at most 63
         // bits are active. Unused low bits remain zero after every refill and
         // consume.
-        // ReadBlock2's refill: at most three bytes, each behind its own
-        // count test, loaded straight from the buffer. The one-word refill
-        // this replaced fired on a pattern the branch predictor missed on
-        // high-entropy streams (22 million misses against 17 million here
-        // for 7zz on film at level 5 on Graviton3); this shape matches 7zz's
-        // miss count and its film decode time within one percent.
+        //
+        // Linux ARM64 refills as ReadBlock2 does: at most three bytes, each
+        // behind its own count test. The one-word refill fired on a pattern
+        // Graviton3's branch predictor missed on high-entropy streams (22
+        // million misses against 17 million for 7zz on film at level 5); the
+        // byte-wise shape matches 7zz's miss count and its film decode time
+        // within one percent there. On x86-64 the word refill measured 2 to 6
+        // percent faster than the byte-wise one, so other platforms keep it.
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         if self.count < n && self.end - self.pos >= 3 {
             self.bits |= u64::from(self.buffer[self.pos]) << (56 - self.count);
             self.pos += 1;
@@ -78,6 +81,13 @@ impl<R: Read> Bits<R> {
                     self.count += 8;
                 }
             }
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+        if self.count < n && self.end - self.pos >= 4 {
+            let word = u32::from_be_bytes(self.buffer[self.pos..self.pos + 4].try_into().unwrap());
+            self.bits |= u64::from(word) << (32 - self.count);
+            self.pos += 4;
+            self.count += 32;
         }
         while self.count < n {
             let byte = self.byte()?.ok_or_else(|| {
@@ -321,8 +331,18 @@ mod high_reservoir_tests {
         }
         #[inline(always)]
         fn peek(&mut self, n: u32) -> io::Result<u32> {
-            // Byte-at-a-time refill, the state the production reader's
-            // three-byte fast path must reproduce exactly.
+            // The same refill policy as the production reader on this
+            // platform, whose state the high-aligned reservoir must reproduce
+            // exactly: one word when it can on most platforms, bytes behind
+            // their own tests on Linux ARM64.
+            #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+            if self.count < n && self.end - self.pos >= 4 {
+                let word =
+                    u32::from_be_bytes(self.buffer[self.pos..self.pos + 4].try_into().unwrap());
+                self.bits = (self.bits << 32) | u64::from(word);
+                self.pos += 4;
+                self.count += 32;
+            }
             while self.count < n {
                 let byte = self.byte()?.ok_or_else(|| {
                     io::Error::new(io::ErrorKind::UnexpectedEof, "truncated BZip2 stream")
