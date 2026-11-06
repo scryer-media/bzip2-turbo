@@ -1,17 +1,7 @@
 # Changelog
 
-## 0.1.0
+## 0.1.1
 
-- Extract the 7-Zip BZip2 port into an independent library with retained LGPL
-  provenance and crc-turbo checksums.
-- Preserve bounded native single-threaded and multithreaded encoding/decoding,
-  compact memory selection, callbacks and explicit 7-Zip settings.
-- Add bzip2 0.6.1-compatible streaming and low-level APIs with documented backend
-  tuning and memory differences; retain MIT adapter notices.
-- Add independent conformance, compatibility, fuzz, privacy, secret-scanning,
-  platform CI and benchmark tooling.
-- Improve encoder table pricing and block-sort partition scans while preserving
-  reference output bytes.
 - Decode native parser Huffman symbols with 7-Zip's `CDecoder` structure: one
   20-bit window, a 9-bit direct table for short codes and per-length code limits
   for longer codes, with no bit-serial reads. Incomplete and oversubscribed
@@ -31,13 +21,8 @@
   film now decodes within 1 to 2 percent of 7zz at one thread on Graviton3
   and ahead at two, and the text cases, which keep the word refill, 1 to 4
   percent ahead. x86-64 keeps the word refill, which measured faster on it.
-- Reduce native decoder parsing and output-storage work, reuse bounded parser
-  scratch, and retain source-faithful Linux ARM64 MTF traversal.
 - Remove per-byte bounds-check branches from the inverse-BWT link scatter and
   paired successor pass with safe, branch-free index clamping.
-- Add reproducible JSON, logs, repeated-text, media and executable fixtures, plus
-  corrected codec-process RSS accounting and verified four-way benchmarks.
-- Preserve measured baselines and remaining gaps without claiming complete parity.
 - Queue each parsed block for the decoder's reconstruction worker while it
   still reconstructs the previous block, matching 7-Zip's parser run-ahead.
 - Back every streaming `Decoder` TT and last column (the compatibility API's
@@ -52,3 +37,27 @@
   native decoder's two-thread cap; higher budgets still measure encoding and are
   recorded as skipped decode scenarios. `legacy-compare` applies the same
   cap to its decode timings while still checking bytes at every thread count.
+- Add contributor rules for version-bump PRs: every code change bumps the
+  version, `Cargo.lock` and changelog in the same PR, sized by
+  `cargo semver-checks`, under a released `## <version>` heading.
+- Present the README benchmarks as separate encode and decode tables per
+  platform, narrow enough for crates.io, with MiB/s in the header, and show the serial `bzip2` references at every thread
+  budget instead of only at 1T.
+
+## 0.1.0
+
+- Extract the 7-Zip BZip2 port into an independent library with retained LGPL
+  provenance and crc-turbo checksums.
+- Preserve bounded native single-threaded and multithreaded encoding/decoding,
+  compact memory selection, callbacks and explicit 7-Zip settings.
+- Add bzip2 0.6.1-compatible streaming and low-level APIs with documented backend
+  tuning and memory differences; retain MIT adapter notices.
+- Add independent conformance, compatibility, fuzz, privacy, secret-scanning,
+  platform CI and benchmark tooling.
+- Improve encoder table pricing and block-sort partition scans while preserving
+  reference output bytes.
+- Reduce native decoder parsing and output-storage work, reuse bounded parser
+  scratch, and retain source-faithful Linux ARM64 MTF traversal.
+- Add reproducible JSON, logs, repeated-text, media and executable fixtures, plus
+  corrected codec-process RSS accounting and verified four-way benchmarks.
+- Preserve measured baselines and remaining gaps without claiming complete parity.

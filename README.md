@@ -59,50 +59,49 @@ and the decoder's design are in the crate documentation and under
 
 ## Benchmarks
 
-Level-5 combined-corpus throughput in MiB/s: total original bytes divided by
-the sum of each fixture's median wall time over four measured rounds, using
-varied JSON, structured logs, repeated text, MKV and ELF. Whole-process
-measurements with a null output sink; budgets are requested thread counts.
-Native decoding uses at most two threads, so decode is measured at 1T and 2T.
-The pure Rust and C references are serial.
+Level 5, all fixtures combined (JSON, logs, repeated text, MKV, ELF). Higher is
+better. 1T–8T is the requested thread count.
 
-### ARM64 — Graviton3
+### ARM64 (Graviton3)
 
-| Engine / budget | Encode | Decode |
+| Encode MiB/s | 1T | 2T | 4T | 8T |
+|---|---:|---:|---:|---:|
+| **bzip2-turbo** | **10.6** | **18.0** | **32.1** | **54.0** |
+| 7zz | 6.8 | 12.0 | 21.7 | 38.1 |
+| bzip2 (Rust) | 8.9 | 8.9 | 8.9 | 8.9 |
+| bzip2 (C) | 8.5 | 8.5 | 8.4 | 8.4 |
+
+| Decode MiB/s | 1T | 2T |
 |---|---:|---:|
-| bzip2-turbo / 1T | 10.6 | 47.0 |
-| 7zz / 1T | 6.8 | 46.4 |
-| bzip2 (Rust) / 1T | 8.9 | 34.4 |
-| bzip2 (C) / 1T | 8.5 | 35.7 |
-| bzip2-turbo / 2T | 18.0 | 66.0 |
-| 7zz / 2T | 12.0 | 64.8 |
-| bzip2-turbo / 4T | 32.1 | — |
-| 7zz / 4T | 21.7 | — |
-| bzip2-turbo / 8T | 54.0 | — |
-| 7zz / 8T | 38.1 | — |
+| **bzip2-turbo** | **47.0** | **66.0** |
+| 7zz | 46.4 | 64.8 |
+| bzip2 (Rust) | 34.4 | 34.5 |
+| bzip2 (C) | 35.7 | 35.7 |
 
-### x86-64 — Intel Xeon
+### x86-64 (Intel Xeon)
 
-| Engine / budget | Encode | Decode |
+| Encode MiB/s | 1T | 2T | 4T | 8T |
+|---|---:|---:|---:|---:|
+| **bzip2-turbo** | **13.0** | **22.3** | **39.9** | **45.9** |
+| 7zz | 9.3 | 16.8 | 30.2 | 38.0 |
+| bzip2 (Rust) | 11.0 | 10.9 | 10.9 | 10.8 |
+| bzip2 (C) | 9.8 | 9.7 | 9.7 | 9.7 |
+
+| Decode MiB/s | 1T | 2T |
 |---|---:|---:|
-| bzip2-turbo / 1T | 13.0 | 84.6 |
-| 7zz / 1T | 9.3 | 71.5 |
-| bzip2 (Rust) / 1T | 11.0 | 42.0 |
-| bzip2 (C) / 1T | 9.8 | 42.5 |
-| bzip2-turbo / 2T | 22.3 | 117.5 |
-| 7zz / 2T | 16.8 | 90.0 |
-| bzip2-turbo / 4T | 39.9 | — |
-| 7zz / 4T | 30.2 | — |
-| bzip2-turbo / 8T | 45.9 | — |
-| 7zz / 8T | 38.0 | — |
+| **bzip2-turbo** | **84.6** | **117.5** |
+| 7zz | 71.5 | 90.0 |
+| bzip2 (Rust) | 42.0 | 42.1 |
+| bzip2 (C) | 42.5 | 42.7 |
 
-Aggregate rates do not imply a lead on every fixture. Every fixture, level,
-budget, peak RSS and source identity is in the
-[detailed results](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmark.md);
-the [benchmarking guide](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmarking.md)
-reproduces them and the
-[decoder performance notes](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/decoder-performance.md)
-compare the native decoder with 7zz case by case.
+- Decoding uses at most two threads, so it is measured at 1T and 2T only.
+- The standard `bzip2` crate is single-threaded, so its rate stays flat as
+  threads are added: at 2T bzip2-turbo encodes 2x and decodes 1.9x (ARM64)
+  to 2.8x (x86-64) faster.
+- These are combined totals; bzip2-turbo does not lead on every fixture.
+- [Per-fixture results, all levels and peak RSS](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmark.md),
+  [how to reproduce them](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmarking.md),
+  and the [decoder compared with 7zz case by case](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/decoder-performance.md).
 
 ## Attribution
 
