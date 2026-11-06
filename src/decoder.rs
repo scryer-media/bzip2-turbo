@@ -996,7 +996,7 @@ fn move_mtf(words: &mut [u64; 32], index: usize, next: u64, byte: u8) {
     #[cfg(target_arch = "x86_64")]
     move_mtf_reverse(words, index, next, byte);
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    move_mtf_forward(words, index, next, byte);
+    move_mtf_forward2(words, index, next, byte);
     #[cfg(all(
         not(target_arch = "x86_64"),
         not(all(target_os = "linux", target_arch = "aarch64"))
@@ -1004,15 +1004,42 @@ fn move_mtf(words: &mut [u64; 32], index: usize, next: u64, byte: u8) {
     move_mtf_paired(words, index, next, byte);
 }
 
-// ReadBlock2 / CMtf8Decoder::GetAndMove advances one word per carry step.
-// Keep the paired implementation selected on its existing other platforms.
-#[cfg(any(all(target_os = "linux", target_arch = "aarch64"), test))]
+// ReadBlock2 / CMtf8Decoder::GetAndMove as one word per carry step; kept as
+// the test oracle for the two-word layout below.
+#[cfg(test)]
 #[inline(always)]
 fn move_mtf_forward(words: &mut [u64; 32], index: usize, next: u64, byte: u8) {
     let word = index / 8;
     let shift = (index & 7) * 8;
     let mut carry = u64::from(byte);
     for entry in &mut words[..word] {
+        let previous = *entry;
+        *entry = (previous << 8) | carry;
+        carry = previous >> 56;
+    }
+    let mask = u64::MAX >> (56 - shift);
+    words[word] = (next & !mask) | (((next << 8) | carry) & mask);
+}
+
+// ReadBlock2's carry loop as GCC lays it out: two words per iteration with an
+// exit test after each word, so no separate remainder loop. On Graviton3 this
+// measured 1 to 3 percent faster than the one-word loop on film streams with
+// the same branch-miss count. Keep the paired implementation selected on its
+// existing other platforms.
+#[cfg(any(all(target_os = "linux", target_arch = "aarch64"), test))]
+#[inline(always)]
+fn move_mtf_forward2(words: &mut [u64; 32], index: usize, next: u64, byte: u8) {
+    let word = index / 8;
+    let shift = (index & 7) * 8;
+    let mut carry = u64::from(byte);
+    let mut entries = words[..word].iter_mut();
+    while let Some(entry) = entries.next() {
+        let previous = *entry;
+        *entry = (previous << 8) | carry;
+        carry = previous >> 56;
+        let Some(entry) = entries.next() else {
+            break;
+        };
         let previous = *entry;
         *entry = (previous << 8) | carry;
         carry = previous >> 56;
@@ -1702,7 +1729,10 @@ impl<R: Read> Read for Decoder<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{move_mtf, move_mtf_bytes, move_mtf_forward, move_mtf_paired, move_mtf_reverse};
+    use super::{
+        move_mtf, move_mtf_bytes, move_mtf_forward, move_mtf_forward2, move_mtf_paired,
+        move_mtf_reverse,
+    };
     #[test]
     fn byte_mtf_preserves_evolving_reduced_alphabets_and_unused_tail() {
         for size in [
@@ -1747,11 +1777,14 @@ mod tests {
                 let mut paired = words;
                 let mut reversed = words;
                 let mut forward = words;
+                let mut forward2 = words;
                 let mut bytes: [u8; 256] = expected.as_slice().try_into().unwrap();
                 move_mtf_paired(&mut paired, index, next, byte);
                 move_mtf_reverse(&mut reversed, index, next, byte);
                 move_mtf_forward(&mut forward, index, next, byte);
+                move_mtf_forward2(&mut forward2, index, next, byte);
                 assert_eq!(forward, paired, "forward MTF state at index {index}");
+                assert_eq!(forward2, paired, "forward2 MTF state at index {index}");
                 assert_eq!(paired, reversed, "MTF state at index {index}");
                 move_mtf(&mut words, index, next, byte);
                 assert_eq!(words, paired, "selected MTF state at index {index}");

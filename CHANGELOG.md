@@ -21,6 +21,9 @@
   references, two positions per step, so each counter is addressed through one
   register as in 7-Zip's `DecodeBlock1`; x86-64 level 5 and 9 decoding reaches
   7zz parity on the measured Intel host.
+- Lay out the Linux AArch64 MTF carry loop as GCC lays out 7-Zip's
+  `ReadBlock2` loop, two words per iteration with an exit test after each;
+  film streams decode 1 to 3 percent faster on Graviton3, bytes unchanged.
 - Reduce native decoder parsing and output-storage work, reuse bounded parser
   scratch, and retain source-faithful Linux ARM64 MTF traversal.
 - Remove per-byte bounds-check branches from the inverse-BWT link scatter and

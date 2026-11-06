@@ -49,9 +49,15 @@ flow, table construction and storage lifetime together.
   the end-of-stream footer follows the last block; a stream cut closer than that
   is a truncation error. The suspendable incremental decoder keeps its
   bit-serial canonical walk.
-- Use the reference's forward word-at-a-time MTF carry loop on Linux ARM64.
-  Native differential tests compare every position and evolving MTF state.
-  Other platforms retain their previous MTF selection.
+- Use the reference's forward word-at-a-time MTF carry loop on Linux ARM64,
+  laid out as GCC compiles `ReadBlock2`: two words per iteration with an exit
+  test after each word and no remainder loop. Against the one-word loop this
+  measured 3 percent faster on film at levels 1 and 9 and 1 percent at level
+  5 on Graviton3, with the same branch-miss count, and neutral elsewhere; the
+  paired-load variant with a scalar tail was 5 percent slower with 45 percent
+  more branch misses. Native differential tests compare every position and
+  evolving MTF state for each variant. Other platforms retain their previous
+  MTF selection.
 - Scatter inverse-BWT links as `DecodeBlock1` does, with each bucket counter
   loaded and stored through one plain address register. The ordinary scatter
   builds a table of references to the 256 counter cells once per block, walks
