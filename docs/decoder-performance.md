@@ -3,10 +3,10 @@
 The native `Decoder` changes in runtime commit `8a2188e6b667` were selected
 from paired measurements against the pinned 7-Zip 26.04 reference. The
 decode-parity follow-up measured below brings native decoding to 7zz's time or
-better on the film, program and repeated-text cases on both hosts and on the
-two-thread level 1 text cases, and to within 4 percent of 7zz on the other
-text cases. Parity here means 7zz's time or better; every case still behind
-is listed under the measured results. The compatibility adapters retain their
+better on every Intel case and on every Graviton3 case except film at one
+thread, within 2 percent, and three two-thread cases within 4 percent. Parity
+here means 7zz's time or better; every case still behind is listed under the
+measured results. The compatibility adapters retain their
 separate incremental parser; native-parser timings do not measure that API.
 
 ## Follow the complete stream
@@ -60,20 +60,28 @@ flow, table construction and storage lifetime together.
   more branch misses. Native differential tests compare every position and
   evolving MTF state for each variant. Other platforms retain their previous
   MTF selection.
-- On Linux ARM64, refill the bit reservoir the way `ReadBlock2` does: up to
-  three bytes before each symbol, each load behind its own count test, in
-  place of a 32-bit word loaded whenever fewer than 20 bits remained. On the
-  Intel host the byte-wise shape measured 2 to 6 percent slower than the word
-  refill on text at one thread and 3 to 4 percent slower on film, so x86-64
-  and other platforms keep the word refill. The word refill's branch fired
-  on a pattern the predictor missed on high-entropy input: 22 million branch
-  misses against 17 million for 7zz on film at level 5 on Graviton3, with the
-  parser taking 99 percent of them. A branch-free 64-bit refill removed the
-  misses but added 12 percent more instructions and was slower; the byte-wise
-  shape matches 7zz's miss count and brings film at one thread to within 1 to
-  3 percent of 7zz across the levels, ahead at two threads, while the logs and
-  json cases give up 2 to 3 percent of their lead and stay within 4 percent of
-  7zz. Four-byte run stores, also tried, were neutral and were not kept.
+- On Linux ARM64, refill the bit reservoir the way `ReadBlock2` does on
+  high-entropy blocks: up to three bytes before each symbol, each load behind
+  its own count test, in place of a 32-bit word loaded whenever fewer than 20
+  bits remained. The word refill's branch fired on a pattern the predictor
+  missed on such input: 22 million branch misses against 17 million for 7zz
+  on film at level 5 on Graviton3, with the parser taking 99 percent of them.
+  A branch-free 64-bit refill removed the misses but added 12 percent more
+  instructions and was slower; the byte-wise shape matches 7zz's miss count
+  and brings film at one thread to within 1 to 2 percent of 7zz across the
+  levels, ahead at two threads. Applied to every block it cost the logs and
+  json cases 2 to 3 percent at one thread, so the parser chooses per block:
+  it weights each table's expected code length (the sum over codes of length
+  times 2 to the minus length) by its selector count and refills byte-wise
+  when the block averages at least 6 bits per code. Text blocks sit near 3
+  bits and keep the word refill; film blocks sit near 8. With the selector
+  the text cases at one thread run 1 to 4 percent ahead of 7zz on Graviton3,
+  with fewer instructions and branch misses than either the unconditional
+  byte-wise build or 7zz, and film is unchanged. On the Intel host the
+  byte-wise shape measured 2 to 6 percent slower than the word refill on text
+  and 3 to 4 percent slower on film, so x86-64 and other platforms keep the
+  word refill everywhere. Four-byte run stores, also tried, were neutral and
+  were not kept.
 - Scatter inverse-BWT links as `DecodeBlock1` does, with each bucket counter
   loaded and stored through one plain address register. The ordinary scatter
   builds a table of references to the 256 counter cells once per block, walks
@@ -170,7 +178,8 @@ reference bytes and malformed-stream handling.
 The decode-parity follow-up (the clamped and register-addressed scatter,
 run-ahead, huge-page TT storage mapped through `mmap`, the CDecoder Huffman
 structure, the worker cancellation changes, and on Linux ARM64 the two-word
-MTF carry loop and byte-wise reservoir refill) was measured on two Linux hosts,
+MTF carry loop and the per-block byte-wise reservoir refill) was measured on
+two Linux hosts,
 a Graviton3 (Neoverse V1) instance and an Intel Xeon (Sapphire Rapids)
 instance, against 7zz 26.04 built from the pinned source on the same host. The
 Graviton3 column is the final build; the Intel column is the build before the
@@ -183,16 +192,16 @@ timing. Ratios are this crate's time over 7zz's; below 1.0 is faster.
 
 | case | Graviton3 1T | Graviton3 2T | Intel 1T | Intel 2T |
 | --- | --- | --- | --- | --- |
-| logs L1 | 1.01 | 0.99 | 1.01 | 0.98 |
-| json L1 | 1.04 | 0.97 | 1.01 | 0.84 |
-| film L1 | 1.01 | 0.97 | 0.72 | 0.52 |
-| program L1 | 1.03 | 0.94 | 0.86 | 0.64 |
-| logs L5 | 0.99 | 1.03 | 1.01 | 1.01 |
-| json L5 | 1.01 | 1.02 | 1.02 | 1.03 |
-| film L5 | 1.01 | 0.95 | 0.74 | 0.56 |
-| logs L9 | 1.02 | 1.02 | 1.01 | 1.00 |
-| json L9 | 1.01 | 1.02 | 1.01 | 1.01 |
-| film L9 | 1.03 | 1.00 | 0.82 | 0.91 |
+| logs L1 | 0.98 | 0.99 | 1.01 | 0.98 |
+| json L1 | 0.99 | 0.97 | 1.01 | 0.84 |
+| film L1 | 1.01 | 0.96 | 0.72 | 0.52 |
+| program L1 | 1.00 | 0.90 | 0.86 | 0.64 |
+| logs L5 | 0.98 | 1.04 | 1.01 | 1.01 |
+| json L5 | 0.99 | 1.02 | 1.02 | 1.03 |
+| film L5 | 1.02 | 0.97 | 0.74 | 0.56 |
+| logs L9 | 0.97 | 1.00 | 1.01 | 1.00 |
+| json L9 | 0.96 | 0.99 | 1.01 | 1.01 |
+| film L9 | 1.01 | 1.01 | 0.82 | 0.91 |
 | repeated L9 | 0.56 | 0.59 | 0.80 | 0.84 |
 
 Relative to the previous main build on the same hosts, the logs and json
@@ -207,18 +216,16 @@ TLB refill counts
 now match 7zz on both hosts (previously 150 times higher on Graviton3), and the
 `mmap` storage path makes these results independent of the process allocator.
 
-Remaining gaps, all within 4 percent: on Graviton3 the film cases at 1T are
-1 to 3 percent behind, the json level 1 and program cases at 1T 3 to 4
-percent, and the level 5 and 9 text cases at 2T 2 to 3 percent, the last tied
-to per-chunk handoffs between the parser and the worker (about seven times
-the context switches of 7zz's two-thread path). The byte-wise refill that
-closed the film gap costs the Graviton3 text cases 2 to 3 percent at 1T
-against the word refill; their branch-miss counts now match 7zz's, so what
-remains there is instruction cost rather than prediction. Intel level 5 and 9
-cases at 1T sit 1 to 2 percent behind, within run-to-run noise. On the
-Graviton3 host used for the final run, 7zz's own level 9 times were 25 to 45
-percent longer than on the earlier instance of the same type, so ratios, not
-times, are comparable between runs.
+Remaining gaps: on Graviton3 the film cases at 1T are 1 to 2 percent behind
+with the same instruction and branch-miss counts as 7zz within 3 percent,
+and the logs and json level 5 cases at 2T 2 to 4 percent, tied to per-chunk
+handoffs between the parser and the worker (about seven times the context
+switches of 7zz's two-thread path); film level 9 at 2T reads 1 percent
+behind, inside its run-to-run spread. Intel level 5 and 9 cases at 1T sit 1
+to 2 percent behind, within run-to-run noise. On the Graviton3 host used for
+the final run, 7zz's own level 9 times were 25 to 45 percent longer than on
+the earlier instance of the same type, so ratios, not times, are comparable
+between runs.
 
 ## Evidence and limits
 

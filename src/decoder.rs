@@ -48,26 +48,26 @@ impl<R: Read> Bits<R> {
         self.pos += 1;
         Ok(Some(byte))
     }
+    /// Returns the next `n` bits without consuming them.
+    ///
+    /// CBitDecoder keeps active bits high-aligned. A refill starts with fewer
+    /// than n <= 32 bits and adds at most one word, so at most 63 bits are
+    /// active. Unused low bits remain zero after every refill and consume.
+    ///
+    /// `BYTEWISE` selects ReadBlock2's refill, at most three bytes each behind
+    /// its own count test, over the one-word refill. The word refill's branch
+    /// fired on a pattern Graviton3's predictor missed on high-entropy blocks
+    /// (22 million misses against 17 million for 7zz on film at level 5),
+    /// while on text blocks, and on x86-64 everywhere, it measured 2 to 6
+    /// percent faster than the byte-wise shape. The block parser picks per
+    /// block on Linux ARM64; every other caller uses the word refill.
     #[inline(always)]
-    fn peek(&mut self, n: u32) -> io::Result<u32> {
+    fn peek<const BYTEWISE: bool>(&mut self, n: u32) -> io::Result<u32> {
         debug_assert!(n <= 32);
         if n == 0 {
             return Ok(0);
         }
-        // CBitDecoder keeps active bits high-aligned. A refill starts with
-        // fewer than n <= 32 bits and adds at most one word, so at most 63
-        // bits are active. Unused low bits remain zero after every refill and
-        // consume.
-        //
-        // Linux ARM64 refills as ReadBlock2 does: at most three bytes, each
-        // behind its own count test. The one-word refill fired on a pattern
-        // Graviton3's branch predictor missed on high-entropy streams (22
-        // million misses against 17 million for 7zz on film at level 5); the
-        // byte-wise shape matches 7zz's miss count and its film decode time
-        // within one percent there. On x86-64 the word refill measured 2 to 6
-        // percent faster than the byte-wise one, so other platforms keep it.
-        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-        if self.count < n && self.end - self.pos >= 3 {
+        if BYTEWISE && self.count < n && self.end - self.pos >= 3 {
             self.bits |= u64::from(self.buffer[self.pos]) << (56 - self.count);
             self.pos += 1;
             self.count += 8;
@@ -82,8 +82,7 @@ impl<R: Read> Bits<R> {
                 }
             }
         }
-        #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
-        if self.count < n && self.end - self.pos >= 4 {
+        if !BYTEWISE && self.count < n && self.end - self.pos >= 4 {
             let word = u32::from_be_bytes(self.buffer[self.pos..self.pos + 4].try_into().unwrap());
             self.bits |= u64::from(word) << (32 - self.count);
             self.pos += 4;
@@ -100,7 +99,7 @@ impl<R: Read> Bits<R> {
     }
     #[inline(always)]
     fn take(&mut self, n: u32) -> io::Result<u32> {
-        let value = self.peek(n)?;
+        let value = self.peek::<false>(n)?;
         self.consume(n);
         Ok(value)
     }
@@ -176,6 +175,17 @@ impl Huffman {
         };
         table.rebuild(lengths)?;
         Ok(table)
+    }
+    /// The code length a symbol drawn from this table's implied distribution
+    /// expects, in 1/256 bit: the sum over codes of length times 2^-length.
+    /// Near 8 for the flat trees of high-entropy blocks, near 3 for text.
+    #[cfg(any(all(target_os = "linux", target_arch = "aarch64"), test))]
+    fn expected_code_bits_q8(&self) -> u32 {
+        let mut total = 0u32;
+        for len in 1..=MAX_CODE_BITS {
+            total += (self.counts[len as usize] * len) << (MAX_CODE_BITS - len);
+        }
+        total >> (MAX_CODE_BITS - 8)
     }
     fn rebuild(&mut self, lengths: &[u8]) -> io::Result<()> {
         self.first.fill(0);
@@ -257,8 +267,8 @@ impl Huffman {
     /// Codes absent from an incomplete tree walk past the 20-bit limit and are
     /// rejected as invalid, where CDecoder returns SZ_ERROR_DATA.
     #[inline(always)]
-    fn symbol<R: Read>(&self, bits: &mut Bits<R>) -> io::Result<usize> {
-        let window = bits.peek(MAX_CODE_BITS)?;
+    fn symbol<R: Read, const BYTEWISE: bool>(&self, bits: &mut Bits<R>) -> io::Result<usize> {
+        let window = bits.peek::<BYTEWISE>(MAX_CODE_BITS)?;
         let prefix = window >> (MAX_CODE_BITS - TABLE_BITS);
         if prefix >= self.limits[0] {
             let mut len = TABLE_BITS + 1;
@@ -330,13 +340,11 @@ mod high_reservoir_tests {
             Ok(Some(byte))
         }
         #[inline(always)]
-        fn peek(&mut self, n: u32) -> io::Result<u32> {
-            // The same refill policy as the production reader on this
-            // platform, whose state the high-aligned reservoir must reproduce
-            // exactly: one word when it can on most platforms, bytes behind
-            // their own tests on Linux ARM64.
-            #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
-            if self.count < n && self.end - self.pos >= 4 {
+        fn peek<const BYTEWISE: bool>(&mut self, n: u32) -> io::Result<u32> {
+            // The same refill policy as the production reader, whose state
+            // the high-aligned reservoir must reproduce exactly: one word
+            // when it can, or bytes while short.
+            if !BYTEWISE && self.count < n && self.end - self.pos >= 4 {
                 let word =
                     u32::from_be_bytes(self.buffer[self.pos..self.pos + 4].try_into().unwrap());
                 self.bits = (self.bits << 32) | u64::from(word);
@@ -354,7 +362,7 @@ mod high_reservoir_tests {
         }
         #[inline(always)]
         fn take(&mut self, n: u32) -> io::Result<u32> {
-            let value = self.peek(n)?;
+            let value = self.peek::<false>(n)?;
             self.count -= n;
             Ok(value)
         }
@@ -414,7 +422,7 @@ mod high_reservoir_tests {
         }
         #[inline(always)]
         fn symbol<R: Read>(&self, bits: &mut OriginalBits<R>) -> io::Result<usize> {
-            let entry = self.fast[bits.peek(10)? as usize];
+            let entry = self.fast[bits.peek::<false>(10)? as usize];
             let len = entry & 255;
             if len != 0 {
                 bits.count -= len;
@@ -529,7 +537,7 @@ mod high_reservoir_tests {
                             bytes: &bytes[..end],
                             width,
                         });
-                        let got = outcome(packed.symbol(&mut left));
+                        let got = outcome(packed.symbol::<_, false>(&mut left));
                         // The CDecoder window always needs 20 bits, even
                         // where the original resolved a short code early.
                         if end * 8 < 20 {
@@ -579,7 +587,7 @@ mod high_reservoir_tests {
                     width,
                 });
                 for &symbol in &symbols {
-                    assert_eq!(packed.symbol(&mut left).unwrap(), symbol);
+                    assert_eq!(packed.symbol::<_, false>(&mut left).unwrap(), symbol);
                     assert_eq!(original.symbol(&mut right).unwrap(), symbol);
                     assert_eq!(
                         consumed(&left, encoded.len()),
@@ -619,6 +627,10 @@ mod high_reservoir_tests {
     }
     #[test]
     fn high_aligned_bits_match_original_peek_take_align_partial_errors_and_zero() {
+        exercise_against_original::<false>();
+        exercise_against_original::<true>();
+    }
+    fn exercise_against_original<const BYTEWISE: bool>() {
         for length in [0, 1, 2, 3, 4, 5, 31, 32, 33, 257, 32775] {
             let bytes: Vec<u8> = (0..length).map(|i| ((i * 97) ^ (i >> 3)) as u8).collect();
             for width in [1, 3, 4, 17, 32768] {
@@ -645,7 +657,7 @@ mod high_reservoir_tests {
                             high.align();
                             Ok(0)
                         } else if turn % 3 == 0 {
-                            high.peek(n)
+                            high.peek::<BYTEWISE>(n)
                         } else {
                             high.take(n)
                         };
@@ -653,7 +665,7 @@ mod high_reservoir_tests {
                             low.align();
                             Ok(0)
                         } else if turn % 3 == 0 {
-                            low.peek(n)
+                            low.peek::<BYTEWISE>(n)
                         } else {
                             low.take(n)
                         };
@@ -667,8 +679,8 @@ mod high_reservoir_tests {
                             (high.reader.bytes.len(), high.reader.calls),
                             (low.reader.bytes.len(), low.reader.calls)
                         );
-                        assert_eq!(high.peek(0).unwrap(), 0);
-                        assert_eq!(low.peek(0).unwrap(), 0);
+                        assert_eq!(high.peek::<BYTEWISE>(0).unwrap(), 0);
+                        assert_eq!(low.peek::<BYTEWISE>(0).unwrap(), 0);
                         assert_state(&high, &low);
                         if ended {
                             break;
@@ -909,65 +921,92 @@ impl<R: Read> Parser<R> {
             let mut huffman = &tables[0];
             let mut run = 0usize;
             let mut weight = 1usize;
-            loop {
-                if group_left == 0 {
-                    let selector = *selectors
-                        .get(selector_index)
-                        .ok_or_else(|| invalid("missing BZip2 selector"))?;
-                    huffman = &tables[usize::from(selector)];
-                    selector_index += 1;
-                    group_left = 50;
+            // Linux ARM64 refills byte-wise on blocks whose selectors weight
+            // the tables to at least six expected bits per code, where the
+            // word refill's branch mispredicts; text blocks sit near three
+            // bits and keep the word refill, which is faster there.
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            let bytewise = {
+                let mut weights = [0u32; 6];
+                for &selector in selectors.iter() {
+                    weights[usize::from(selector)] += 1;
                 }
-                let symbol = huffman.symbol(&mut self.bits)?;
-                group_left -= 1;
-                if symbol <= 1 {
-                    run = run
-                        .checked_add(weight * (symbol + 1))
-                        .ok_or_else(|| invalid("BZip2 run overflow"))?;
-                    if run > limit - length {
-                        return Err(invalid("BZip2 block exceeds declared size"));
+                let mut total = 0u64;
+                for (table, &weight) in tables.iter().zip(&weights) {
+                    total += u64::from(table.expected_code_bits_q8()) * u64::from(weight);
+                }
+                total >= 6 * 256 * selectors.len() as u64
+            };
+            #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+            let bytewise = false;
+            macro_rules! symbols {
+                ($bytewise:expr) => {
+                    loop {
+                        if group_left == 0 {
+                            let selector = *selectors
+                                .get(selector_index)
+                                .ok_or_else(|| invalid("missing BZip2 selector"))?;
+                            huffman = &tables[usize::from(selector)];
+                            selector_index += 1;
+                            group_left = 50;
+                        }
+                        let symbol = huffman.symbol::<R, $bytewise>(&mut self.bits)?;
+                        group_left -= 1;
+                        if symbol <= 1 {
+                            run = run
+                                .checked_add(weight * (symbol + 1))
+                                .ok_or_else(|| invalid("BZip2 run overflow"))?;
+                            if run > limit - length {
+                                return Err(invalid("BZip2 block exceeds declared size"));
+                            }
+                            weight = weight
+                                .checked_mul(2)
+                                .ok_or_else(|| invalid("BZip2 run overflow"))?;
+                            continue;
+                        }
+                        if run != 0 {
+                            #[cfg(target_arch = "x86_64")]
+                            let byte = mtf[0];
+                            #[cfg(not(target_arch = "x86_64"))]
+                            let byte = mtf[0] as u8;
+                            counts[byte as usize] += run;
+                            last[length..length + run].fill(byte);
+                            length += run;
+                            run = 0;
+                            weight = 1;
+                        }
+                        if symbol == alphabet_size - 1 {
+                            break;
+                        }
+                        let index = symbol - 1;
+                        if index >= alphabet.len() {
+                            return Err(invalid("invalid BZip2 MTF index"));
+                        }
+                        #[cfg(target_arch = "x86_64")]
+                        let byte = mtf[index];
+                        #[cfg(not(target_arch = "x86_64"))]
+                        let (next, byte) = {
+                            let next = mtf[index / 8];
+                            (next, (next >> ((index & 7) * 8)) as u8)
+                        };
+                        if length == limit {
+                            return Err(invalid("BZip2 block exceeds declared size"));
+                        }
+                        // ReadBlock2 publishes the byte and histogram before moving MTF words.
+                        last[length] = byte;
+                        length += 1;
+                        counts[byte as usize] += 1;
+                        #[cfg(target_arch = "x86_64")]
+                        move_mtf_bytes(&mut mtf, index, byte);
+                        #[cfg(not(target_arch = "x86_64"))]
+                        move_mtf(&mut mtf, index, next, byte);
                     }
-                    weight = weight
-                        .checked_mul(2)
-                        .ok_or_else(|| invalid("BZip2 run overflow"))?;
-                    continue;
-                }
-                if run != 0 {
-                    #[cfg(target_arch = "x86_64")]
-                    let byte = mtf[0];
-                    #[cfg(not(target_arch = "x86_64"))]
-                    let byte = mtf[0] as u8;
-                    counts[byte as usize] += run;
-                    last[length..length + run].fill(byte);
-                    length += run;
-                    run = 0;
-                    weight = 1;
-                }
-                if symbol == alphabet_size - 1 {
-                    break;
-                }
-                let index = symbol - 1;
-                if index >= alphabet.len() {
-                    return Err(invalid("invalid BZip2 MTF index"));
-                }
-                #[cfg(target_arch = "x86_64")]
-                let byte = mtf[index];
-                #[cfg(not(target_arch = "x86_64"))]
-                let (next, byte) = {
-                    let next = mtf[index / 8];
-                    (next, (next >> ((index & 7) * 8)) as u8)
                 };
-                if length == limit {
-                    return Err(invalid("BZip2 block exceeds declared size"));
-                }
-                // ReadBlock2 publishes the byte and histogram before moving MTF words.
-                last[length] = byte;
-                length += 1;
-                counts[byte as usize] += 1;
-                #[cfg(target_arch = "x86_64")]
-                move_mtf_bytes(&mut mtf, index, byte);
-                #[cfg(not(target_arch = "x86_64"))]
-                move_mtf(&mut mtf, index, next, byte);
+            }
+            if bytewise {
+                symbols!(true);
+            } else {
+                symbols!(false);
             }
             if origin >= length {
                 return Err(invalid("invalid BZip2 BWT origin"));
@@ -1758,6 +1797,15 @@ impl<R: Read> Read for Decoder<R> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expected_code_bits_flat_and_skewed_trees() {
+        let mut table = super::Huffman::new(&[8u8; 256]).unwrap();
+        // 256 codes of eight bits: every symbol expects eight bits.
+        assert_eq!(table.expected_code_bits_q8(), 8 * 256);
+        // A text-like tree: 1, 2, 3 and two 4-bit codes expect 1.875 bits.
+        table.rebuild(&[1, 2, 3, 4, 4]).unwrap();
+        assert_eq!(table.expected_code_bits_q8(), 480);
+    }
     use super::{
         move_mtf, move_mtf_bytes, move_mtf_forward, move_mtf_forward2, move_mtf_paired,
         move_mtf_reverse,
@@ -2563,7 +2611,11 @@ mod cdecoder_tests {
                 let (want, len) = reference(&codes, &bytes, expected_position).unwrap();
                 assert_eq!(want, symbol);
                 expected_position += len as usize;
-                assert_eq!(table.symbol(&mut bits).unwrap(), symbol, "{lengths:?}");
+                assert_eq!(
+                    table.symbol::<_, false>(&mut bits).unwrap(),
+                    symbol,
+                    "{lengths:?}"
+                );
                 assert_eq!(consumed(&bits, bytes.len()), expected_position);
             }
             // Single windows: each code's first and last 20-bit extension,
@@ -2585,11 +2637,11 @@ mod cdecoder_tests {
                 let mut bits = Bits::new(bytes.as_slice());
                 match reference(&codes, &bytes, 0) {
                     Some((symbol, len)) => {
-                        assert_eq!(table.symbol(&mut bits).unwrap(), symbol);
+                        assert_eq!(table.symbol::<_, false>(&mut bits).unwrap(), symbol);
                         assert_eq!(consumed(&bits, bytes.len()), len as usize);
                     }
                     None => {
-                        let error = table.symbol(&mut bits).unwrap_err();
+                        let error = table.symbol::<_, false>(&mut bits).unwrap_err();
                         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
                         assert_eq!(error.to_string(), "invalid Huffman code");
                     }

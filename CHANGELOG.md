@@ -25,10 +25,12 @@
   `ReadBlock2` loop, two words per iteration with an exit test after each;
   film streams decode 1 to 3 percent faster on Graviton3, bytes unchanged.
 - On Linux AArch64, refill the bit reservoir as `ReadBlock2` does, up to
-  three bytes each behind its own test, instead of one word when it runs low.
-  The word refill's branch mispredicted on high-entropy streams there; film
-  now decodes within 1 to 3 percent of 7zz at one thread on Graviton3 and
-  ahead at two. x86-64 keeps the word refill, which measured faster on it.
+  three bytes each behind its own test, on blocks whose Huffman tables average
+  at least 6 expected bits per code, instead of one word when it runs low.
+  The word refill's branch mispredicted on such high-entropy blocks there;
+  film now decodes within 1 to 2 percent of 7zz at one thread on Graviton3
+  and ahead at two, and the text cases, which keep the word refill, 1 to 4
+  percent ahead. x86-64 keeps the word refill, which measured faster on it.
 - Reduce native decoder parsing and output-storage work, reuse bounded parser
   scratch, and retain source-faithful Linux ARM64 MTF traversal.
 - Remove per-byte bounds-check branches from the inverse-BWT link scatter and
