@@ -41,8 +41,10 @@
   version, `Cargo.lock` and changelog in the same PR, sized by
   `cargo semver-checks`, under a released `## <version>` heading.
 - Present the README benchmarks as separate encode and decode tables per
-  platform, narrow enough for crates.io, with MiB/s in the header, and show the serial `bzip2` references at every thread
-  budget instead of only at 1T.
+  platform, narrow enough for crates.io, with MiB/s in the header, and show
+  the serial `bzip2` references at every thread budget instead of only at 1T.
+- Build tests at `opt-level = 1`: the native test suite runs in about 7 s
+  instead of 60 s, with debug assertions and overflow checks still on.
 
 ## 0.1.0
 

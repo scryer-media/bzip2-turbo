@@ -45,6 +45,10 @@ strip = false
 debug = 1
 
 [profile.test]
+# The byte-parity tests run the codec on multi-megabyte inputs; at opt-level 0
+# the native suite takes about 60 s, at 1 about 7 s (debug assertions and
+# overflow checks stay on). Optimizing only dependencies does not help.
+opt-level = 1
 debug = 0
 split-debuginfo = "off"
 incremental = false
