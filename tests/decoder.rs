@@ -383,3 +383,189 @@ fn fragmented_and_interrupted_input_preserves_word_refill_boundaries() {
         assert_eq!(decoded, [data.as_slice(), data.as_slice()].concat());
     }
 }
+
+fn random_bytes(len: usize, mut seed: u32) -> Vec<u8> {
+    (0..len)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect()
+}
+
+// The worker starts a fresh 64 KiB chunk sequence for every block and ends
+// each block with a shorter chunk, so callback chunk sizes reveal the plain
+// length of each block.
+fn block_lengths(encoded: &[u8]) -> Vec<usize> {
+    use std::sync::{Arc, Mutex};
+    let chunks = Arc::new(Mutex::new(Vec::new()));
+    let state = Arc::clone(&chunks);
+    let mut decoder = Decoder::with_output_callback(encoded, 2, move |bytes| {
+        state.lock().unwrap().push(bytes.len());
+    });
+    decoder.read_to_end(&mut Vec::new()).unwrap();
+    drop(decoder);
+    let mut blocks = Vec::new();
+    let mut length = 0;
+    for &chunk in chunks.lock().unwrap().iter() {
+        length += chunk;
+        if chunk < 65536 {
+            blocks.push(length);
+            length = 0;
+        }
+    }
+    assert_eq!(length, 0, "a block ended on a whole chunk");
+    blocks
+}
+
+// Bit offset just past the `ordinal`-th (1-based) block magic.
+fn after_block_magic(bytes: &[u8], ordinal: usize) -> usize {
+    let mut window = 0u64;
+    let mut found = 0;
+    for bit in 0..bytes.len() * 8 {
+        window =
+            ((window << 1) | u64::from((bytes[bit / 8] >> (7 - bit % 8)) & 1)) & 0xFFFF_FFFF_FFFF;
+        if window == 0x314159265359 {
+            found += 1;
+            if found == ordinal {
+                return bit + 1;
+            }
+        }
+    }
+    panic!("stream has fewer than {ordinal} blocks");
+}
+
+fn flip_bit(bytes: &mut [u8], bit: usize) {
+    bytes[bit / 8] ^= 1 << (7 - bit % 8);
+}
+
+fn read_until_error(decoder: &mut impl Read, buffer: usize) -> (Vec<u8>, std::io::Error) {
+    let mut decoded = Vec::new();
+    let mut buf = vec![0; buffer];
+    loop {
+        match decoder.read(&mut buf) {
+            Ok(0) => panic!("corrupt stream decoded to EOF"),
+            Ok(n) => decoded.extend_from_slice(&buf[..n]),
+            Err(error) => return (decoded, error),
+        }
+    }
+}
+
+#[test]
+fn parser_error_after_queued_blocks_delivers_their_output_first() {
+    let data = random_bytes(600_000, 0x2468_1357);
+    let encoded = compress_level(&data, 1);
+    let blocks = block_lengths(&encoded);
+    assert!(blocks.len() >= 5);
+    let prefix = blocks[0] + blocks[1];
+    let mut corrupt = encoded.clone();
+    // Break the third block's marker: the parser fails there while the first
+    // two blocks are queued or being reconstructed.
+    let bit = after_block_magic(&corrupt, 3) - 1;
+    flip_bit(&mut corrupt, bit);
+    for threads in [1, 2, 4] {
+        for buffer in [1, 37, 1 << 20] {
+            let mut decoder = Decoder::with_threads(corrupt.as_slice(), threads);
+            let (decoded, error) = read_until_error(&mut decoder, buffer);
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(decoded.len(), prefix, "threads {threads} buffer {buffer}");
+            assert_eq!(decoded, data[..prefix]);
+            assert!(decoder.read(&mut [0; 1]).is_err());
+        }
+    }
+}
+
+#[test]
+fn worker_crc_error_never_delivers_the_queued_successor() {
+    use std::sync::{Arc, Mutex};
+    let data = random_bytes(600_000, 0x0bad_c0de);
+    let encoded = compress_level(&data, 1);
+    let blocks = block_lengths(&encoded);
+    assert!(blocks.len() >= 4);
+    for victim in [0, 1] {
+        let mut corrupt = encoded.clone();
+        // The stored block CRC follows the marker; only reconstruction checks
+        // it, after the parser has queued the next block.
+        let bit = after_block_magic(&corrupt, victim + 1) + 7;
+        flip_bit(&mut corrupt, bit);
+        let limit: usize = blocks[..=victim].iter().sum();
+        let start: usize = blocks[..victim].iter().sum();
+        for threads in [1, 2, 4] {
+            let observed = Arc::new(Mutex::new(0usize));
+            let state = Arc::clone(&observed);
+            let mut decoder =
+                Decoder::with_output_callback(corrupt.as_slice(), threads, move |bytes| {
+                    *state.lock().unwrap() += bytes.len();
+                });
+            let (decoded, error) = read_until_error(&mut decoder, 4096);
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("block CRC"), "{error}");
+            drop(decoder);
+            assert!(decoded.len() >= start && decoded.len() < limit);
+            assert_eq!(decoded, data[..decoded.len()]);
+            assert!(*observed.lock().unwrap() < limit);
+        }
+    }
+}
+
+#[test]
+fn tiny_final_blocks_follow_full_blocks() {
+    let source = random_bytes(400_000, 0x5eed_1234);
+    let first = block_lengths(&compress_level(&source, 1))[0];
+    for tail in [1, 2, 3, 17] {
+        let data = &source[..first * 2 + tail];
+        let encoded = compress_level(data, 1);
+        assert_eq!(block_lengths(&encoded), [first, first, tail]);
+        let mut concatenated = encoded.clone();
+        concatenated.extend(compress_level(&data[..tail], 1));
+        let expected = [data, &data[..tail]].concat();
+        for threads in [1, 2, 4] {
+            for buffer in [1, 4096, 1 << 20] {
+                for (stream, plain) in [(&encoded, data), (&concatenated, expected.as_slice())] {
+                    let mut decoder = Decoder::with_threads(stream.as_slice(), threads);
+                    let mut decoded = Vec::new();
+                    let mut buf = vec![0; buffer];
+                    loop {
+                        let n = decoder.read(&mut buf).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        decoded.extend_from_slice(&buf[..n]);
+                    }
+                    assert_eq!(decoded, plain, "tail {tail} threads {threads}");
+                    assert_eq!(decoder.read(&mut buf).unwrap(), 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn one_byte_reads_match_bulk_reads_across_blocks() {
+    let mut data = random_bytes(250_000, 0x1234_abcd);
+    data.extend(std::iter::repeat_n(7u8, 300_000));
+    data.extend(random_bytes(90_000, 0x4321_dcba));
+    let encoded = compress_level(&data, 1);
+    assert!(block_lengths(&encoded).len() >= 4);
+    for threads in [1, 2, 4] {
+        for low_memory in [false, true] {
+            let mut decoder = if low_memory {
+                Decoder::with_low_memory(encoded.as_slice(), threads)
+            } else {
+                Decoder::with_threads(encoded.as_slice(), threads)
+            };
+            let mut decoded = Vec::with_capacity(data.len());
+            let mut byte = [0; 1];
+            loop {
+                match decoder.read(&mut byte).unwrap() {
+                    0 => break,
+                    n => decoded.extend_from_slice(&byte[..n]),
+                }
+            }
+            assert!(decoded == data, "threads {threads} low memory {low_memory}");
+            assert_eq!(decoder.read(&mut byte).unwrap(), 0);
+        }
+    }
+}

@@ -12,7 +12,11 @@ lookup table, reconstructs bounded chunks, updates the CRC and supplies bytes
 through `Read`. CRC verification completes at the block boundary; a later
 CRC error cannot retract a prefix already returned to the caller. Multithreaded decoding overlaps parsing with one
 reconstruction worker. Increasing the requested thread count above two does
-not create more reconstruction workers.
+not create more reconstruction workers. As in `RunScout`, the parser queues
+the next block as soon as it is parsed, so the worker can start it at a block
+boundary without waiting for the caller to observe the previous block's end.
+The pipeline still holds at most two parsed blocks at once, counting the one
+being reconstructed.
 
 The Graviton baseline profile placed most of the MKV difference in entropy
 parsing, even though inverse-BWT reconstruction was also a large hotspot in

@@ -22,3 +22,5 @@
 - Add reproducible JSON, logs, repeated-text, media and executable fixtures, plus
   corrected codec-process RSS accounting and verified four-way benchmarks.
 - Preserve measured baselines and remaining gaps without claiming complete parity.
+- Queue each parsed block for the decoder's reconstruction worker while it
+  still reconstructs the previous block, matching 7-Zip's parser run-ahead.

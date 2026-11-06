@@ -1148,6 +1148,21 @@ impl Worker {
             .send(block)
             .map_err(|_| io::Error::other("BZip2 worker stopped before accepting a block"))
     }
+    /// Queues a block without waiting; returns it when the one-slot queue is
+    /// occupied or the worker has exited. The caller keeps it staged and then
+    /// drains output, where an exited worker reports its own error.
+    fn try_submit(&self, block: Block) -> Option<Block> {
+        use std::sync::mpsc::TrySendError;
+        match self
+            .jobs
+            .as_ref()
+            .expect("live worker job queue")
+            .try_send(block)
+        {
+            Ok(()) => None,
+            Err(TrySendError::Full(block) | TrySendError::Disconnected(block)) => Some(block),
+        }
+    }
     fn receive(&mut self) -> io::Result<WorkerMessage> {
         match self.receiver.as_ref().expect("live worker receiver").recv() {
             Ok(message) => Ok(message),
@@ -1194,7 +1209,10 @@ pub struct Decoder<R: Read> {
     mode: Mode,
     threads: usize,
     worker: Option<Worker>,
-    worker_active: bool,
+    // Blocks submitted to the worker whose Finished has not been received:
+    // at most the one being reconstructed plus the one-slot job queue. A
+    // staged block exists only below two, so at most two parsed blocks live.
+    in_flight: u8,
     staged: Option<Block>,
     active: Option<BlockOutput>,
     output: Vec<u8>,
@@ -1233,7 +1251,7 @@ impl<R: Read> Decoder<R> {
                 threads.clamp(1, 2)
             },
             worker: None,
-            worker_active: false,
+            in_flight: 0,
             staged: None,
             active: None,
             output: Vec::new(),
@@ -1370,35 +1388,14 @@ impl<R: Read> Decoder<R> {
             self.position = 0;
         }
         loop {
-            if !self.worker_active {
-                let block = if let Some(block) = self.staged.take() {
-                    Some(block)
-                } else if self.error.is_none() && !self.parser.finished {
-                    match self.parser.next() {
-                        Ok(block) => block,
-                        Err(error) => {
-                            self.error = Some(error);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                if let Some(block) = block {
-                    if self.worker.is_none() {
-                        self.worker = Some(Worker::start(self.callback.clone(), self.mode)?);
-                    }
-                    self.worker
-                        .as_ref()
-                        .expect("started worker")
-                        .submit(block)?;
-                    self.worker_active = true;
-                }
-            }
             // RunScout / DecodeStreams overlap exactly one entropy parser and
             // one reconstruction worker, irrespective of a larger thread request.
-            if self.worker_active
-                && self.staged.is_none()
+            // Like RunScout, the caller parses one block ahead of the block being
+            // reconstructed and publishes it at once (DecoderEvent.Set), so the
+            // worker finds its successor queued at a block boundary instead of
+            // waiting for this thread to observe Finished.
+            if self.staged.is_none()
+                && self.in_flight < 2
                 && self.error.is_none()
                 && !self.parser.finished
             {
@@ -1407,7 +1404,29 @@ impl<R: Read> Decoder<R> {
                     Err(error) => self.error = Some(error),
                 }
             }
-            if self.worker_active {
+            if let Some(block) = self.staged.take() {
+                // A block is staged only while fewer than two are in flight.
+                debug_assert!(self.in_flight < 2, "staged block beyond the job queue");
+                if self.worker.is_none() {
+                    self.worker = Some(Worker::start(self.callback.clone(), self.mode)?);
+                }
+                let worker = self.worker.as_ref().expect("started worker");
+                if self.in_flight == 0 {
+                    // Every submitted block has been taken and finished, so the
+                    // queue is empty and the idle worker produces no output.
+                    worker.submit(block)?;
+                    self.in_flight = 1;
+                    continue;
+                }
+                // The worker may be waiting on output delivery; never block here.
+                // A full slot holds the in-flight block the worker has not yet
+                // taken; keep this one staged and retry after the next message.
+                match worker.try_submit(block) {
+                    None => self.in_flight += 1,
+                    Some(block) => self.staged = Some(block),
+                }
+            }
+            if self.in_flight > 0 {
                 match self.worker.as_mut().expect("active worker").receive()? {
                     WorkerMessage::Data(bytes) => {
                         self.output_end = bytes.len();
@@ -1416,7 +1435,7 @@ impl<R: Read> Decoder<R> {
                         return Ok(true);
                     }
                     WorkerMessage::Finished => {
-                        self.worker_active = false;
+                        self.in_flight -= 1;
                         continue;
                     }
                     WorkerMessage::Error(error) => return Err(error),
