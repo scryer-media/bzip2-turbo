@@ -23,9 +23,6 @@
   7zz parity on the measured Intel host.
 - Reduce native decoder parsing and output-storage work, reuse bounded parser
   scratch, and retain source-faithful Linux ARM64 MTF traversal.
-- Reshape the compact inverse-BWT reconstruction loop after
-  `CSpecState::Decode`, with minimal live state, a branch-free run counter and
-  one limit compare per byte; decoded bytes and errors are unchanged.
 - Remove per-byte bounds-check branches from the inverse-BWT link scatter and
   paired successor pass with safe, branch-free index clamping.
 - Add reproducible JSON, logs, repeated-text, media and executable fixtures, plus
