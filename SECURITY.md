@@ -10,5 +10,6 @@ can still be large: consumers should enforce application-specific output limits.
 Native worker queues are bounded and workers are joined during teardown.
 
 Repository hooks and CI run gitleaks and privacy checks on content and commit
-messages. Required upstream legal notices are retained. See PORTING.md for the
-scope of unsafe code and which checks do not establish OS or SIMD safety.
+messages. Required upstream legal notices are retained. The
+[validation record](docs/validation.md) states the scope of unsafe code and
+which checks do not establish OS or SIMD safety.
