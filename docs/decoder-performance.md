@@ -31,6 +31,13 @@ flow, table construction and storage lifetime together.
 - Carry the next last-column byte through scalar inverse-BWT table construction,
   as in `DecodeBlock1`. An explicit final element avoids reading a sentinel
   outside the input; the existing long-run specialization remains intact.
+  The ordinary scatter binds the link and last-column slices to one length and
+  clamps each bucket start to the final index. For a parser histogram the clamp
+  is the identity; it compiles to a conditional select, so the loop keeps only
+  its back-edge branch, as `DecodeBlock1` does, with no per-byte bounds checks.
+  The bucket counter advances unclamped, keeping the select off the
+  load-increment-store chain carried through repeated buckets. The paired
+  successor pass clamps its source index the same way.
 - Reuse initialized output storage and track its valid prefix separately.
   Unobserved single-threaded decoding uses a 1 MiB buffer. Callback and worker
   chunk boundaries remain unchanged. A failed block cannot expose stale bytes.
