@@ -2670,7 +2670,7 @@ mod cdecoder_tests {
                 }
             })
             .collect();
-        let mut encoder = crate::write::BzEncoder::new(Vec::new(), crate::Compression::fast());
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
         encoder.write_all(&data).unwrap();
         let encoded = encoder.finish().unwrap();
         let mut whole = Vec::new();
