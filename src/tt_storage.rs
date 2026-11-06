@@ -1,4 +1,4 @@
-//! Owned TT storage: Linux transparent huge-page advice, Vec elsewhere.
+//! Owned TT and last-column storage: Linux transparent huge-page advice, Vec elsewhere.
 //! Algorithms remain safe Rust. Only native allocation/advice/slice ownership uses FFI.
 //! Allocation policy follows 7-Zip C/Alloc.c at revision 9128b80e3a471108678e2b3ec3c985861c8d7b0f.
 //! SPDX-License-Identifier: LGPL-2.1-or-later
@@ -8,13 +8,19 @@ use std::ops::{Deref, DerefMut};
 
 mod sealed {
     pub trait Sealed {}
+    impl Sealed for u8 {}
     impl Sealed for u32 {}
     impl Sealed for [u32; 2] {}
 }
 
-/// Only the two fixed, all-zero-valid TT representations may own native storage.
+/// Only the fixed, all-zero-valid last-column and TT representations may own
+/// native storage. Each ceiling is the format bound of 900,000 elements rounded
+/// up to whole 2 MiB pages.
 pub(crate) trait Word: sealed::Sealed + Copy + Default + Send + Sync {
     const MAX_ALLOCATION: usize;
+}
+impl Word for u8 {
+    const MAX_ALLOCATION: usize = 2 << 20;
 }
 impl Word for u32 {
     const MAX_ALLOCATION: usize = 4 << 20;
@@ -23,18 +29,25 @@ impl Word for [u32; 2] {
     const MAX_ALLOCATION: usize = 8 << 20;
 }
 
+/// Whether this target backs every TT and last-column buffer with advised
+/// 2 MiB pages, so allocation bounds must count the rounded extents.
+pub(crate) const NATIVE_HUGE_PAGES: bool = cfg!(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(miri)
+));
+
 const MAX_WORDS: usize = 900_000;
 const HUGE_PAGE: usize = 2 << 20;
-const THRESHOLD: usize = 1 << 20;
 
+// BigAlloc with madvise rounds to the huge-page size and aligns to it. CDecoder
+// passes one allocation of more than 1 MiB, so every block is advised; here each
+// separately owned buffer is rounded up to at least one whole 2 MiB page.
 fn allocation_bytes<W: Word>(words: usize) -> Option<usize> {
     if words > MAX_WORDS {
         return None;
     }
-    let bytes = words.checked_mul(std::mem::size_of::<W>())?;
-    if bytes <= THRESHOLD {
-        return None;
-    }
+    let bytes = words.checked_mul(std::mem::size_of::<W>())?.max(1);
     bytes
         .checked_add(HUGE_PAGE - 1)
         .map(|size| size & !(HUGE_PAGE - 1))
@@ -74,6 +87,20 @@ impl<W: Word> TtBuffer<W> {
             ))]
             Self::Native(values) => values.capacity(),
         }
+    }
+
+    /// Ensures capacity for `words` without ever shrinking or reallocating a
+    /// buffer that already holds them. A too-small buffer is released before its
+    /// replacement is allocated, so its words are discarded (logical length zero).
+    /// CDecoder sizes its one `_counters` allocation at the format maximum; the
+    /// decoder sizes each owner at the stream's declared block limit instead.
+    pub(crate) fn with_capacity_at_least(self, words: usize) -> Self {
+        assert!(words <= MAX_WORDS, "TT exceeds the format bound");
+        if self.capacity() >= words {
+            return self;
+        }
+        drop(self);
+        Self::allocate(words)
     }
 
     /// Sets the initialized logical extent, retaining possibly dirty words on reuse.
@@ -181,7 +208,7 @@ mod native {
         length: usize,
     }
     // SAFETY: Buffer uniquely owns its C allocation; moving it never creates aliases.
-    // Word is sealed to the two Send integer representations, with no borrowed data.
+    // Word is sealed to the three Send integer representations, with no borrowed data.
     unsafe impl<W: Word> Send for Buffer<W> {}
     // SAFETY: Word is sealed to Sync integers with no interior mutability. Shared
     // access exposes only immutable slices; mutation and length changes require
@@ -217,8 +244,9 @@ mod native {
             // Advice failure does not invalidate a successful allocation.
             let _ = advice(pointer.as_ptr().cast(), bytes);
             // SAFETY: posix_memalign returned bytes writable bytes, uniquely owned by buffer.
-            // Word is sealed to u32 and [u32; 2]: both accept all-zero bits, align to four,
-            // and their four/eight-byte sizes divide the checked huge-page byte extent.
+            // Word is sealed to u8, u32 and [u32; 2]: all accept all-zero bits, need at
+            // most four-byte alignment (the 2 MiB alignment covers it), and their
+            // one/four/eight-byte sizes divide the checked huge-page byte extent.
             // Initializing the complete range also faults in the advised huge pages.
             unsafe {
                 pointer
@@ -374,6 +402,66 @@ mod native {
             live.set_len(1);
             assert_eq!(live.as_slice(), [0]);
         }
+        #[test]
+        fn byte_column_storage_is_one_zeroed_page_with_its_own_ceiling() {
+            for bytes in [0, 1, (2 << 20) + 1, 4 << 20, usize::MAX] {
+                assert!(
+                    super::Buffer::<u8>::allocate(bytes, |_, _| panic!("invalid column advised"))
+                        .is_none()
+                );
+            }
+            let mut column = super::Buffer::<u8>::allocate(2 << 20, |pointer, bytes| {
+                assert_eq!(pointer as usize % super::super::HUGE_PAGE, 0);
+                assert_eq!(bytes, 2 << 20);
+                -1
+            })
+            .unwrap();
+            assert_eq!(column.capacity(), 2 << 20);
+            column.set_len(900_000);
+            assert!(column.as_slice().iter().all(|&byte| byte == 0));
+            column.as_mut_slice()[899_999] = 0xa5;
+            column = std::thread::spawn(move || {
+                assert_eq!(column.as_slice()[899_999], 0xa5);
+                column
+            })
+            .join()
+            .unwrap();
+            column.set_len(3);
+            assert_eq!(column.as_slice(), [0; 3]);
+        }
+        #[test]
+        fn every_buffer_size_is_huge_page_backed_and_kept_once_large_enough() {
+            use super::super::TtBuffer;
+            fn native<W: super::Word>(lengths: &[usize]) {
+                let mut buffer = TtBuffer::<W>::default();
+                for &length in lengths {
+                    buffer = buffer.resized(length);
+                    assert!(matches!(&buffer, TtBuffer::Native(_)), "length {length}");
+                    assert_eq!(buffer.len(), length);
+                }
+                // Sizing at the declared limit never shrinks or reallocates.
+                let address = buffer.as_ptr();
+                buffer = buffer.with_capacity_at_least(1).resized(1).resized(17);
+                assert_eq!(buffer.as_ptr(), address);
+            }
+            native::<u8>(&[1, 17, 100_000, 900_000]);
+            native::<u32>(&[1, 17, 100_000, 262_144, 262_145, 900_000]);
+            native::<[u32; 2]>(&[1, 17, 100_000, 262_145, 900_000]);
+            assert_eq!(TtBuffer::<u32>::default().resized(1).capacity(), 1 << 19);
+            assert_eq!(
+                TtBuffer::<u32>::default()
+                    .with_capacity_at_least(500_000)
+                    .capacity(),
+                1 << 19
+            );
+            assert_eq!(
+                TtBuffer::<u32>::default()
+                    .with_capacity_at_least(900_000)
+                    .capacity(),
+                1 << 20
+            );
+            assert_eq!(TtBuffer::<u8>::default().resized(1).capacity(), 2 << 20);
+        }
     }
 }
 
@@ -382,17 +470,55 @@ mod tests {
     use super::*;
     #[test]
     fn allocation_rounding_and_format_bound_are_checked() {
-        for words in [0, 1, THRESHOLD / 4] {
-            assert_eq!(allocation_bytes::<u32>(words), None);
+        // No size threshold: every request rounds up to at least one page.
+        for words in [0, 1, 100_000, 250_000, HUGE_PAGE / 4] {
+            assert_eq!(allocation_bytes::<u32>(words), Some(HUGE_PAGE));
         }
-        assert_eq!(allocation_bytes::<u32>(THRESHOLD / 4 + 1), Some(HUGE_PAGE));
         assert_eq!(
             allocation_bytes::<u32>(HUGE_PAGE / 4 + 1),
             Some(2 * HUGE_PAGE)
         );
+        assert_eq!(allocation_bytes::<u32>(500_000), Some(HUGE_PAGE));
+        assert_eq!(allocation_bytes::<u32>(600_000), Some(4 << 20));
         assert_eq!(allocation_bytes::<u32>(900_000), Some(4 << 20));
         assert_eq!(allocation_bytes::<u32>(900_001), None);
         assert_eq!(allocation_bytes::<u32>(usize::MAX), None);
+        // The last column of any level fits one page.
+        for bytes in [0, 1, 100_000, 900_000] {
+            assert_eq!(allocation_bytes::<u8>(bytes), Some(HUGE_PAGE));
+        }
+        assert_eq!(allocation_bytes::<u8>(900_001), None);
+        for (words, pages) in [
+            (1, 1),
+            (200_000, 1),
+            (HUGE_PAGE / 8, 1),
+            (HUGE_PAGE / 8 + 1, 2),
+            (500_000, 2),
+            (700_000, 3),
+            (900_000, 4),
+        ] {
+            assert_eq!(allocation_bytes::<[u32; 2]>(words), Some(pages * HUGE_PAGE));
+        }
+    }
+    #[test]
+    fn declared_limit_capacity_is_never_shrunk_or_reallocated() {
+        let small = if cfg!(miri) { 5 } else { 100_000 };
+        let large = if cfg!(miri) { 33 } else { 900_000 };
+        let mut buffer = TtBuffer::<u8>::default().with_capacity_at_least(small);
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.capacity() >= small);
+        let address = buffer.as_ptr();
+        for length in [small, 1, small / 2, small] {
+            buffer = buffer.with_capacity_at_least(small).resized(length);
+            assert_eq!(buffer.len(), length);
+            assert_eq!(buffer.as_ptr(), address);
+        }
+        buffer[0] = 0x5a;
+        buffer = buffer.with_capacity_at_least(1);
+        assert_eq!(buffer[0], 0x5a);
+        buffer = buffer.with_capacity_at_least(large);
+        assert!(buffer.capacity() >= large);
+        assert!(std::panic::catch_unwind(|| buffer.with_capacity_at_least(MAX_WORDS + 1)).is_err());
     }
     #[test]
     fn storage_reuses_dirty_capacity_and_moves_between_threads() {

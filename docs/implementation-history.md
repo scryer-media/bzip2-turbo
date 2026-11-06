@@ -165,7 +165,9 @@ For finite archive memory budgets, the archive adapter selects compact links
 and single-threaded decoding even when a larger worker count is requested. This
 keeps the codec within the archive's existing 8 MiB admission estimate. The
 standalone decoder defaults to paired links on macOS ARM64 (10 MiB ST / 16 MiB
-MT estimates), and compact links elsewhere (6 MiB ST / 12 MiB MT). Explicit
+MT estimates), and compact links elsewhere (6 MiB ST / 12 MiB MT; the Linux
+x86-64/AArch64 ST estimate later became 8 MiB with 2 MiB huge-page TT and
+last-column storage, see [decoder performance](decoder-performance.md)). Explicit
 low-memory constructors select compact links on every platform. These estimates
 exclude caller-owned readers, callback allocations and OS thread stacks. Output
 is reconstructed in bounded 64 KiB chunks rather than retaining a whole

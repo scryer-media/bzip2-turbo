@@ -521,11 +521,40 @@ mod high_reservoir_tests {
 }
 
 struct Block {
-    last: Vec<u8>,
+    // ReadBlock2's BZIP2_BYTE_MODE column; a recycled column-pool owner.
+    last: TtBuffer<u8>,
+    // The stream's declared block-size limit, which sizes the TT once.
+    limit: usize,
     counts: [usize; 256],
     origin: usize,
     randomized: bool,
     crc: u32,
+}
+
+/// Last-column owners a decoder ever creates. CDecoder keeps the column inside
+/// its single `_counters` allocation. Here a single-threaded decoder holds one
+/// column, and returns it as soon as its TT is built. A pipelined decoder parses
+/// only while fewer than two blocks are in flight, and each submitted block's
+/// column returns with its Finished message, so at most two exist.
+const COLUMN_OWNERS: usize = 2;
+
+// Owners are created lazily and reused for every later block and stream.
+#[derive(Default)]
+struct ColumnPool {
+    spare: Vec<TtBuffer<u8>>,
+    owners: usize,
+}
+impl ColumnPool {
+    fn take(&mut self) -> TtBuffer<u8> {
+        self.spare.pop().unwrap_or_else(|| {
+            self.owners += 1;
+            debug_assert!(self.owners <= COLUMN_OWNERS, "column owner bound exceeded");
+            TtBuffer::default()
+        })
+    }
+    fn give(&mut self, column: TtBuffer<u8>) {
+        self.spare.push(column);
+    }
 }
 // CBase retains entropy scratch between blocks; published Blocks own no borrows.
 #[derive(Default)]
@@ -546,6 +575,7 @@ fn append_huffman(tables: &mut Vec<Huffman>, lengths: &[u8]) -> io::Result<()> {
 struct Parser<R> {
     bits: Bits<R>,
     workspace: ParserWorkspace,
+    columns: ColumnPool,
     limit: usize,
     combined: u32,
     started: bool,
@@ -557,6 +587,7 @@ impl<R: Read> Parser<R> {
         Self {
             bits: Bits::new(reader),
             workspace: ParserWorkspace::default(),
+            columns: ColumnPool::default(),
             limit: 0,
             combined: 0,
             started: false,
@@ -703,7 +734,16 @@ impl<R: Read> Parser<R> {
                 words
             };
             let mut counts = [0usize; 256];
-            let mut last = Vec::with_capacity(self.limit);
+            let limit = self.limit;
+            // ReadBlock2 stores the column in place; a recycled owner already
+            // covers the declared limit, so each byte is one bounded indexed store.
+            let mut column = self
+                .columns
+                .take()
+                .with_capacity_at_least(limit)
+                .resized(limit);
+            let last: &mut [u8] = &mut column[..limit];
+            let mut length = 0usize;
             let mut selector_index = 0;
             let mut group_left = 0;
             let mut huffman = &tables[0];
@@ -724,7 +764,7 @@ impl<R: Read> Parser<R> {
                     run = run
                         .checked_add(weight * (symbol + 1))
                         .ok_or_else(|| invalid("BZip2 run overflow"))?;
-                    if run > self.limit - last.len() {
+                    if run > limit - length {
                         return Err(invalid("BZip2 block exceeds declared size"));
                     }
                     weight = weight
@@ -738,7 +778,8 @@ impl<R: Read> Parser<R> {
                     #[cfg(not(target_arch = "x86_64"))]
                     let byte = mtf[0] as u8;
                     counts[byte as usize] += run;
-                    last.resize(last.len() + run, byte);
+                    last[length..length + run].fill(byte);
+                    length += run;
                     run = 0;
                     weight = 1;
                 }
@@ -756,23 +797,26 @@ impl<R: Read> Parser<R> {
                     let next = mtf[index / 8];
                     (next, (next >> ((index & 7) * 8)) as u8)
                 };
-                if last.len() == self.limit {
+                if length == limit {
                     return Err(invalid("BZip2 block exceeds declared size"));
                 }
                 // ReadBlock2 publishes the byte and histogram before moving MTF words.
-                last.push(byte);
+                last[length] = byte;
+                length += 1;
                 counts[byte as usize] += 1;
                 #[cfg(target_arch = "x86_64")]
                 move_mtf_bytes(&mut mtf, index, byte);
                 #[cfg(not(target_arch = "x86_64"))]
                 move_mtf(&mut mtf, index, next, byte);
             }
-            if origin >= last.len() {
+            if origin >= length {
                 return Err(invalid("invalid BZip2 BWT origin"));
             }
             self.combined = self.combined.rotate_left(1) ^ crc;
             return Ok(Some(Block {
-                last,
+                // Only the logical extent shrinks; the owner keeps its capacity.
+                last: column.resized(length),
+                limit,
                 counts,
                 origin,
                 randomized,
@@ -992,10 +1036,20 @@ enum BlockOutput {
     Paired(OutputState<[u32; 2]>),
 }
 impl BlockOutput {
-    fn new(block: Block, links: Links) -> Self {
+    /// Builds the block's TT; the caller keeps the last column, which this
+    /// output never reads again, and returns it to its pool.
+    fn new(block: &Block, links: Links) -> Self {
+        // Size the TT once at the declared limit, as CDecoder sizes `_counters`
+        // once, so later shorter or equal blocks never regrow it.
         match links {
-            Links::Compact(words) => Self::Compact(OutputState::<u32>::new(block, words)),
-            Links::Paired(words) => Self::Paired(OutputState::<[u32; 2]>::new(block, words)),
+            Links::Compact(words) => Self::Compact(OutputState::<u32>::new(
+                block,
+                words.with_capacity_at_least(block.limit),
+            )),
+            Links::Paired(words) => Self::Paired(OutputState::<[u32; 2]>::new(
+                block,
+                words.with_capacity_at_least(block.limit),
+            )),
         }
     }
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -1063,7 +1117,8 @@ impl OutputPool {
 
 enum WorkerMessage {
     Data(Vec<u8>),
-    Finished,
+    /// The finished block's last column, returned to the caller's pool.
+    Finished(TtBuffer<u8>),
     Error(io::Error),
 }
 struct Worker {
@@ -1088,7 +1143,10 @@ impl Worker {
                     allocated: 0,
                 };
                 while let Ok(block) = blocks.recv() {
-                    let mut output = BlockOutput::new(block, links.take());
+                    let mut output = BlockOutput::new(&block, links.take());
+                    // The column travels back with Finished, so the caller never
+                    // waits for an owner and the in-flight count bounds them.
+                    let column = block.last;
                     loop {
                         let Some(mut bytes) = pool.take() else {
                             return;
@@ -1104,7 +1162,7 @@ impl Worker {
                                     return;
                                 }
                                 if output.finished() {
-                                    if sender.send(WorkerMessage::Finished).is_err() {
+                                    if sender.send(WorkerMessage::Finished(column)).is_err() {
                                         return;
                                     }
                                     break;
@@ -1212,6 +1270,7 @@ pub struct Decoder<R: Read> {
     // Blocks submitted to the worker whose Finished has not been received:
     // at most the one being reconstructed plus the one-slot job queue. A
     // staged block exists only below two, so at most two parsed blocks live.
+    // Each holds one last column until its Finished arrives (COLUMN_OWNERS).
     in_flight: u8,
     staged: Option<Block>,
     active: Option<BlockOutput>,
@@ -1309,6 +1368,12 @@ impl<R: Read> Decoder<R> {
     /// the reader, allocator overhead, OS thread stacks, and storage owned or
     /// allocated by an output callback. Reusable scratch and output/TT capacity
     /// are included. Thread budgets follow [`Self::with_threads`].
+    ///
+    /// On Linux x86-64 and AArch64 every TT and last-column buffer is a whole
+    /// number of 2 MiB pages advised with `MADV_HUGEPAGE`; the bound counts those
+    /// rounded extents. The kernel honours the advice only when transparent huge
+    /// pages are set to `madvise` or `always`; with `never` the same allocations
+    /// use ordinary pages.
     pub const fn memory_usage(threads: usize) -> u64 {
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             if threads > 1 {
@@ -1322,9 +1387,16 @@ impl<R: Read> Decoder<R> {
     }
     /// Conservative allocation bound for [`Self::with_low_memory`], with the
     /// same reader, stack and callback exclusions as [`Self::memory_usage`].
+    ///
+    /// Single-threaded: 6 MiB, or 8 MiB on Linux x86-64 and AArch64, where the
+    /// level-9 TT rounds to 4 MiB and the last column to one 2 MiB page.
+    /// Multithreaded: 12 MiB, which also covers the second last column and the
+    /// worker's output ring.
     pub const fn low_memory_usage(threads: usize) -> u64 {
         if threads > 1 && !cfg!(target_family = "wasm") {
             12 * 1024 * 1024
+        } else if super::tt_storage::NATIVE_HUGE_PAGES {
+            8 * 1024 * 1024
         } else {
             6 * 1024 * 1024
         }
@@ -1354,7 +1426,12 @@ impl<R: Read> Decoder<R> {
                     .take()
                     .map_or_else(|| Links::new(self.mode), BlockOutput::into_links);
                 self.active = match self.parser.next()? {
-                    Some(block) => Some(BlockOutput::new(block, links)),
+                    Some(block) => {
+                        let output = BlockOutput::new(&block, links);
+                        // DecodeBlock1 has consumed the column; reuse it at once.
+                        self.parser.columns.give(block.last);
+                        Some(output)
+                    }
                     None => return Ok(false),
                 };
             }
@@ -1434,8 +1511,9 @@ impl<R: Read> Decoder<R> {
                         self.position = 0;
                         return Ok(true);
                     }
-                    WorkerMessage::Finished => {
+                    WorkerMessage::Finished(column) => {
                         self.in_flight -= 1;
+                        self.parser.columns.give(column);
                         continue;
                     }
                     WorkerMessage::Error(error) => return Err(error),
@@ -2052,7 +2130,11 @@ mod parser_workspace_tests {
         encoded.extend(stream(4, true, 18003));
         encoded.extend(stream(2, false, 3));
         let mut parser = Parser::new(encoded.as_slice());
-        assert_eq!(parser.next().unwrap().unwrap().last, [0]);
+        // Callers return each consumed column, as the decoder does.
+        let block = parser.next().unwrap().unwrap();
+        assert_eq!(*block.last, [0]);
+        let column = block.last.as_ptr();
+        parser.columns.give(block.last);
         let workspace = &parser.workspace;
         let owners = (
             workspace.alphabet.as_ptr(),
@@ -2072,7 +2154,12 @@ mod parser_workspace_tests {
             .map(|table| (table.symbols.as_ptr(), table.symbols.capacity()))
             .collect();
         for expected in [b'A', 0, b'A'] {
-            assert_eq!(parser.next().unwrap().unwrap().last, [expected]);
+            let block = parser.next().unwrap().unwrap();
+            assert_eq!(*block.last, [expected]);
+            // The one column owner is reused for every later block.
+            assert_eq!(block.last.as_ptr(), column);
+            parser.columns.give(block.last);
+            assert_eq!(parser.columns.owners, 1);
             let workspace = &parser.workspace;
             assert_eq!(
                 (

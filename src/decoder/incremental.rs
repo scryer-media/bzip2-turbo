@@ -335,8 +335,9 @@ impl Incremental {
                             .take()
                             .map_or_else(|| Links::new(self.mode), BlockOutput::into_links);
                         self.active = Some(BlockOutput::new(
-                            Block {
-                                last: std::mem::take(&mut self.last),
+                            &Block {
+                                last: std::mem::take(&mut self.last).into(),
+                                limit: self.limit,
                                 counts: self.counts,
                                 origin: self.origin,
                                 randomized: self.randomized,

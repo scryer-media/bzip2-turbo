@@ -70,13 +70,27 @@ fn reference_streams_decode_at_every_output_boundary() {
 #[test]
 fn compact_budget_factories_keep_callbacks_bytes_and_repeated_eof() {
     use std::sync::{Arc, Mutex};
-    assert_eq!(Decoder::<&[u8]>::low_memory_usage(1), 6 << 20);
-    let parallel = if cfg!(target_family = "wasm") { 6 } else { 12 };
+    // Linux x86-64/AArch64 count the 2 MiB-rounded TT and last-column pages.
+    let serial = if cfg!(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(miri)
+    )) {
+        8
+    } else {
+        6
+    };
+    assert_eq!(Decoder::<&[u8]>::low_memory_usage(1), serial << 20);
+    let parallel = if cfg!(target_family = "wasm") {
+        serial
+    } else {
+        12
+    };
     assert_eq!(Decoder::<&[u8]>::low_memory_usage(8), parallel << 20);
     let expected = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         10
     } else {
-        6
+        serial
     };
     assert_eq!(Decoder::<&[u8]>::memory_usage(1), expected << 20);
     let data: Vec<_> = (0..300_001).map(|index| (index % 251) as u8).collect();

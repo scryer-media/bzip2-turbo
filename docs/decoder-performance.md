@@ -74,14 +74,45 @@ These are safe Rust changes. The decoder's existing unsafe-code prohibition
 remains in place; no unchecked lookup experiment or experimental CI change was
 integrated. Public signatures and dependency versions are unchanged.
 
+## TT storage
+
+`CDecoder` allocates `_counters` once, at the format maximum, through
+`BigAlloc`: TT words and the byte-mode last column share one allocation that,
+on Linux, is aligned to 2 MiB and advised with `MADV_HUGEPAGE`. Every block of
+every level therefore chases its links through huge-page-backed memory.
+
+On Linux x86-64 and AArch64 the decoder follows that policy with separately
+owned buffers. Every TT and every last column is rounded up to whole 2 MiB
+pages (at least one), aligned to 2 MiB and advised with `MADV_HUGEPAGE`,
+whatever its size. Compact links take 2 MiB for levels 1–5 and 4 MiB for
+levels 6–9; a last column of any level fits one 2 MiB page. The TT is sized
+once at the stream's declared block limit and is never shrunk or reallocated
+while it is large enough; a later member with a larger level grows it once.
+Last columns come from a small recycled pool instead of a fresh allocation per
+block: one owner when single-threaded, returned as soon as its TT is built,
+and at most two when pipelined, each returned with its block's completion
+message. The kernel honours the advice only when transparent huge pages are
+set to `madvise` or `always`; with `never` these buffers use ordinary 4 KiB
+pages, as before. Other targets keep exact-size `Vec` storage, and the
+recycled column is a `Vec` there: extending it to the block limit zero-fills
+only bytes beyond the previous block's length. Native pages are zeroed once,
+when allocated. The parser stores each byte at a bounded index into the
+column, with no per-byte capacity check beyond the declared-size test.
+
 ## Memory and correctness
 
-On 64-bit targets, the conservative compact single-threaded requested-allocation
-subtotal is 6,223,996 bytes, below the documented 6 MiB estimate. This counts the
-retained tables and worst-case 900,000-byte last column. It excludes the reader,
-stack, allocator metadata and other exclusions stated by the public memory
-estimate; it is not a whole-process RSS promise. Byte selectors offset the
-larger single-threaded output buffer. Worker output ownership remains bounded.
+On 64-bit Linux x86-64 and AArch64, the conservative compact single-threaded
+requested-allocation subtotal is 7,421,148 bytes, below the documented 8 MiB
+estimate: a 4 MiB level-9 TT, one 2 MiB last-column page, the 1 MiB output
+buffer, the 32 KiB input buffer and 48,348 bytes of retained entropy tables.
+On other 64-bit targets the exact-size TT and 900,000-byte last column give
+5,629,692 bytes, below the 6 MiB estimate. With two threads, the Linux
+subtotal is 9,649,372 bytes, below 12 MiB: the TT, two last-column pages,
+eighteen 64 KiB worker output chunks, the input buffer and the tables.
+These exclude the reader, stack, allocator metadata and other exclusions
+stated by the public memory estimate; they are not a whole-process RSS
+promise. Byte selectors offset the larger single-threaded output buffer.
+Worker output ownership remains bounded.
 
 Tests compare the high-aligned reservoir against the earlier implementation,
 including exact read consumption and error outcomes. Additional tests cover
