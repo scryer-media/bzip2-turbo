@@ -1,8 +1,10 @@
 # Native decoder improvements
 
 The native `Decoder` changes in runtime commit `8a2188e6b667` were selected
-from paired measurements against the pinned 7-Zip 26.04 reference. They do
-not establish full performance parity. The compatibility adapters retain their
+from paired measurements against the pinned 7-Zip 26.04 reference. The
+decode-parity follow-up measured below brings native decoding to 7zz parity or
+better on every measured x86-64 case and on most AArch64 cases, with the
+remaining AArch64 gaps listed. The compatibility adapters retain their
 separate incremental parser; native-parser timings do not measure that API.
 
 ## Follow the complete stream
@@ -93,13 +95,12 @@ against a register-held length. The CRC is still computed in one batch per
 read, runs still carry across reads, and decoded bytes and errors are
 unchanged; a unit test compares every read result, output buffer and state
 with the previous loop. Generated AArch64 and x86-64 code was inspected for
-this shape, including the absence of stack reloads in the loop. It has not
-yet been timed against 7zz on the Linux hosts; no performance result is
-claimed here.
+this shape, including the absence of stack reloads in the loop. Its timings
+are part of the measured results below.
 
-These are safe Rust changes. The decoder's existing unsafe-code prohibition
-remains in place; no unchecked lookup experiment or experimental CI change was
-integrated. Public signatures and dependency versions are unchanged.
+These are safe Rust changes; no unsafe code was added to the decoder and no
+experimental CI change was integrated. Public signatures and dependency
+versions are unchanged.
 
 ## TT storage
 
@@ -163,6 +164,50 @@ large-to-small and incomplete table rebuilds, allocation reuse across concatenat
 members, selectors beyond the storage cap, short and empty reads, repeated EOF,
 CRC rejection and callback failure. Existing interoperability tests verify
 reference bytes and malformed-stream handling.
+
+## Measured results
+
+The decode-parity follow-up (the reconstruct loop, clamped and
+register-addressed scatter, run-ahead, huge-page TT storage mapped through
+`mmap`, the CDecoder Huffman structure and the worker cancellation changes)
+was measured on two Linux hosts, a Graviton3 (Neoverse V1) instance and an
+Intel Xeon (Sapphire Rapids) instance, against 7zz 26.04 built from the pinned
+source on the same host. Each entry is the median of nine interleaved runs of
+the complete process pinned to the same cores, reading from the page cache and
+writing to the null device, with 1T meaning one decoding thread and 2T the
+run-ahead worker. Streams were produced by 7zz at levels 1, 5 and 9 from the
+canonical fixtures. Every decode was byte-compared with the original before
+timing. Ratios are this crate's time over 7zz's; below 1.0 is faster.
+
+| case | Graviton3 1T | Graviton3 2T | Intel 1T | Intel 2T |
+| --- | --- | --- | --- | --- |
+| logs L1 | 0.97 | 1.00 | 1.01 | 0.96 |
+| json L1 | 0.97 | 0.97 | 1.01 | 0.83 |
+| film L1 | 1.07 | 1.02 | 0.72 | 0.52 |
+| program L1 | 1.01 | 0.93 | 0.85 | 0.63 |
+| logs L5 | 0.98 | 1.03 | 1.02 | 1.00 |
+| json L5 | 0.99 | 1.01 | 1.02 | 1.03 |
+| film L5 | 1.04 | 1.01 | 0.74 | 0.57 |
+| logs L9 | 0.98 | 1.04 | 1.02 | 0.99 |
+| json L9 | 0.99 | 1.00 | 1.01 | 1.01 |
+| film L9 | 1.06 | 1.00 | 0.81 | 0.89 |
+| repeated L9 | 0.56 | 0.58 | 0.79 | 0.84 |
+
+Relative to the previous main build on the same hosts, the logs and json
+level 1 cases improved by 13 to 19 percent on Graviton3 and by 18 to 21
+percent at 2T on Intel, and the Intel level 5 and 9 cases by 1 to 13 percent.
+TLB refill counts
+now match 7zz on both hosts (previously 150 times higher on Graviton3), and the
+`mmap` storage path makes these results independent of the process allocator.
+
+Remaining gaps, all on Graviton3: the film cases at 1T are 4 to 7 percent
+behind, entirely in the parser, where this crate executes fewer instructions
+than `ReadBlock2` but takes about 22 percent more branch misses; the CDecoder
+Huffman port did not change that count, so the source is elsewhere in the
+parser and is not yet diagnosed. The level 5 and 9 cases at 2T are 1 to 4
+percent behind, tied to per-chunk handoffs between the parser and the worker
+(about seven times the context switches of 7zz's two-thread path). Intel
+level 5 and 9 cases at 1T sit 1 to 2 percent behind, within run-to-run noise.
 
 ## Evidence and limits
 
