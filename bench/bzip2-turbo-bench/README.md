@@ -8,7 +8,9 @@ The latter accepts the historical level, block-size, passes, runs, warmups,
 hardware, revision, profile, darwin-resources and require-parity options.
 Platform identity values use Go OS/architecture names. These legacy commands
 keep their candidate/reference ratio direction; four-contender reports use
-reference/ours. All raw outputs stay outside the checkout.
+reference/ours. `legacy-compare` checks bytes at 1, 2, 4 and 8 threads but
+times decoding only at 1 and 2, the thread counts the native decoder can use.
+All raw outputs stay outside the checkout.
 Four contenders run in rotating order: 7zz, turbo, Rust bzip2 with its pure Rust
 backend, and Rust bzip2 with its C backend. Every encoded output is decoded by
 every contender before timing. Native turbo output must match 7zz byte for byte;
@@ -110,7 +112,8 @@ Build the native example and both isolated reference builds as documented in
 cargo build --manifest-path ../../Cargo.toml --release --example codec-bench
 go run . toolchain --sevenzip 7zz
 go run . suite --sevenzip 7zz --size-kib 16 --levels 1,5,9 --threads 1,2 --api both --repeats 4 --out /tmp/bzip2-smoke.json
-# Full matrix, only when explicitly measuring performance on an idle host:
+# Full matrix, only when explicitly measuring performance on an idle host
+# (native 4T/8T time encoding only; decode is timed at 1T and 2T):
 go run . suite --sevenzip 7zz --size-kib 32768 --levels 1,5,9 --threads 1,2,4,8 --api both --repeats 4 --out /tmp/bzip2-matrix.json
 go run . run --sevenzip 7zz --input /tmp/corpus.bin --threads 1 --out /tmp/bzip2-run.json
 ```
@@ -126,7 +129,12 @@ See the reference-build README for explicit equivalent environment overrides.
 the source identity root. No tools are built or downloaded automatically.
 `--list` prints the matrix without requiring tools. Corpora are deterministic
 text, random, periodic and runs. Compatibility turbo is serial and skipped for
-thread counts above one. Pure Rust and C references always run one real thread;
+thread counts above one. Native decoding uses at most two threads (parser and
+one reconstruction worker, `Decoder::with_mode`'s clamp), so native scenarios
+above two threads time encoding only; their decode mode, for turbo and 7zz
+alike, is listed in `Skipped` with `"mode": "decode"`. Every encoder's stream is
+still cross-decoded by every decoder at the scenario's thread count before
+timing. Pure Rust and C references always run one real thread;
 `reference_threads` records this even when native turbo and 7zz use more threads.
 
 Default `--settings block-size` gives the setting index an explicit meaning:

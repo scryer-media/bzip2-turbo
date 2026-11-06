@@ -37,8 +37,30 @@
 //! dropping a native encoder does not finish its stream. Read a decoder through
 //! EOF to validate the complete stream, including its trailer checksum.
 //!
+//! # Differences from the `bzip2` crate
+//!
+//! The adapters follow bzip2 0.6.1's interface and stream behavior; the backend
+//! differs:
+//!
+//! - Compressed bytes can differ from libbz2. Matching native settings
+//!   reproduce 7-Zip's bytes.
+//! - Compatibility [`Compression`] levels select 100,000-byte block increments
+//!   with a default of six; native `EncoderOptions` keeps 7-Zip's level and
+//!   pass mapping with a default of five.
+//! - `work_factor` is validated in `0..=250` but does not tune the 7-Zip
+//!   sorter.
+//! - Compact decoding (`Decompress::new(true)`, [`Decoder::with_low_memory`])
+//!   uses 32-bit links, not libbz2's 16-bit small-memory representation, and
+//!   does not promise its footprint. Memory estimates cover codec allocations,
+//!   not whole-process RSS.
+//! - Low-level calls can consume or produce less than their slice capacity;
+//!   the compatibility bridge admits at most 16 KiB of input per call.
+//! - A zero-progress underlying writer returns `WriteZero` instead of looping.
+//! - The original package's backend and linkage Cargo features do not exist.
+//!
 //! The codec is licensed under LGPL-2.1-or-later; compatibility adapters retain MIT.
-//! See the repository `PORTING.md` for reference revisions and verification evidence.
+//! The repository's `docs/validation.md` records reference revisions and
+//! verification evidence.
 
 #![deny(unsafe_code)]
 #![cfg_attr(feature = "compress", doc = include_str!("../README.md"))]

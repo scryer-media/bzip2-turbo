@@ -5,7 +5,7 @@ use super::{Block, OutputState, RANDOM_NUMBERS, invalid, tt};
 use std::io;
 
 impl OutputState<u32> {
-    pub(super) fn new(block: Block, links: TtBuffer<u32>) -> Self {
+    pub(super) fn new(block: &Block, links: TtBuffer<u32>) -> Self {
         let n = block.last.len();
         let links = tt::build_links(&block.last, block.counts, links);
         let position = links[(links[block.origin] >> 8) as usize];
