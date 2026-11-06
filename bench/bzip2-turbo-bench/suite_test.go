@@ -13,7 +13,9 @@ import (
 
 func TestScheduleKeepsCompatibilitySerial(t *testing.T) {
 	ready, skipped := schedule([]string{"text", "random", "periodic", "runs"}, []int{1, 5, 9}, []int{1, 2, 4, 8}, []string{"native", "compat"})
-	if len(ready) != 60 || len(skipped) != 36 {
+	// 36 compatible scenarios above one thread plus 24 native decode modes
+	// above the native decoder's two-thread cap.
+	if len(ready) != 60 || len(skipped) != 36+24 {
 		t.Fatalf("ready=%d skipped=%d", len(ready), len(skipped))
 	}
 	seen := map[scenario]bool{}
@@ -26,10 +28,24 @@ func TestScheduleKeepsCompatibilitySerial(t *testing.T) {
 			t.Fatal("pretend compatible MT", s)
 		}
 	}
+	decodeSkips := 0
 	for _, s := range skipped {
-		if s.Skip == "" || s.API != "compat" || s.Threads == 1 {
+		compat := s.API == "compat" && s.Threads != 1 && s.Mode == ""
+		nativeDecode := s.API == "native" && s.Threads > nativeDecodeThreadCap && s.Mode == "decode"
+		if s.Skip == "" || !(compat || nativeDecode) {
 			t.Fatal("invalid skip", s)
 		}
+		if nativeDecode {
+			decodeSkips++
+			runnable := s
+			runnable.Mode, runnable.Skip = "", ""
+			if !seen[runnable] {
+				t.Fatal("native scenario above decode cap lost its encode timing", s)
+			}
+		}
+	}
+	if decodeSkips != 24 {
+		t.Fatalf("native decode skips=%d", decodeSkips)
 	}
 	for i := 0; i < 4; i++ {
 		want := []int{i, (i + 1) % 4, (i + 2) % 4, (i + 3) % 4}
@@ -38,6 +54,21 @@ func TestScheduleKeepsCompatibilitySerial(t *testing.T) {
 		}
 	}
 
+}
+func TestModesDropNativeDecodeAboveThreadCap(t *testing.T) {
+	both := []string{"encode", "decode"}
+	for _, n := range []int{1, 2, 4, 8} {
+		want := both
+		if n > nativeDecodeThreadCap {
+			want = []string{"encode"}
+		}
+		if got := modes(scenario{API: "native", Level: 9, Threads: n}); !reflect.DeepEqual(got, want) {
+			t.Fatalf("native threads=%d modes=%v", n, got)
+		}
+	}
+	if got := modes(scenario{API: "compat", Level: 9, Threads: 1}); !reflect.DeepEqual(got, both) {
+		t.Fatalf("compat modes=%v", got)
+	}
 }
 func TestRSSMediansAndRatiosUseBytesAndRejectMissingSamples(t *testing.T) {
 	ptr := func(n uint64) *uint64 { return &n }

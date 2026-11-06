@@ -2,8 +2,8 @@ name: release
 
 # Two ways in, the same checks and the same publish (see docs/publishing.md):
 #
-# - Run from the Actions tab (workflow_dispatch) on main with the version to
-#   release. The run refuses unless that commit already passed ci.yml, then
+# - Run from the Actions tab (workflow_dispatch) on main using Cargo.toml
+#   for the version. The run refuses unless that commit passed ci.yml, then
 #   publishes the crate to crates.io through trusted publishing and creates
 #   the tag v<version> and the GitHub release. dry_run (the default) stops
 #   after the checks.
@@ -19,10 +19,6 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version to release, exactly as in Cargo.toml (e.g. 0.1.0)"
-        required: true
-        type: string
       dry_run:
         description: "Run the checks only; publish nothing"
         required: true
@@ -64,11 +60,9 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: The version being released
         id: version
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-            version="$INPUT_VERSION"
+            version="$(cargo pkgid -p "$CRATE" | sed 's/.*[#@]//')"
             if [ "$GITHUB_REF" != refs/heads/main ]; then
               echo "::error::a release is dispatched from main, not $GITHUB_REF"
               exit 1

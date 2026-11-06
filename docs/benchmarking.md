@@ -32,7 +32,9 @@ and `bzip2-sys` 0.1.13+1.0.8 for `c`. The pure graph must exclude `bzip2-sys`;
 the C graph must exclude `libbz2-rs-sys`. Both drivers require one thread and
 use the same standard I/O buffering as the turbo compatibility driver. Native
 turbo and 7zz can use matching explicit worker counts; reports retain the
-serial reference thread count. This is benchmark-only isolation, not a library
+serial reference thread count. Native decoding uses at most two threads, so the
+suite times decode at 1 and 2 threads only; higher budgets time encoding and
+record decode as a skipped scenario. This is benchmark-only isolation, not a library
 backend feature or runtime dependency.
 
 The harness defaults to `--settings block-size`: indices 1, 5 and 9 mean
@@ -99,7 +101,9 @@ main text workload. Run from
 `bench/bzip2-turbo-bench`: `go run . legacy-corpus DESTINATION --mib 32`
 and `go run . legacy-compare --codec EXE --oracle EXE --input FILE --results JSON`.
 The corpus bytes, CLI options, report keys, alternating order, Darwin resource
-counters and strict unrounded parity criterion match the historical tools.
+counters and strict unrounded parity criterion match the historical tools,
+except that decode timings stop at two threads, the most the native decoder
+uses; bytes are still checked at every thread count.
 Platform identity fields use Go OS/architecture names; supply `--hardware` for
 a precise machine description. Four 1 MiB corpus SHA-256 characterizations and
 a tiny comparison schema/identity smoke check verified the migration.

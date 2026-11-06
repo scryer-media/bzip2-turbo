@@ -6,6 +6,8 @@ At approximately 22:48 UTC, the scheduled shutdown timer on each task host was e
 
 The output sink is `/dev/null` for every timed engine and operation. Wall time includes GNU time wrapper startup, codec startup and I/O. RSS is median peak codec-command RSS from GNU time's own child report (`gnu-time-child-v1`), not the Go parent's pre-exec high-water mark. CPU fields are reported at GNU time's hundredth-second precision. RSS is not aggregate simultaneous process-tree memory. Budgets are requests: native decoding uses at most two total threads; the pure Rust and C references remain serial at every comparison budget.
 
+These are prior results: the harness used to time decode at every requested budget. From this change on it measures decode only at 1T and 2T, matching the native decoder's two-thread cap; 4T and 8T budgets still measure encoding and record decode as skipped scenarios. The 4T and 8T decode rows below are kept as measured.
+
 Build receipts record Rust 1.97.1 with optimization level 3, fat LTO, one codegen unit and stripped executables, with no target-CPU or extra Rust flag override. The Go harness uses Go 1.23.12. 7zz 26.04 uses pinned SDK source `9128b80e3a471108678e2b3ec3c985861c8d7b0f`, GCC 13.3.0 and its stock makefile.gcc build. Serial references use bzip2 0.6.1 with libbz2-rs-sys 0.2.6, or the bundled static libbz2 1.0.8 backend.
 
 Signed source revision: `f6cb7d2c02a9d988dc55f031a7f8ecce8eab8f8c`. Source content SHA-256: `bb1482244ade70cec0f81d222e8aa43bc559bc2c4534ac6b9bcf39c104606047`. Approved source archive SHA-256: `7af740b8bd9928cb609db9499bbdca9363e9755711e2fd13d5ceb759b5cf4cac`.
@@ -24,7 +26,7 @@ JSON uses varied values and recurring keys; logs are complete varied structured 
 
 Host: c7g.2xlarge, Graviton3, 16 GiB RAM, Ubuntu 24.04.
 
-The host exposes 8 allowed logical CPUs across 8 physical cores. Every contender uses the same affinity set at a given requested budget; physical cores are selected before SMT. Native decoder capacity is 1/2/2/2 total threads at requested budgets 1/2/4/8; the 7zz setting is a request, not a measured live-thread count.
+The host exposes 8 allowed logical CPUs across 8 physical cores. Every contender uses the same affinity set at a given requested budget; physical cores are selected before SMT. Native decoder capacity is 1/2/2/2 total threads at requested budgets 1/2/4/8; the 7zz setting is a request, not a measured live-thread count. The 4T and 8T decode rows below are prior results that measured the same two-thread native pipeline as 2T.
 
 | Requested budget | Allowed logical CPUs |
 |---|---|
@@ -368,7 +370,7 @@ Cells show **MiB/s · peak RSS MiB**, using separate encode/decode medians. Pure
 
 Host: c7i.2xlarge, Intel Xeon Platinum 8488C, 16 GiB RAM, Ubuntu 24.04.
 
-The host exposes 8 allowed logical CPUs across 4 physical cores. Every contender uses the same affinity set at a given requested budget; physical cores are selected before SMT. Native decoder capacity is 1/2/2/2 total threads at requested budgets 1/2/4/8; the 7zz setting is a request, not a measured live-thread count.
+The host exposes 8 allowed logical CPUs across 4 physical cores. Every contender uses the same affinity set at a given requested budget; physical cores are selected before SMT. Native decoder capacity is 1/2/2/2 total threads at requested budgets 1/2/4/8; the 7zz setting is a request, not a measured live-thread count. The 4T and 8T decode rows below are prior results that measured the same two-thread native pipeline as 2T.
 
 | Requested budget | Allowed logical CPUs |
 |---|---|

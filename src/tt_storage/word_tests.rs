@@ -1,15 +1,19 @@
-use super::{HUGE_PAGE, MAX_WORDS, THRESHOLD, TtBuffer, Word, allocation_bytes};
+use super::{HUGE_PAGE, MAX_WORDS, TtBuffer, Word, allocation_bytes};
 use std::fmt::Debug;
 
+/// The largest element count that still fits one page, capped by the format bound.
+fn one_page<W: Word>() -> usize {
+    (HUGE_PAGE / std::mem::size_of::<W>()).min(MAX_WORDS)
+}
+
 fn geometry<W: Word>() {
-    let width = std::mem::size_of::<W>();
-    for length in [0, 1, THRESHOLD / width] {
-        assert_eq!(allocation_bytes::<W>(length), None);
+    let full = one_page::<W>();
+    for length in [0, 1, full] {
+        assert_eq!(allocation_bytes::<W>(length), Some(HUGE_PAGE));
     }
-    assert_eq!(
-        allocation_bytes::<W>(THRESHOLD / width + 1),
-        Some(HUGE_PAGE)
-    );
+    if full < MAX_WORDS {
+        assert_eq!(allocation_bytes::<W>(full + 1), Some(2 * HUGE_PAGE));
+    }
     assert_eq!(allocation_bytes::<W>(MAX_WORDS), Some(W::MAX_ALLOCATION));
     for length in [MAX_WORDS + 1, usize::MAX] {
         assert_eq!(allocation_bytes::<W>(length), None);
@@ -17,7 +21,8 @@ fn geometry<W: Word>() {
 }
 
 #[test]
-fn both_word_widths_obey_logical_and_rounded_byte_bounds() {
+fn every_word_width_obeys_logical_and_rounded_byte_bounds() {
+    geometry::<u8>();
     geometry::<u32>();
     geometry::<[u32; 2]>();
 }
@@ -52,13 +57,14 @@ fn ownership<W: Word + PartialEq + Debug + 'static>(value: impl Fn(usize) -> W) 
 }
 
 #[test]
-fn both_word_widths_preserve_dirty_prefix_and_independent_threaded_owners() {
+fn every_word_width_preserves_dirty_prefix_and_independent_threaded_owners() {
+    ownership::<u8>(|index| (index as u8) ^ 0x5a);
     ownership::<u32>(|index| 0xABCD_EF01 ^ index as u32);
     ownership::<[u32; 2]>(|index| [index as u32, !(index as u32)]);
 }
 
 fn refusal<W: Word + PartialEq + Debug>() {
-    let requested = THRESHOLD / std::mem::size_of::<W>() + 1;
+    let requested = one_page::<W>();
     let logical = if cfg!(miri) { 33 } else { requested };
     let buffer = TtBuffer::<W>::allocate_with(requested, |bytes| {
         assert_eq!(bytes, HUGE_PAGE);
@@ -72,7 +78,8 @@ fn refusal<W: Word + PartialEq + Debug>() {
 }
 
 #[test]
-fn both_word_widths_fall_back_to_initialized_storage_after_refusal() {
+fn every_word_width_falls_back_to_initialized_storage_after_refusal() {
+    refusal::<u8>();
     refusal::<u32>();
     refusal::<[u32; 2]>();
 }

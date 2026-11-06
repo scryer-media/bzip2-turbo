@@ -4,6 +4,7 @@
 //! Modified: safe Rust ownership, standard I/O, and bounded reconstruction jobs.
 use super::tt_storage::TtBuffer;
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -47,16 +48,41 @@ impl<R: Read> Bits<R> {
         self.pos += 1;
         Ok(Some(byte))
     }
+    /// Returns the next `n` bits without consuming them.
+    ///
+    /// CBitDecoder keeps active bits high-aligned. A refill starts with fewer
+    /// than n <= 32 bits and adds at most one word, so at most 63 bits are
+    /// active. Unused low bits remain zero after every refill and consume.
+    ///
+    /// `BYTEWISE` selects ReadBlock2's refill, at most three bytes each behind
+    /// its own count test, over the one-word refill. The word refill's branch
+    /// fired on a pattern Graviton3's predictor missed on high-entropy blocks
+    /// (22 million misses against 17 million for 7zz on film at level 5),
+    /// while on text blocks, and on x86-64 everywhere, it measured 2 to 6
+    /// percent faster than the byte-wise shape. The block parser picks per
+    /// block on Linux ARM64; every other caller uses the word refill.
     #[inline(always)]
-    fn peek(&mut self, n: u32) -> io::Result<u32> {
+    fn peek<const BYTEWISE: bool>(&mut self, n: u32) -> io::Result<u32> {
         debug_assert!(n <= 32);
         if n == 0 {
             return Ok(0);
         }
-        // CBitDecoder keeps active bits high-aligned. A refill starts with
-        // at most 31 bits, so a complete word leaves at most 63 active bits.
-        // Unused low bits remain zero after every refill and consume.
-        if self.count < n && self.end - self.pos >= 4 {
+        if BYTEWISE && self.count < n && self.end - self.pos >= 3 {
+            self.bits |= u64::from(self.buffer[self.pos]) << (56 - self.count);
+            self.pos += 1;
+            self.count += 8;
+            if self.count < n {
+                self.bits |= u64::from(self.buffer[self.pos]) << (56 - self.count);
+                self.pos += 1;
+                self.count += 8;
+                if self.count < n {
+                    self.bits |= u64::from(self.buffer[self.pos]) << (56 - self.count);
+                    self.pos += 1;
+                    self.count += 8;
+                }
+            }
+        }
+        if !BYTEWISE && self.count < n && self.end - self.pos >= 4 {
             let word = u32::from_be_bytes(self.buffer[self.pos..self.pos + 4].try_into().unwrap());
             self.bits |= u64::from(word) << (32 - self.count);
             self.pos += 4;
@@ -73,7 +99,7 @@ impl<R: Read> Bits<R> {
     }
     #[inline(always)]
     fn take(&mut self, n: u32) -> io::Result<u32> {
-        let value = self.peek(n)?;
+        let value = self.peek::<false>(n)?;
         self.consume(n);
         Ok(value)
     }
@@ -88,12 +114,52 @@ impl<R: Read> Bits<R> {
     }
 }
 
+/// Longest BZip2 code, CDecoder's kNumBitsMax (BZip2Decoder's kMaxHuffmanLen).
+const MAX_CODE_BITS: u32 = 20;
+/// Largest BZip2 alphabet (256 MTF values, RUNA/RUNB, EOB), CDecoder's
+/// m_NumSymbols.
+const MAX_SYMBOLS: usize = 258;
+/// Direct-table width of `Huffman::symbol`, CDecoder's kNumTableBits. 7-Zip
+/// uses 9 for BZip2; any width in `1..MAX_CODE_BITS` is valid.
+const TABLE_BITS: u32 = 9;
+const TABLE_LEN: usize = 1 << TABLE_BITS;
+// One limit per long length plus the table bound and the sentinel.
+const LIMITS_LEN: usize = (MAX_CODE_BITS + 2 - TABLE_BITS) as usize;
+// One position bias per long length.
+const POSES_LEN: usize = (MAX_CODE_BITS - TABLE_BITS) as usize;
+// Short-code table entries, then the long-code symbols in canonical order. The
+// long run starts at the first table index no short code covers; for an
+// alphabet of at most 258 symbols that start minus the short-symbol count is
+// largest for short lengths 1..=TABLE_BITS, which bounds the array at
+// CDecoder's _symbols size.
+const TABLE_SYMBOLS_LEN: usize = TABLE_LEN + MAX_SYMBOLS - (TABLE_BITS as usize + 1);
+
+/// One canonical BZip2 Huffman table.
+///
+/// `first`/`counts`/`offsets`/`symbols` are the canonical code description the
+/// suspendable bit-serial decoder in `incremental` walks. `limits`, `poses`,
+/// `lens` and `table_symbols` are the lookup structure of 7-Zip's
+/// `NHuffman::CDecoder` (HuffmanDecoder.h, `Build` and `Z7_HUFF_DECODE_BASE`)
+/// used by `symbol`: codes of at most `TABLE_BITS` bits resolve through a
+/// direct table, and longer codes are found by comparing one 20-bit window
+/// against per-length code limits, with no bit-serial reads.
 struct Huffman {
     first: [u32; 21],
     counts: [u32; 21],
     offsets: [usize; 21],
     symbols: Vec<u16>,
-    fast: [u32; 1024],
+    // limits[0]: number of TABLE_BITS-bit prefixes owned by short codes, so a
+    // direct lookup is valid iff the window's top TABLE_BITS bits are below it.
+    // limits[len - TABLE_BITS] for long `len`: one past the last code of
+    // length `len`, left-aligned to 20 bits. The last entry is the 1 << 20
+    // sentinel that stops the length search past the longest code.
+    limits: [u32; LIMITS_LEN],
+    // poses[len - TABLE_BITS - 1]: subtracted from a length-`len` code value to
+    // index its symbol in `table_symbols`.
+    poses: [u32; POSES_LEN],
+    // Code length for each direct-table index below limits[0].
+    lens: [u8; TABLE_LEN],
+    table_symbols: [u16; TABLE_SYMBOLS_LEN],
 }
 impl Huffman {
     fn new(lengths: &[u8]) -> io::Result<Self> {
@@ -102,17 +168,37 @@ impl Huffman {
             counts: [0; 21],
             offsets: [0; 21],
             symbols: Vec::with_capacity(lengths.len()),
-            fast: [0; 1024],
+            limits: [0; LIMITS_LEN],
+            poses: [0; POSES_LEN],
+            lens: [0; TABLE_LEN],
+            table_symbols: [0; TABLE_SYMBOLS_LEN],
         };
         table.rebuild(lengths)?;
         Ok(table)
+    }
+    /// The code length a symbol drawn from this table's implied distribution
+    /// expects, in 1/256 bit: the sum over codes of length times 2^-length.
+    /// Near 8 for the flat trees of high-entropy blocks, near 3 for text.
+    #[cfg(any(all(target_os = "linux", target_arch = "aarch64"), test))]
+    fn expected_code_bits_q8(&self) -> u32 {
+        let mut total = 0u32;
+        for len in 1..=MAX_CODE_BITS {
+            total += (self.counts[len as usize] * len) << (MAX_CODE_BITS - len);
+        }
+        total >> (MAX_CODE_BITS - 8)
     }
     fn rebuild(&mut self, lengths: &[u8]) -> io::Result<()> {
         self.first.fill(0);
         self.counts.fill(0);
         self.offsets.fill(0);
-        self.fast.fill(0);
+        self.limits.fill(0);
+        self.poses.fill(0);
+        self.lens.fill(0);
+        self.table_symbols.fill(0);
         self.symbols.clear();
+        if lengths.len() > MAX_SYMBOLS {
+            return Err(invalid("too many Huffman symbols"));
+        }
         self.symbols.reserve_exact(lengths.len());
         for &len in lengths {
             if !(1..=20).contains(&len) {
@@ -136,42 +222,86 @@ impl Huffman {
                 }
             }
         }
-        for len in 1..=10 {
+        // CDecoder::Build. Short codes fill their direct-table ranges: a
+        // length-`len` code owns 1 << (TABLE_BITS - len) consecutive indices.
+        let table_bits = TABLE_BITS as usize;
+        for len in 1..=table_bits {
+            let span = 1 << (table_bits - len);
             for index in 0..self.counts[len] {
                 let symbol = self.symbols[self.offsets[len] + index as usize];
-                let prefix = ((self.first[len] + index) as usize) << (10 - len);
-                for slot in &mut self.fast[prefix..prefix + (1 << (10 - len))] {
-                    *slot = (u32::from(symbol) << 8) | len as u32;
-                }
+                let prefix = ((self.first[len] + index) as usize) << (table_bits - len);
+                self.lens[prefix..prefix + span].fill(len as u8);
+                self.table_symbols[prefix..prefix + span].fill(symbol);
             }
         }
+        // `start` is the canonical code value at the current length and `next`
+        // the number of `table_symbols` slots used so far. Long symbols reuse
+        // the table indices at and above limits[0], which direct lookups never
+        // read. The tree is not oversubscribed, so start <= 1 << len.
+        let short = self.first[table_bits] + self.counts[table_bits];
+        self.limits[0] = short;
+        let mut start = short;
+        let mut next = short;
+        for len in table_bits + 1..=MAX_CODE_BITS as usize {
+            start <<= 1;
+            // start >= next: every used slot is a short-table prefix or an
+            // earlier long code, and each covers two or more values here.
+            self.poses[len - table_bits - 1] = start - next;
+            let count = self.counts[len];
+            let offset = self.offsets[len];
+            self.table_symbols[next as usize..(next + count) as usize]
+                .copy_from_slice(&self.symbols[offset..offset + count as usize]);
+            next += count;
+            start += count;
+            self.limits[len - table_bits] = start << (MAX_CODE_BITS as usize - len);
+        }
+        self.limits[LIMITS_LEN - 1] = 1 << MAX_CODE_BITS;
         Ok(())
     }
+    /// Decodes one symbol from a 20-bit window (Z7_HUFF_DECODE_BASE as
+    /// BZip2Decoder.cpp uses it through Z7_HUFF_DECODE_VAL_IN_HIGH32).
+    ///
+    /// The window needs 20 available bits even for a short code. A valid
+    /// stream always has them: the 80-bit end-of-stream footer follows the
+    /// last block. A stream cut closer than that returns UnexpectedEof.
+    /// Codes absent from an incomplete tree walk past the 20-bit limit and are
+    /// rejected as invalid, where CDecoder returns SZ_ERROR_DATA.
     #[inline(always)]
-    fn symbol<R: Read>(&self, bits: &mut Bits<R>) -> io::Result<usize> {
-        let entry = self.fast[bits.peek(10)? as usize];
-        let len = entry & 255;
-        if len != 0 {
-            bits.consume(len);
-            return Ok((entry >> 8) as usize);
-        }
-        let mut code = bits.take(10)?;
-        for len in 11..=20 {
-            code = (code << 1) | bits.take(1)?;
-            let index = code.wrapping_sub(self.first[len]);
-            if index < self.counts[len] {
-                return Ok(usize::from(
-                    self.symbols[self.offsets[len] + index as usize],
-                ));
+    fn symbol<R: Read, const BYTEWISE: bool>(&self, bits: &mut Bits<R>) -> io::Result<usize> {
+        let window = bits.peek::<BYTEWISE>(MAX_CODE_BITS)?;
+        let prefix = window >> (MAX_CODE_BITS - TABLE_BITS);
+        if prefix >= self.limits[0] {
+            let mut len = TABLE_BITS + 1;
+            if window >= self.limits[1] {
+                // limits[LIMITS_LEN - 1] exceeds every window, so the search
+                // stops at MAX_CODE_BITS + 1 at the latest.
+                loop {
+                    len += 1;
+                    if window < self.limits[(len - TABLE_BITS) as usize] {
+                        break;
+                    }
+                }
+                if len > MAX_CODE_BITS {
+                    return Err(invalid("invalid Huffman code"));
+                }
             }
+            // The window is at or above the previous length's limit, so the
+            // code is at least this length's first code and the index lands
+            // in this length's run of `table_symbols`.
+            let code = window >> (MAX_CODE_BITS - len);
+            let index = code - self.poses[(len - TABLE_BITS - 1) as usize];
+            bits.consume(len);
+            return Ok(usize::from(self.table_symbols[index as usize]));
         }
-        Err(invalid("invalid Huffman code"))
+        let prefix = prefix as usize;
+        bits.consume(u32::from(self.lens[prefix]));
+        Ok(usize::from(self.table_symbols[prefix]))
     }
 }
 
 #[cfg(test)]
 mod high_reservoir_tests {
-    use super::{Bits, Huffman, invalid};
+    use super::{Bits, Huffman, TABLE_BITS, TABLE_LEN, invalid};
     use std::io::{self, Read};
     struct OriginalBits<R> {
         reader: R,
@@ -210,10 +340,11 @@ mod high_reservoir_tests {
             Ok(Some(byte))
         }
         #[inline(always)]
-        fn peek(&mut self, n: u32) -> io::Result<u32> {
-            // All callers request at most 32 bits. A refill starts below that
-            // count, so appending a complete word fits the 64-bit reservoir.
-            if self.count < n && self.end - self.pos >= 4 {
+        fn peek<const BYTEWISE: bool>(&mut self, n: u32) -> io::Result<u32> {
+            // The same refill policy as the production reader, whose state
+            // the high-aligned reservoir must reproduce exactly: one word
+            // when it can, or bytes while short.
+            if !BYTEWISE && self.count < n && self.end - self.pos >= 4 {
                 let word =
                     u32::from_be_bytes(self.buffer[self.pos..self.pos + 4].try_into().unwrap());
                 self.bits = (self.bits << 32) | u64::from(word);
@@ -231,7 +362,7 @@ mod high_reservoir_tests {
         }
         #[inline(always)]
         fn take(&mut self, n: u32) -> io::Result<u32> {
-            let value = self.peek(n)?;
+            let value = self.peek::<false>(n)?;
             self.count -= n;
             Ok(value)
         }
@@ -291,7 +422,7 @@ mod high_reservoir_tests {
         }
         #[inline(always)]
         fn symbol<R: Read>(&self, bits: &mut OriginalBits<R>) -> io::Result<usize> {
-            let entry = self.fast[bits.peek(10)? as usize];
+            let entry = self.fast[bits.peek::<false>(10)? as usize];
             let len = entry & 255;
             if len != 0 {
                 bits.count -= len;
@@ -343,6 +474,13 @@ mod high_reservoir_tests {
     fn outcome<T>(result: io::Result<T>) -> Result<T, (io::ErrorKind, String)> {
         result.map_err(|error| (error.kind(), error.to_string()))
     }
+    // Bits consumed from a `Fragmented` input of `total` bytes.
+    fn consumed(bits: &Bits<Fragmented<'_>>, total: usize) -> usize {
+        (total - bits.reader.bytes.len() - (bits.end - bits.pos)) * 8 - bits.count as usize
+    }
+    fn original_consumed(bits: &OriginalBits<Fragmented<'_>>, total: usize) -> usize {
+        (total - bits.reader.bytes.len() - (bits.end - bits.pos)) * 8 - bits.count as usize
+    }
     #[test]
     fn high_aligned_huffman_matches_original_symbols_errors_and_refill_edges() {
         let trees = [
@@ -363,7 +501,23 @@ mod high_reservoir_tests {
             assert_eq!(packed.counts, original.counts);
             assert_eq!(packed.offsets, original.offsets);
             assert_eq!(packed.symbols, original.symbols);
-            assert_eq!(packed.fast, original.fast);
+            // The direct table holds exactly the original fast table's codes
+            // of at most TABLE_BITS bits.
+            for prefix in 0..TABLE_LEN {
+                let entry = original.fast[(prefix << 10) >> TABLE_BITS];
+                let len = entry & 255;
+                if (prefix as u32) < packed.limits[0] {
+                    assert_eq!(
+                        (
+                            u32::from(packed.lens[prefix]),
+                            u32::from(packed.table_symbols[prefix])
+                        ),
+                        (len, entry >> 8)
+                    );
+                } else {
+                    assert!(len == 0 || len > TABLE_BITS);
+                }
+            }
             let mut words = vec![0u32, u32::MAX, 0xaaaa_aaaa, 0x5555_5555];
             for length in 1..=20 {
                 for index in 0..packed.counts[length] {
@@ -383,12 +537,24 @@ mod high_reservoir_tests {
                             bytes: &bytes[..end],
                             width,
                         });
-                        assert_eq!(
-                            outcome(packed.symbol(&mut left)),
-                            outcome(original.symbol(&mut right))
-                        );
-                        assert_state(&left, &right);
-                        assert_eq!(left.reader.bytes.len(), right.reader.bytes.len());
+                        let got = outcome(packed.symbol::<_, false>(&mut left));
+                        // The CDecoder window always needs 20 bits, even
+                        // where the original resolved a short code early.
+                        if end * 8 < 20 {
+                            assert_eq!(
+                                got.map_err(|(kind, _)| kind),
+                                Err(io::ErrorKind::UnexpectedEof)
+                            );
+                            continue;
+                        }
+                        let want = outcome(original.symbol(&mut right));
+                        assert_eq!(got, want);
+                        // Refill granularity differs (a 20-bit window versus
+                        // 10-bit and single-bit reads), so compare the bits
+                        // each consumed rather than the reservoir state.
+                        if want.is_ok() {
+                            assert_eq!(consumed(&left, end), original_consumed(&right, end));
+                        }
                     }
                 }
             }
@@ -421,10 +587,12 @@ mod high_reservoir_tests {
                     width,
                 });
                 for &symbol in &symbols {
-                    assert_eq!(packed.symbol(&mut left).unwrap(), symbol);
+                    assert_eq!(packed.symbol::<_, false>(&mut left).unwrap(), symbol);
                     assert_eq!(original.symbol(&mut right).unwrap(), symbol);
-                    assert_state(&left, &right);
-                    assert_eq!(left.reader.bytes.len(), right.reader.bytes.len());
+                    assert_eq!(
+                        consumed(&left, encoded.len()),
+                        original_consumed(&right, encoded.len())
+                    );
                 }
             }
         }
@@ -459,6 +627,10 @@ mod high_reservoir_tests {
     }
     #[test]
     fn high_aligned_bits_match_original_peek_take_align_partial_errors_and_zero() {
+        exercise_against_original::<false>();
+        exercise_against_original::<true>();
+    }
+    fn exercise_against_original<const BYTEWISE: bool>() {
         for length in [0, 1, 2, 3, 4, 5, 31, 32, 33, 257, 32775] {
             let bytes: Vec<u8> = (0..length).map(|i| ((i * 97) ^ (i >> 3)) as u8).collect();
             for width in [1, 3, 4, 17, 32768] {
@@ -485,7 +657,7 @@ mod high_reservoir_tests {
                             high.align();
                             Ok(0)
                         } else if turn % 3 == 0 {
-                            high.peek(n)
+                            high.peek::<BYTEWISE>(n)
                         } else {
                             high.take(n)
                         };
@@ -493,7 +665,7 @@ mod high_reservoir_tests {
                             low.align();
                             Ok(0)
                         } else if turn % 3 == 0 {
-                            low.peek(n)
+                            low.peek::<BYTEWISE>(n)
                         } else {
                             low.take(n)
                         };
@@ -507,8 +679,8 @@ mod high_reservoir_tests {
                             (high.reader.bytes.len(), high.reader.calls),
                             (low.reader.bytes.len(), low.reader.calls)
                         );
-                        assert_eq!(high.peek(0).unwrap(), 0);
-                        assert_eq!(low.peek(0).unwrap(), 0);
+                        assert_eq!(high.peek::<BYTEWISE>(0).unwrap(), 0);
+                        assert_eq!(low.peek::<BYTEWISE>(0).unwrap(), 0);
                         assert_state(&high, &low);
                         if ended {
                             break;
@@ -521,11 +693,40 @@ mod high_reservoir_tests {
 }
 
 struct Block {
-    last: Vec<u8>,
+    // ReadBlock2's BZIP2_BYTE_MODE column; a recycled column-pool owner.
+    last: TtBuffer<u8>,
+    // The stream's declared block-size limit, which sizes the TT once.
+    limit: usize,
     counts: [usize; 256],
     origin: usize,
     randomized: bool,
     crc: u32,
+}
+
+/// Last-column owners a decoder ever creates. CDecoder keeps the column inside
+/// its single `_counters` allocation. Here a single-threaded decoder holds one
+/// column, and returns it as soon as its TT is built. A pipelined decoder parses
+/// only while fewer than two blocks are in flight, and each submitted block's
+/// column returns with its Finished message, so at most two exist.
+const COLUMN_OWNERS: usize = 2;
+
+// Owners are created lazily and reused for every later block and stream.
+#[derive(Default)]
+struct ColumnPool {
+    spare: Vec<TtBuffer<u8>>,
+    owners: usize,
+}
+impl ColumnPool {
+    fn take(&mut self) -> TtBuffer<u8> {
+        self.spare.pop().unwrap_or_else(|| {
+            self.owners += 1;
+            debug_assert!(self.owners <= COLUMN_OWNERS, "column owner bound exceeded");
+            TtBuffer::default()
+        })
+    }
+    fn give(&mut self, column: TtBuffer<u8>) {
+        self.spare.push(column);
+    }
 }
 // CBase retains entropy scratch between blocks; published Blocks own no borrows.
 #[derive(Default)]
@@ -546,6 +747,7 @@ fn append_huffman(tables: &mut Vec<Huffman>, lengths: &[u8]) -> io::Result<()> {
 struct Parser<R> {
     bits: Bits<R>,
     workspace: ParserWorkspace,
+    columns: ColumnPool,
     limit: usize,
     combined: u32,
     started: bool,
@@ -557,6 +759,7 @@ impl<R: Read> Parser<R> {
         Self {
             bits: Bits::new(reader),
             workspace: ParserWorkspace::default(),
+            columns: ColumnPool::default(),
             limit: 0,
             combined: 0,
             started: false,
@@ -703,76 +906,116 @@ impl<R: Read> Parser<R> {
                 words
             };
             let mut counts = [0usize; 256];
-            let mut last = Vec::with_capacity(self.limit);
+            let limit = self.limit;
+            // ReadBlock2 stores the column in place; a recycled owner already
+            // covers the declared limit, so each byte is one bounded indexed store.
+            let mut column = self
+                .columns
+                .take()
+                .with_capacity_at_least(limit)
+                .resized(limit);
+            let last: &mut [u8] = &mut column[..limit];
+            let mut length = 0usize;
             let mut selector_index = 0;
             let mut group_left = 0;
             let mut huffman = &tables[0];
             let mut run = 0usize;
             let mut weight = 1usize;
-            loop {
-                if group_left == 0 {
-                    let selector = *selectors
-                        .get(selector_index)
-                        .ok_or_else(|| invalid("missing BZip2 selector"))?;
-                    huffman = &tables[usize::from(selector)];
-                    selector_index += 1;
-                    group_left = 50;
+            // Linux ARM64 refills byte-wise on blocks whose selectors weight
+            // the tables to at least six expected bits per code, where the
+            // word refill's branch mispredicts; text blocks sit near three
+            // bits and keep the word refill, which is faster there.
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+            let bytewise = {
+                let mut weights = [0u32; 6];
+                for &selector in selectors.iter() {
+                    weights[usize::from(selector)] += 1;
                 }
-                let symbol = huffman.symbol(&mut self.bits)?;
-                group_left -= 1;
-                if symbol <= 1 {
-                    run = run
-                        .checked_add(weight * (symbol + 1))
-                        .ok_or_else(|| invalid("BZip2 run overflow"))?;
-                    if run > self.limit - last.len() {
-                        return Err(invalid("BZip2 block exceeds declared size"));
+                let mut total = 0u64;
+                for (table, &weight) in tables.iter().zip(&weights) {
+                    total += u64::from(table.expected_code_bits_q8()) * u64::from(weight);
+                }
+                total >= 6 * 256 * selectors.len() as u64
+            };
+            #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+            let bytewise = false;
+            macro_rules! symbols {
+                ($bytewise:expr) => {
+                    loop {
+                        if group_left == 0 {
+                            let selector = *selectors
+                                .get(selector_index)
+                                .ok_or_else(|| invalid("missing BZip2 selector"))?;
+                            huffman = &tables[usize::from(selector)];
+                            selector_index += 1;
+                            group_left = 50;
+                        }
+                        let symbol = huffman.symbol::<R, $bytewise>(&mut self.bits)?;
+                        group_left -= 1;
+                        if symbol <= 1 {
+                            run = run
+                                .checked_add(weight * (symbol + 1))
+                                .ok_or_else(|| invalid("BZip2 run overflow"))?;
+                            if run > limit - length {
+                                return Err(invalid("BZip2 block exceeds declared size"));
+                            }
+                            weight = weight
+                                .checked_mul(2)
+                                .ok_or_else(|| invalid("BZip2 run overflow"))?;
+                            continue;
+                        }
+                        if run != 0 {
+                            #[cfg(target_arch = "x86_64")]
+                            let byte = mtf[0];
+                            #[cfg(not(target_arch = "x86_64"))]
+                            let byte = mtf[0] as u8;
+                            counts[byte as usize] += run;
+                            last[length..length + run].fill(byte);
+                            length += run;
+                            run = 0;
+                            weight = 1;
+                        }
+                        if symbol == alphabet_size - 1 {
+                            break;
+                        }
+                        let index = symbol - 1;
+                        if index >= alphabet.len() {
+                            return Err(invalid("invalid BZip2 MTF index"));
+                        }
+                        #[cfg(target_arch = "x86_64")]
+                        let byte = mtf[index];
+                        #[cfg(not(target_arch = "x86_64"))]
+                        let (next, byte) = {
+                            let next = mtf[index / 8];
+                            (next, (next >> ((index & 7) * 8)) as u8)
+                        };
+                        if length == limit {
+                            return Err(invalid("BZip2 block exceeds declared size"));
+                        }
+                        // ReadBlock2 publishes the byte and histogram before moving MTF words.
+                        last[length] = byte;
+                        length += 1;
+                        counts[byte as usize] += 1;
+                        #[cfg(target_arch = "x86_64")]
+                        move_mtf_bytes(&mut mtf, index, byte);
+                        #[cfg(not(target_arch = "x86_64"))]
+                        move_mtf(&mut mtf, index, next, byte);
                     }
-                    weight = weight
-                        .checked_mul(2)
-                        .ok_or_else(|| invalid("BZip2 run overflow"))?;
-                    continue;
-                }
-                if run != 0 {
-                    #[cfg(target_arch = "x86_64")]
-                    let byte = mtf[0];
-                    #[cfg(not(target_arch = "x86_64"))]
-                    let byte = mtf[0] as u8;
-                    counts[byte as usize] += run;
-                    last.resize(last.len() + run, byte);
-                    run = 0;
-                    weight = 1;
-                }
-                if symbol == alphabet_size - 1 {
-                    break;
-                }
-                let index = symbol - 1;
-                if index >= alphabet.len() {
-                    return Err(invalid("invalid BZip2 MTF index"));
-                }
-                #[cfg(target_arch = "x86_64")]
-                let byte = mtf[index];
-                #[cfg(not(target_arch = "x86_64"))]
-                let (next, byte) = {
-                    let next = mtf[index / 8];
-                    (next, (next >> ((index & 7) * 8)) as u8)
                 };
-                if last.len() == self.limit {
-                    return Err(invalid("BZip2 block exceeds declared size"));
-                }
-                // ReadBlock2 publishes the byte and histogram before moving MTF words.
-                last.push(byte);
-                counts[byte as usize] += 1;
-                #[cfg(target_arch = "x86_64")]
-                move_mtf_bytes(&mut mtf, index, byte);
-                #[cfg(not(target_arch = "x86_64"))]
-                move_mtf(&mut mtf, index, next, byte);
             }
-            if origin >= last.len() {
+            if bytewise {
+                symbols!(true);
+            } else {
+                symbols!(false);
+            }
+            if origin >= length {
                 return Err(invalid("invalid BZip2 BWT origin"));
             }
             self.combined = self.combined.rotate_left(1) ^ crc;
             return Ok(Some(Block {
-                last,
+                // Only the logical extent shrinks; the owner keeps its capacity.
+                last: column.resized(length),
+                limit,
                 counts,
                 origin,
                 randomized,
@@ -821,7 +1064,7 @@ fn move_mtf(words: &mut [u64; 32], index: usize, next: u64, byte: u8) {
     #[cfg(target_arch = "x86_64")]
     move_mtf_reverse(words, index, next, byte);
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    move_mtf_forward(words, index, next, byte);
+    move_mtf_forward2(words, index, next, byte);
     #[cfg(all(
         not(target_arch = "x86_64"),
         not(all(target_os = "linux", target_arch = "aarch64"))
@@ -829,15 +1072,42 @@ fn move_mtf(words: &mut [u64; 32], index: usize, next: u64, byte: u8) {
     move_mtf_paired(words, index, next, byte);
 }
 
-// ReadBlock2 / CMtf8Decoder::GetAndMove advances one word per carry step.
-// Keep the paired implementation selected on its existing other platforms.
-#[cfg(any(all(target_os = "linux", target_arch = "aarch64"), test))]
+// ReadBlock2 / CMtf8Decoder::GetAndMove as one word per carry step; kept as
+// the test oracle for the two-word layout below.
+#[cfg(test)]
 #[inline(always)]
 fn move_mtf_forward(words: &mut [u64; 32], index: usize, next: u64, byte: u8) {
     let word = index / 8;
     let shift = (index & 7) * 8;
     let mut carry = u64::from(byte);
     for entry in &mut words[..word] {
+        let previous = *entry;
+        *entry = (previous << 8) | carry;
+        carry = previous >> 56;
+    }
+    let mask = u64::MAX >> (56 - shift);
+    words[word] = (next & !mask) | (((next << 8) | carry) & mask);
+}
+
+// ReadBlock2's carry loop as GCC lays it out: two words per iteration with an
+// exit test after each word, so no separate remainder loop. On Graviton3 this
+// measured 1 to 3 percent faster than the one-word loop on film streams with
+// the same branch-miss count. Keep the paired implementation selected on its
+// existing other platforms.
+#[cfg(any(all(target_os = "linux", target_arch = "aarch64"), test))]
+#[inline(always)]
+fn move_mtf_forward2(words: &mut [u64; 32], index: usize, next: u64, byte: u8) {
+    let word = index / 8;
+    let shift = (index & 7) * 8;
+    let mut carry = u64::from(byte);
+    let mut entries = words[..word].iter_mut();
+    while let Some(entry) = entries.next() {
+        let previous = *entry;
+        *entry = (previous << 8) | carry;
+        carry = previous >> 56;
+        let Some(entry) = entries.next() else {
+            break;
+        };
         let previous = *entry;
         *entry = (previous << 8) | carry;
         carry = previous >> 56;
@@ -992,10 +1262,20 @@ enum BlockOutput {
     Paired(OutputState<[u32; 2]>),
 }
 impl BlockOutput {
-    fn new(block: Block, links: Links) -> Self {
+    /// Builds the block's TT; the caller keeps the last column, which this
+    /// output never reads again, and returns it to its pool.
+    fn new(block: &Block, links: Links) -> Self {
+        // Size the TT once at the declared limit, as CDecoder sizes `_counters`
+        // once, so later shorter or equal blocks never regrow it.
         match links {
-            Links::Compact(words) => Self::Compact(OutputState::<u32>::new(block, words)),
-            Links::Paired(words) => Self::Paired(OutputState::<[u32; 2]>::new(block, words)),
+            Links::Compact(words) => Self::Compact(OutputState::<u32>::new(
+                block,
+                words.with_capacity_at_least(block.limit),
+            )),
+            Links::Paired(words) => Self::Paired(OutputState::<[u32; 2]>::new(
+                block,
+                words.with_capacity_at_least(block.limit),
+            )),
         }
     }
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -1063,13 +1343,17 @@ impl OutputPool {
 
 enum WorkerMessage {
     Data(Vec<u8>),
-    Finished,
+    /// The finished block's last column, returned to the caller's pool.
+    Finished(TtBuffer<u8>),
     Error(io::Error),
 }
 struct Worker {
     jobs: Option<std::sync::mpsc::SyncSender<Block>>,
     receiver: Option<std::sync::mpsc::Receiver<WorkerMessage>>,
     returned: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    /// Set on drop before the job queue closes, so a block still buffered in
+    /// the queue is discarded instead of reconstructed for nobody.
+    cancelled: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 impl Worker {
@@ -1079,6 +1363,8 @@ impl Worker {
         // its successor, without expanding an RLE-heavy block into one allocation.
         let (sender, receiver) = std::sync::mpsc::sync_channel(16);
         let (returned, buffers) = std::sync::mpsc::sync_channel(OUTPUT_OWNERS);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::clone(&cancelled);
         let handle = std::thread::Builder::new()
             .name("bzip2-reconstruct".into())
             .spawn(move || {
@@ -1088,7 +1374,15 @@ impl Worker {
                     allocated: 0,
                 };
                 while let Ok(block) = blocks.recv() {
-                    let mut output = BlockOutput::new(block, links.take());
+                    // A closed queue still yields its buffered block; skip the
+                    // table build and callback once the decoder is dropping.
+                    if cancel.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let mut output = BlockOutput::new(&block, links.take());
+                    // The column travels back with Finished, so the caller never
+                    // waits for an owner and the in-flight count bounds them.
+                    let column = block.last;
                     loop {
                         let Some(mut bytes) = pool.take() else {
                             return;
@@ -1104,7 +1398,7 @@ impl Worker {
                                     return;
                                 }
                                 if output.finished() {
-                                    if sender.send(WorkerMessage::Finished).is_err() {
+                                    if sender.send(WorkerMessage::Finished(column)).is_err() {
                                         return;
                                     }
                                     break;
@@ -1123,6 +1417,7 @@ impl Worker {
             jobs: Some(jobs),
             receiver: Some(receiver),
             returned: Some(returned),
+            cancelled,
             handle: Some(handle),
         })
     }
@@ -1148,6 +1443,23 @@ impl Worker {
             .send(block)
             .map_err(|_| io::Error::other("BZip2 worker stopped before accepting a block"))
     }
+    /// Queues the successor of the one in-flight block; returns it only when
+    /// the worker has exited. The caller keeps it staged and then drains
+    /// output, where an exited worker reports its own error.
+    ///
+    /// A full slot still holds the in-flight block: the worker is between
+    /// blocks (in `recv` or `into_links`), never waiting on output delivery or
+    /// an owner, since every earlier Finished has been received. It takes that
+    /// block promptly, so waiting for the slot cannot deadlock.
+    fn submit_successor(&self, block: Block) -> Option<Block> {
+        use std::sync::mpsc::TrySendError;
+        let jobs = self.jobs.as_ref().expect("live worker job queue");
+        match jobs.try_send(block) {
+            Ok(()) => None,
+            Err(TrySendError::Full(block)) => jobs.send(block).err().map(|error| error.0),
+            Err(TrySendError::Disconnected(block)) => Some(block),
+        }
+    }
     fn receive(&mut self) -> io::Result<WorkerMessage> {
         match self.receiver.as_ref().expect("live worker receiver").recv() {
             Ok(message) => Ok(message),
@@ -1167,8 +1479,10 @@ impl Worker {
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        // Close every channel before joining: the worker can wait for output
-        // delivery, a returned owner, or the next block.
+        // Cancel a still-queued block first, then close every channel before
+        // joining: the worker can wait for output delivery, a returned owner,
+        // or the next block.
+        self.cancelled.store(true, Ordering::Release);
         self.receiver.take();
         self.returned.take();
         self.jobs.take();
@@ -1194,7 +1508,11 @@ pub struct Decoder<R: Read> {
     mode: Mode,
     threads: usize,
     worker: Option<Worker>,
-    worker_active: bool,
+    // Blocks submitted to the worker whose Finished has not been received:
+    // at most the one being reconstructed plus the one-slot job queue. A
+    // staged block exists only below two, so at most two parsed blocks live.
+    // Each holds one last column until its Finished arrives (COLUMN_OWNERS).
+    in_flight: u8,
     staged: Option<Block>,
     active: Option<BlockOutput>,
     output: Vec<u8>,
@@ -1233,7 +1551,7 @@ impl<R: Read> Decoder<R> {
                 threads.clamp(1, 2)
             },
             worker: None,
-            worker_active: false,
+            in_flight: 0,
             staged: None,
             active: None,
             output: Vec::new(),
@@ -1291,6 +1609,12 @@ impl<R: Read> Decoder<R> {
     /// the reader, allocator overhead, OS thread stacks, and storage owned or
     /// allocated by an output callback. Reusable scratch and output/TT capacity
     /// are included. Thread budgets follow [`Self::with_threads`].
+    ///
+    /// On Linux x86-64 and AArch64 every TT and last-column buffer is a whole
+    /// number of 2 MiB pages advised with `MADV_HUGEPAGE`; the bound counts those
+    /// rounded extents. The kernel honours the advice only when transparent huge
+    /// pages are set to `madvise` or `always`; with `never` the same allocations
+    /// use ordinary pages.
     pub const fn memory_usage(threads: usize) -> u64 {
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             if threads > 1 {
@@ -1304,9 +1628,16 @@ impl<R: Read> Decoder<R> {
     }
     /// Conservative allocation bound for [`Self::with_low_memory`], with the
     /// same reader, stack and callback exclusions as [`Self::memory_usage`].
+    ///
+    /// Single-threaded: 6 MiB, or 8 MiB on Linux x86-64 and AArch64, where the
+    /// level-9 TT rounds to 4 MiB and the last column to one 2 MiB page.
+    /// Multithreaded: 12 MiB, which also covers the second last column and the
+    /// worker's output ring.
     pub const fn low_memory_usage(threads: usize) -> u64 {
         if threads > 1 && !cfg!(target_family = "wasm") {
             12 * 1024 * 1024
+        } else if super::tt_storage::NATIVE_HUGE_PAGES {
+            8 * 1024 * 1024
         } else {
             6 * 1024 * 1024
         }
@@ -1336,7 +1667,12 @@ impl<R: Read> Decoder<R> {
                     .take()
                     .map_or_else(|| Links::new(self.mode), BlockOutput::into_links);
                 self.active = match self.parser.next()? {
-                    Some(block) => Some(BlockOutput::new(block, links)),
+                    Some(block) => {
+                        let output = BlockOutput::new(&block, links);
+                        // DecodeBlock1 has consumed the column; reuse it at once.
+                        self.parser.columns.give(block.last);
+                        Some(output)
+                    }
                     None => return Ok(false),
                 };
             }
@@ -1370,35 +1706,14 @@ impl<R: Read> Decoder<R> {
             self.position = 0;
         }
         loop {
-            if !self.worker_active {
-                let block = if let Some(block) = self.staged.take() {
-                    Some(block)
-                } else if self.error.is_none() && !self.parser.finished {
-                    match self.parser.next() {
-                        Ok(block) => block,
-                        Err(error) => {
-                            self.error = Some(error);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                if let Some(block) = block {
-                    if self.worker.is_none() {
-                        self.worker = Some(Worker::start(self.callback.clone(), self.mode)?);
-                    }
-                    self.worker
-                        .as_ref()
-                        .expect("started worker")
-                        .submit(block)?;
-                    self.worker_active = true;
-                }
-            }
             // RunScout / DecodeStreams overlap exactly one entropy parser and
             // one reconstruction worker, irrespective of a larger thread request.
-            if self.worker_active
-                && self.staged.is_none()
+            // Like RunScout, the caller parses one block ahead of the block being
+            // reconstructed and publishes it at once (DecoderEvent.Set), so the
+            // worker finds its successor queued at a block boundary instead of
+            // waiting for this thread to observe Finished.
+            if self.staged.is_none()
+                && self.in_flight < 2
                 && self.error.is_none()
                 && !self.parser.finished
             {
@@ -1407,7 +1722,30 @@ impl<R: Read> Decoder<R> {
                     Err(error) => self.error = Some(error),
                 }
             }
-            if self.worker_active {
+            if let Some(block) = self.staged.take() {
+                // A block is staged only while fewer than two are in flight.
+                debug_assert!(self.in_flight < 2, "staged block beyond the job queue");
+                if self.worker.is_none() {
+                    self.worker = Some(Worker::start(self.callback.clone(), self.mode)?);
+                }
+                let worker = self.worker.as_ref().expect("started worker");
+                if self.in_flight == 0 {
+                    // Every submitted block has been taken and finished, so the
+                    // queue is empty and the idle worker produces no output.
+                    worker.submit(block)?;
+                    self.in_flight = 1;
+                    continue;
+                }
+                // Exactly one block is in flight. If it still fills the slot,
+                // the worker has not taken it, so it is between blocks rather
+                // than waiting on output: wait for the slot. Only an exited
+                // worker leaves this one staged, and receive then reports why.
+                match worker.submit_successor(block) {
+                    None => self.in_flight += 1,
+                    Some(block) => self.staged = Some(block),
+                }
+            }
+            if self.in_flight > 0 {
                 match self.worker.as_mut().expect("active worker").receive()? {
                     WorkerMessage::Data(bytes) => {
                         self.output_end = bytes.len();
@@ -1415,8 +1753,9 @@ impl<R: Read> Decoder<R> {
                         self.position = 0;
                         return Ok(true);
                     }
-                    WorkerMessage::Finished => {
-                        self.worker_active = false;
+                    WorkerMessage::Finished(column) => {
+                        self.in_flight -= 1;
+                        self.parser.columns.give(column);
                         continue;
                     }
                     WorkerMessage::Error(error) => return Err(error),
@@ -1458,7 +1797,19 @@ impl<R: Read> Read for Decoder<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{move_mtf, move_mtf_bytes, move_mtf_forward, move_mtf_paired, move_mtf_reverse};
+    #[test]
+    fn expected_code_bits_flat_and_skewed_trees() {
+        let mut table = super::Huffman::new(&[8u8; 256]).unwrap();
+        // 256 codes of eight bits: every symbol expects eight bits.
+        assert_eq!(table.expected_code_bits_q8(), 8 * 256);
+        // A text-like tree: 1, 2, 3 and two 4-bit codes expect 1.875 bits.
+        table.rebuild(&[1, 2, 3, 4, 4]).unwrap();
+        assert_eq!(table.expected_code_bits_q8(), 480);
+    }
+    use super::{
+        move_mtf, move_mtf_bytes, move_mtf_forward, move_mtf_forward2, move_mtf_paired,
+        move_mtf_reverse,
+    };
     #[test]
     fn byte_mtf_preserves_evolving_reduced_alphabets_and_unused_tail() {
         for size in [
@@ -1503,11 +1854,14 @@ mod tests {
                 let mut paired = words;
                 let mut reversed = words;
                 let mut forward = words;
+                let mut forward2 = words;
                 let mut bytes: [u8; 256] = expected.as_slice().try_into().unwrap();
                 move_mtf_paired(&mut paired, index, next, byte);
                 move_mtf_reverse(&mut reversed, index, next, byte);
                 move_mtf_forward(&mut forward, index, next, byte);
+                move_mtf_forward2(&mut forward2, index, next, byte);
                 assert_eq!(forward, paired, "forward MTF state at index {index}");
+                assert_eq!(forward2, paired, "forward2 MTF state at index {index}");
                 assert_eq!(paired, reversed, "MTF state at index {index}");
                 move_mtf(&mut words, index, next, byte);
                 assert_eq!(words, paired, "selected MTF state at index {index}");
@@ -1996,7 +2350,10 @@ mod parser_workspace_tests {
         assert_eq!(actual.counts, expected.counts);
         assert_eq!(actual.offsets, expected.offsets);
         assert_eq!(actual.symbols, expected.symbols);
-        assert_eq!(actual.fast, expected.fast);
+        assert_eq!(actual.limits, expected.limits);
+        assert_eq!(actual.poses, expected.poses);
+        assert_eq!(actual.lens, expected.lens);
+        assert_eq!(actual.table_symbols, expected.table_symbols);
     }
 
     #[test]
@@ -2033,7 +2390,11 @@ mod parser_workspace_tests {
         encoded.extend(stream(4, true, 18003));
         encoded.extend(stream(2, false, 3));
         let mut parser = Parser::new(encoded.as_slice());
-        assert_eq!(parser.next().unwrap().unwrap().last, [0]);
+        // Callers return each consumed column, as the decoder does.
+        let block = parser.next().unwrap().unwrap();
+        assert_eq!(*block.last, [0]);
+        let column = block.last.as_ptr();
+        parser.columns.give(block.last);
         let workspace = &parser.workspace;
         let owners = (
             workspace.alphabet.as_ptr(),
@@ -2053,7 +2414,12 @@ mod parser_workspace_tests {
             .map(|table| (table.symbols.as_ptr(), table.symbols.capacity()))
             .collect();
         for expected in [b'A', 0, b'A'] {
-            assert_eq!(parser.next().unwrap().unwrap().last, [expected]);
+            let block = parser.next().unwrap().unwrap();
+            assert_eq!(*block.last, [expected]);
+            // The one column owner is reused for every later block.
+            assert_eq!(block.last.as_ptr(), column);
+            parser.columns.give(block.last);
+            assert_eq!(parser.columns.owners, 1);
             let workspace = &parser.workspace;
             assert_eq!(
                 (
@@ -2088,6 +2454,254 @@ mod parser_workspace_tests {
             let mut output = Vec::new();
             decoder.read_to_end(&mut output).unwrap();
             assert_eq!(output, [0, b'A', 0, b'A']);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cdecoder_tests {
+    use super::{Bits, Decoder, Huffman, MAX_CODE_BITS, MAX_SYMBOLS, Parser, TABLE_BITS};
+    use std::io::{self, Read, Write};
+
+    struct Rng(u32);
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+        fn below(&mut self, bound: usize) -> usize {
+            self.next() as usize % bound
+        }
+    }
+
+    /// Canonical (code, length) per symbol, assigned independently of
+    /// `Huffman`: codes ascend in (length, symbol) order.
+    fn canonical(lengths: &[u8]) -> Vec<(u32, u32)> {
+        let mut order: Vec<usize> = (0..lengths.len()).collect();
+        order.sort_by_key(|&symbol| (lengths[symbol], symbol));
+        let mut codes = vec![(0, 0); lengths.len()];
+        let mut previous: Option<(u32, u32)> = None;
+        for symbol in order {
+            let len = u32::from(lengths[symbol]);
+            let code = previous.map_or(0, |(code, prev)| (code + 1) << (len - prev));
+            codes[symbol] = (code, len);
+            previous = Some((code, len));
+        }
+        codes
+    }
+
+    /// Straightforward bit-serial reference: extend the code one bit at a time
+    /// and search every symbol for an exact (code, length) match.
+    fn reference(codes: &[(u32, u32)], bits: &[u8], mut position: usize) -> Option<(usize, u32)> {
+        let mut code = 0;
+        for len in 1..=MAX_CODE_BITS {
+            let bit = (bits[position / 8] >> (7 - position % 8)) & 1;
+            position += 1;
+            code = (code << 1) | u32::from(bit);
+            if let Some(symbol) = codes.iter().position(|&entry| entry == (code, len)) {
+                return Some((symbol, len));
+            }
+        }
+        None
+    }
+
+    fn put(bytes: &mut Vec<u8>, position: &mut usize, code: u32, len: u32) {
+        for shift in (0..len).rev() {
+            if position.is_multiple_of(8) {
+                bytes.push(0);
+            }
+            *bytes.last_mut().unwrap() |= (((code >> shift) & 1) as u8) << (7 - *position % 8);
+            *position += 1;
+        }
+    }
+
+    fn consumed(bits: &Bits<&[u8]>, total: usize) -> usize {
+        (total - bits.reader.len() - (bits.end - bits.pos)) * 8 - bits.count as usize
+    }
+
+    /// Complete trees from random leaf splits, with lengths permuted across
+    /// symbols, plus an incomplete variant missing one leaf.
+    fn random_trees(rng: &mut Rng) -> Vec<Vec<u8>> {
+        let mut trees = Vec::new();
+        for size in [2, 3, 7, 50, 200, 257, 258] {
+            let mut depths = vec![1u8, 1];
+            while depths.len() < size {
+                let index = rng.below(depths.len());
+                if depths[index] < MAX_CODE_BITS as u8 {
+                    depths[index] += 1;
+                    depths.push(depths[index]);
+                }
+            }
+            for index in (1..depths.len()).rev() {
+                depths.swap(index, rng.below(index + 1));
+            }
+            let mut incomplete = depths.clone();
+            incomplete.remove(rng.below(incomplete.len()));
+            trees.push(depths);
+            if incomplete.len() >= 2 {
+                trees.push(incomplete);
+            }
+        }
+        // Deep trees: always split the deepest leaf so lengths reach 20.
+        for size in [21, 40, 258] {
+            let mut depths = vec![1u8, 1];
+            while depths.len() < size {
+                let index = if rng.below(2) == 0 {
+                    (0..depths.len())
+                        .filter(|&i| depths[i] < MAX_CODE_BITS as u8)
+                        .max_by_key(|&i| depths[i])
+                        .unwrap()
+                } else {
+                    rng.below(depths.len())
+                };
+                if depths[index] < MAX_CODE_BITS as u8 {
+                    depths[index] += 1;
+                    depths.push(depths[index]);
+                }
+            }
+            trees.push(depths);
+        }
+        trees
+    }
+
+    #[test]
+    fn limits_decode_matches_bit_serial_reference_for_every_symbol_and_window() {
+        let mut rng = Rng(0x9e37_79b9);
+        let mut every_length: Vec<u8> = (1..=20).collect();
+        every_length.push(20);
+        let long = TABLE_BITS as u8 + 1;
+        let mut trees = vec![
+            every_length,
+            vec![1, 1],
+            vec![2, 2],
+            vec![1, 2, 3, 3],
+            vec![1, 20, 20],
+            vec![8; 256],
+            vec![TABLE_BITS as u8; 258],
+            // Every code longer than the direct table.
+            vec![long; 258],
+            vec![long, long, 20, 20],
+            vec![12; 258],
+            vec![20; 258],
+            (0..258)
+                .map(|i| long + (i % (21 - u16::from(long))) as u8)
+                .collect(),
+        ];
+        trees.extend(random_trees(&mut rng));
+        for lengths in trees {
+            assert!(lengths.len() <= MAX_SYMBOLS);
+            let table = Huffman::new(&lengths).unwrap();
+            let codes = canonical(&lengths);
+            // Every symbol once, then a random message; 32 zero bits keep a
+            // full window available at the last code.
+            let mut message: Vec<usize> = (0..lengths.len()).collect();
+            message.extend((0..2000).map(|_| rng.below(lengths.len())));
+            let mut bytes = Vec::new();
+            let mut position = 0;
+            for &symbol in &message {
+                let (code, len) = codes[symbol];
+                put(&mut bytes, &mut position, code, len);
+            }
+            bytes.extend([0; 4]);
+            let mut bits = Bits::new(bytes.as_slice());
+            let mut expected_position = 0;
+            for &symbol in &message {
+                let (want, len) = reference(&codes, &bytes, expected_position).unwrap();
+                assert_eq!(want, symbol);
+                expected_position += len as usize;
+                assert_eq!(
+                    table.symbol::<_, false>(&mut bits).unwrap(),
+                    symbol,
+                    "{lengths:?}"
+                );
+                assert_eq!(consumed(&bits, bytes.len()), expected_position);
+            }
+            // Single windows: each code's first and last 20-bit extension,
+            // the value just past each code, and random values. Windows
+            // outside an incomplete tree must be errors, not panics.
+            let mut windows: Vec<u32> = (0..4096).map(|_| rng.next() >> 12).collect();
+            for &(code, len) in &codes {
+                let low = code << (MAX_CODE_BITS - len);
+                let high = low | ((1 << (MAX_CODE_BITS - len)) - 1);
+                windows.extend([low, high, high + 1]);
+            }
+            windows.extend([0, (1 << MAX_CODE_BITS) - 1]);
+            for window in windows {
+                if window >= 1 << MAX_CODE_BITS {
+                    continue;
+                }
+                let mut bytes = (window << 12).to_be_bytes().to_vec();
+                bytes.extend([0; 4]);
+                let mut bits = Bits::new(bytes.as_slice());
+                match reference(&codes, &bytes, 0) {
+                    Some((symbol, len)) => {
+                        assert_eq!(table.symbol::<_, false>(&mut bits).unwrap(), symbol);
+                        assert_eq!(consumed(&bits, bytes.len()), len as usize);
+                    }
+                    None => {
+                        let error = table.symbol::<_, false>(&mut bits).unwrap_err();
+                        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                        assert_eq!(error.to_string(), "invalid Huffman code");
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            Huffman::new(&[1; MAX_SYMBOLS + 1])
+                .err()
+                .map(|e| e.to_string()),
+            Some("too many Huffman symbols".to_owned())
+        );
+    }
+
+    #[test]
+    fn streams_cut_inside_the_symbol_area_are_truncation_errors() {
+        let mut rng = Rng(0x2545_f491);
+        // Skewed bytes give a spread of code lengths, some past the table.
+        let data: Vec<u8> = (0..60_000)
+            .map(|_| {
+                let r = rng.next();
+                if r & 7 == 0 {
+                    (r >> 8) as u8
+                } else {
+                    ((r >> 8) % 24) as u8
+                }
+            })
+            .collect();
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        encoder.write_all(&data).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let mut whole = Vec::new();
+        Decoder::new(encoded.as_slice())
+            .read_to_end(&mut whole)
+            .unwrap();
+        assert_eq!(whole, data);
+        // The coding tables end well inside the first few hundred bytes; cut
+        // every 61 bytes through the symbol area and at every one of the
+        // final 16 bytes, which hold the last codes and the footer.
+        let cuts = (400..encoded.len() - 16)
+            .step_by(61)
+            .chain(encoded.len() - 16..encoded.len());
+        for cut in cuts {
+            let mut parser = Parser::new(&encoded[..cut]);
+            let error = loop {
+                match parser.next() {
+                    Ok(Some(block)) => parser.columns.give(block.last),
+                    Ok(None) => panic!("prefix {cut} parsed to the end"),
+                    Err(error) => break error,
+                }
+            };
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "prefix {cut}");
+            for threads in [1, 2] {
+                assert!(
+                    Decoder::with_threads(&encoded[..cut], threads)
+                        .read_to_end(&mut Vec::new())
+                        .is_err(),
+                    "accepted prefix {cut} at {threads} threads"
+                );
+            }
         }
     }
 }

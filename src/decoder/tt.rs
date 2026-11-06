@@ -1,6 +1,7 @@
 //! Inverse BWT links, based on the 7-Zip BZip2 DecodeBlock1 function.
 //! SPDX-License-Identifier: LGPL-2.1-or-later
 use super::super::tt_storage::{TtBuffer, Word};
+use core::cell::Cell;
 
 pub(super) trait LinkWord: Word {
     fn set_low(&mut self, low: u32);
@@ -22,10 +23,15 @@ impl LinkWord for [u32; 2] {
     fn finish(mut links: TtBuffer<Self>) -> TtBuffer<Self> {
         // Low halves are complete before this independent successor pass begins.
         // Only low halves are read; in-place high-half writes are order-independent.
+        // Every low half holds a block index above its byte, so clamping to
+        // the final index is the identity and removes the per-word check.
         let words: &mut [[u32; 2]] = &mut links;
+        let Some(final_index) = words.len().checked_sub(1) else {
+            return links;
+        };
         for index in 0..words.len() {
             let first = words[index][0];
-            words[index][1] = words[(first >> 8) as usize][0];
+            words[index][1] = words[((first >> 8) as usize).min(final_index)][0];
         }
         links
     }
@@ -114,22 +120,49 @@ pub(super) fn build_links<W: LinkWord>(
     if !mostly_long_runs(last) {
         let mut counts = starts(counts);
         let mut links = links.resized(last.len());
-        let words: &mut [W] = &mut links;
-        // DecodeBlock1 carries the current byte while fetching its successor
-        // before the current bucket/scatter chain. The tail is explicit: no
-        // sentinel byte is read beyond the supplied last column.
-        if let Some((&first, tail)) = last.split_first() {
-            let mut byte = first;
-            for (index, &next) in tail.iter().enumerate() {
-                let bucket = usize::from(byte);
-                let destination = counts[bucket];
-                byte = next;
-                counts[bucket] = destination + 1;
+        let words: &mut [W] = &mut links[..last.len()];
+        if let Some(final_index) = last.len().checked_sub(1) {
+            // Both slices are bound once to the same length. Starts from the
+            // histogram of last never exceed the final index, so clamping is
+            // the identity for parser blocks; it is branch-free and lets the
+            // compiler drop both per-byte bounds checks. An inconsistent
+            // histogram still stays in bounds, overwriting the final slot.
+            // The bucket counter is advanced unclamped, so the chain carried
+            // through a repeated bucket stays load, increment, store; the
+            // clamp only feeds this iteration's accesses.
+            let slots = Cell::from_mut(&mut counts).as_array_of_cells().each_ref();
+            let mut scatter = |slot: &Cell<usize>, index: usize| {
+                let start = slot.get();
+                slot.set(start + 1);
+                let destination = start.min(final_index);
                 words[destination].set_low(((index as u32) << 8) | u32::from(last[destination]));
+            };
+            // Like DecodeBlock1, each counter is loaded and stored through
+            // one plain address register: slots come from the table of
+            // counter references one pair ahead, so the scatter chain never
+            // waits on that lookup. Two positions per step keep the clamp a
+            // conditional move; equal buckets within a pair share one cell
+            // and update it in order. No byte is read beyond last.
+            if let [first, second, ahead @ ..] = last {
+                let mut pairs = ahead.chunks_exact(2);
+                let mut current = slots[usize::from(*first)];
+                let mut successor = slots[usize::from(*second)];
+                let mut index = 0;
+                for pair in pairs.by_ref() {
+                    scatter(current, index);
+                    scatter(successor, index + 1);
+                    current = slots[usize::from(pair[0])];
+                    successor = slots[usize::from(pair[1])];
+                    index += 2;
+                }
+                scatter(current, index);
+                scatter(successor, index + 1);
+                if let [byte] = pairs.remainder() {
+                    scatter(slots[usize::from(*byte)], index + 2);
+                }
+            } else {
+                scatter(slots[usize::from(last[0])], 0);
             }
-            let destination = counts[usize::from(byte)];
-            words[destination]
-                .set_low((((last.len() - 1) as u32) << 8) | u32::from(last[destination]));
         }
         return W::finish(links);
     }
@@ -268,6 +301,56 @@ mod tests {
                 .collect();
             compare(&random);
         }
+    }
+    #[test]
+    fn clamped_scatter_matches_checked_at_bucket_and_block_extremes() {
+        // Lengths 1 and 2 make the final index 0 and 1; short inputs stay on
+        // the ordinary scatter whatever their run structure.
+        for input in [&[0u8][..], &[255], &[7, 7], &[0, 255], &[255, 0]] {
+            compare(input);
+        }
+        for length in [3, 255, 256, 257, 1023, 1024, 4097] {
+            for byte in [0, 128, 255] {
+                compare(&vec![byte; length]);
+            }
+            compare(&(0..length).map(|i| [0, 255][i % 2]).collect::<Vec<_>>());
+            compare(&(0..length).map(|i| [255, 0][i % 2]).collect::<Vec<_>>());
+            // Ascending and descending full alphabets fill every bucket.
+            compare(&(0..length).map(|i| (i % 256) as u8).collect::<Vec<_>>());
+            compare(
+                &(0..length)
+                    .map(|i| 255 - (i % 256) as u8)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        // A full block whose histogram is dominated by the last bucket while
+        // every other byte still occurs, so the ordinary path is selected.
+        let mut state = 0x9E37_79B9u32;
+        let skewed: Vec<_> = (0..900_000)
+            .map(|index| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                if index < 256 {
+                    index as u8
+                } else if state.is_multiple_of(8) {
+                    (state >> 24) as u8
+                } else {
+                    255
+                }
+            })
+            .collect();
+        assert!(!super::mostly_long_runs(&skewed));
+        let histogram = counts(&skewed);
+        assert!(histogram.iter().all(|&count| count > 0));
+        assert!(histogram[255] > 700_000);
+        compare(&skewed);
+        let mut low_skew = skewed.clone();
+        for byte in &mut low_skew {
+            *byte = 255 - *byte;
+        }
+        assert!(!super::mostly_long_runs(&low_skew));
+        compare(&low_skew);
     }
     #[test]
     fn scanned_runs_stop_at_every_word_and_tail_boundary() {
