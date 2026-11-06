@@ -74,41 +74,32 @@ verified output, alternating rounds, medians and RSS.
 
 ## Benchmarks
 
-Level-5 combined-corpus throughput in MiB/s: total original bytes divided by the sum of each fixture's median wall time. Four balanced measured rounds follow one warmup, using varied JSON, structured logs, repeated text, MKV and ELF. These are whole-process measurements with a uniform null output sink.
+Level 5, all fixtures combined (JSON, logs, repeated text, MKV, ELF). Higher is
+better. 1T–8T is the requested thread count.
 
-### ARM64 — Graviton3
+### ARM64 (Graviton3)
 
-| Engine / budget | Encode | Decode |
-|---|---:|---:|
-| bzip2-turbo / 1T | 10.6 | 47.0 |
-| 7zz / 1T | 6.8 | 46.4 |
-| bzip2 (Rust) / 1T | 8.9 | 34.4 |
-| bzip2 (C) / 1T | 8.5 | 35.7 |
-| bzip2-turbo / 2T | 18.0 | 66.0 |
-| 7zz / 2T | 12.0 | 64.8 |
-| bzip2-turbo / 4T | 32.1 | 65.7 |
-| 7zz / 4T | 21.7 | 64.7 |
-| bzip2-turbo / 8T | 54.0 | 65.0 |
-| 7zz / 8T | 38.1 | 64.5 |
+| Engine | Encode 1T (MiB/s) | Encode 2T (MiB/s) | Encode 4T (MiB/s) | Encode 8T (MiB/s) | Decode 1T (MiB/s) | Decode 2T+ (MiB/s) |
+|---|---:|---:|---:|---:|---:|---:|
+| **bzip2-turbo** | **10.6** | **18.0** | **32.1** | **54.0** | **47.0** | **66.0** |
+| 7zz | 6.8 | 12.0 | 21.7 | 38.1 | 46.4 | 64.8 |
+| bzip2 (Rust) | 8.9 | — | — | — | 34.4 | — |
+| bzip2 (C) | 8.5 | — | — | — | 35.7 | — |
 
-### x86-64 — Intel Xeon
+### x86-64 (Intel Xeon)
 
-| Engine / budget | Encode | Decode |
-|---|---:|---:|
-| bzip2-turbo / 1T | 13.0 | 84.6 |
-| 7zz / 1T | 9.3 | 71.5 |
-| bzip2 (Rust) / 1T | 11.0 | 42.0 |
-| bzip2 (C) / 1T | 9.8 | 42.5 |
-| bzip2-turbo / 2T | 22.3 | 117.5 |
-| 7zz / 2T | 16.8 | 90.0 |
-| bzip2-turbo / 4T | 39.9 | 112.2 |
-| 7zz / 4T | 30.2 | 88.9 |
-| bzip2-turbo / 8T | 45.9 | 116.5 |
-| 7zz / 8T | 38.0 | 89.1 |
+| Engine | Encode 1T (MiB/s) | Encode 2T (MiB/s) | Encode 4T (MiB/s) | Encode 8T (MiB/s) | Decode 1T (MiB/s) | Decode 2T+ (MiB/s) |
+|---|---:|---:|---:|---:|---:|---:|
+| **bzip2-turbo** | **13.0** | **22.3** | **39.9** | **45.9** | **84.6** | **117.5** |
+| 7zz | 9.3 | 16.8 | 30.2 | 38.0 | 71.5 | 90.0 |
+| bzip2 (Rust) | 11.0 | — | — | — | 42.0 | — |
+| bzip2 (C) | 9.8 | — | — | — | 42.5 | — |
 
-Budgets are requested thread counts. Native bzip2-turbo decoding uses at most two threads including the caller; its 4T/8T rows retain those requests. The pure Rust and C references are serial and appear once at 1T. See [detailed results and methodology](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmark.md) for every fixture, level, budget, peak RSS and source identity.
-
-Aggregate rates do not imply a lead on every fixture.
+- Neither engine decodes faster past two threads (bzip2-turbo uses at most
+  two), so the 2T figure, the best of 2T, 4T and 8T, is shown.
+- The standard `bzip2` crate is single-threaded.
+- These are combined totals; bzip2-turbo does not lead on every fixture.
+- [Per-fixture results, all levels, peak RSS and method](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmark.md).
 
 ## License
 

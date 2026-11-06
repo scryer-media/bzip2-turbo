@@ -24,6 +24,16 @@ adapters. Keep source reference identities and required legal notices intact.
   sevenz-turbo does; that workflow-created tag does not require SSH signing.
   Do not bypass commit signing or push unless explicitly instructed. Release
   and publication require separate authorization.
+- Any code change bumps the crate version, `Cargo.lock` and `CHANGELOG.md` in
+  the same PR. The bump is what `cargo semver-checks` says it is against the
+  published version: the release workflow runs it and refuses a patch bump
+  that carries a breaking change. When an open, unreleased version already
+  covers the change, add to it instead of bumping again; never add entries
+  under a version already on crates.io.
+- The changelog section is the released heading, `## <version>`, never one
+  marked unreleased. The release workflow rejects an `Unreleased` heading and
+  uses that section as the GitHub release notes. Keep the README's dependency
+  line showing the version's major.minor.
 - Enable hooks with git config core.hooksPath .githooks. Go and gitleaks
   are required. The hooks check complete staged blobs and commit messages.
 - Never commit credentials, personal home paths, account names or private

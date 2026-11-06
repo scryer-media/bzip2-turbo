@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- Add contributor rules for version-bump PRs: every code change bumps the
+  version, `Cargo.lock` and changelog in the same PR, sized by
+  `cargo semver-checks`, under a released `## <version>` heading.
+- Present the README benchmarks as one table per platform with MiB/s in the
+  column headers.
+
 ## 0.1.0
 
 - Extract the 7-Zip BZip2 port into an independent library with retained LGPL
