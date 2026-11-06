@@ -10,4 +10,10 @@
   tuning and memory differences; retain MIT adapter notices.
 - Add independent conformance, compatibility, fuzz, privacy, secret-scanning,
   platform CI and benchmark tooling.
-- Freeze the first-pass performance baseline without claiming complete parity.
+- Improve encoder table pricing and block-sort partition scans while preserving
+  reference output bytes.
+- Reduce native decoder parsing and output-storage work, reuse bounded parser
+  scratch, and retain source-faithful Linux ARM64 MTF traversal.
+- Add reproducible JSON, logs, repeated-text, media and executable fixtures, plus
+  corrected codec-process RSS accounting and verified four-way benchmarks.
+- Preserve measured baselines and remaining gaps without claiming complete parity.

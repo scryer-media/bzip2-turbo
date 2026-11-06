@@ -61,11 +61,38 @@ Use CPU sampling, instructions retired where supported, and assembly to diagnose
 costs before changing algorithms. Do not infer CRC throughput from fused decoder
 samples.
 
-The first-pass baseline is frozen by operator instruction. No further parity
-optimization is required for this preparation. Full cross-platform 0% regression
-parity remains an unachieved future objective; selected passing smoke rows do not
-establish it. Preserve every validated improvement and unsuccessful experiment's
-evidence. The Go harness retains `legacy-corpus` and `legacy-compare` commands
+The extraction baseline and the later ARM encoder and decoder measurements
+are recorded separately. The encoder follow-up starts from public base `f68b3ab`;
+[decoder notes](decoder-performance.md) describe the subsequent parsing and
+storage changes. Current timed commands all write to the operating-system
+null device, identified by `OutputSink` in new harness reports. Earlier
+measurements used the special Rust in-memory sink; do not combine their
+medians with the uniform-output follow-up.
+Full cross-platform 0% regression parity remains unachieved pending complete
+measurements. Selected passing rows do not establish that gate. Keep raw evidence
+for validated improvements and unsuccessful experiments outside the repository.
+
+Mac ARM64 sampling attributed 13.8% of JSON encoding samples to Huffman table
+fitting, concentrated in selector price sums. `Entropy::fit` now packs all six
+table costs into independent 10-bit lanes of one `u64`. A selector contains at
+most 50 symbols with code lengths at most 16, so each lane totals at most 800,
+below its 1,024 carry boundary; all six lanes fit in 60 bits. This replaces six
+indexed price loads per symbol with one. Table traversal and strict comparison
+preserve the earliest-table tie rule and encoded output. Scratch remains fixed
+on the stack, with no new heap allocations or API changes. Differential checks
+use the pinned [7-Zip 26.04 source](https://github.com/ip7z/7zip/tree/9128b80e3a471108678e2b3ec3c985861c8d7b0f).
+
+Non-timing instrumentation of a 16 MiB repeated-sentence input with a 71-byte
+period, 500,000-byte blocks, one thread and one pass counted 1.857 billion of
+2.266 billion partition rank reads in empty midpoint passes. After the first
+empty partition, `SortGroup` now scans exact minimum and maximum ranks once.
+An empty partition has made no swaps or rank writes, so those bounds can skip
+the original binary midpoint decisions until the first midpoint that divides
+the keys. That midpoint uses the existing partition loop, preserving its order,
+ties, flags and subsequent rank writes. These operation counts identify wasted
+scanning; they are not elapsed-time results.
+
+The Go harness retains `legacy-corpus` and `legacy-compare` commands
 for the pre-extraction two-process protocol. Its repeated-sentence text corpus
 is historical periodic stress, retained byte for byte rather than used as the
 main text workload. Run from

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -33,32 +32,34 @@ type codecPolicy struct {
 	Policy             string `json:"policy"`
 }
 type row struct {
-	Settings             string      `json:"settings"`
-	ReferencePolicy      codecPolicy `json:"reference_settings"`
-	OursPolicy           codecPolicy `json:"ours_settings"`
-	SettingsMatch        bool        `json:"block_and_pass_settings_match"`
-	ReferenceName        string      `json:"reference_name"`
-	ReferenceThreads     int         `json:"reference_threads"`
-	Corpus               string      `json:"corpus"`
-	API                  string      `json:"api"`
-	Level                int         `json:"level"`
-	Mode                 string      `json:"mode"`
-	Threads              int         `json:"threads"`
-	Input                identity    `json:"input"`
-	InputBytes           int64       `json:"input_bytes"`
-	ReferenceOutput      identity    `json:"reference_encoded_output"`
-	OursOutput           identity    `json:"ours_encoded_output"`
-	ReferenceOutputBytes int64       `json:"reference_encoded_bytes"`
-	OursOutputBytes      int64       `json:"ours_encoded_bytes"`
-	Validation           string      `json:"validation"`
-	Reference            []sample    `json:"reference_runs"`
-	Ours                 []sample    `json:"ours_runs"`
-	ReferenceMedian      float64     `json:"reference_median_wall_seconds"`
-	OursMedian           float64     `json:"ours_median_wall_seconds"`
-	ReferenceOverOurs    float64     `json:"reference_over_ours_wall_seconds"`
-	ReferenceRSSMedian   *float64    `json:"reference_median_peak_rss_bytes,omitempty"`
-	OursRSSMedian        *float64    `json:"ours_median_peak_rss_bytes,omitempty"`
-	ReferenceOverOursRSS *float64    `json:"reference_over_ours_peak_rss,omitempty"`
+	Settings                 string      `json:"settings"`
+	ReferencePolicy          codecPolicy `json:"reference_settings"`
+	OursPolicy               codecPolicy `json:"ours_settings"`
+	SettingsMatch            bool        `json:"block_and_pass_settings_match"`
+	ReferenceName            string      `json:"reference_name"`
+	ReferenceThreads         int         `json:"reference_threads"`
+	Corpus                   string      `json:"corpus"`
+	API                      string      `json:"api"`
+	Level                    int         `json:"level"`
+	Mode                     string      `json:"mode"`
+	Threads                  int         `json:"threads"`
+	Input                    identity    `json:"input"`
+	InputBytes               int64       `json:"input_bytes"`
+	ReferenceOutput          identity    `json:"reference_encoded_output"`
+	OursOutput               identity    `json:"ours_encoded_output"`
+	ReferenceOutputBytes     int64       `json:"reference_encoded_bytes"`
+	OursOutputBytes          int64       `json:"ours_encoded_bytes"`
+	ReferenceEncodedFraction float64     `json:"reference_encoded_fraction,omitempty"`
+	OursEncodedFraction      float64     `json:"ours_encoded_fraction,omitempty"`
+	Validation               string      `json:"validation"`
+	Reference                []sample    `json:"reference_runs"`
+	Ours                     []sample    `json:"ours_runs"`
+	ReferenceMedian          float64     `json:"reference_median_wall_seconds"`
+	OursMedian               float64     `json:"ours_median_wall_seconds"`
+	ReferenceOverOurs        float64     `json:"reference_over_ours_wall_seconds"`
+	ReferenceRSSMedian       *float64    `json:"reference_median_peak_rss_bytes,omitempty"`
+	OursRSSMedian            *float64    `json:"ours_median_peak_rss_bytes,omitempty"`
+	ReferenceOverOursRSS     *float64    `json:"reference_over_ours_peak_rss,omitempty"`
 }
 type report struct {
 	Settings                                                                              string `json:"settings"`
@@ -66,8 +67,11 @@ type report struct {
 	Platform, StartedUTC, SourceSHA256, Revision, ReferenceVersion, RSSScope, TimingScope string
 	Driver, Reference, Pure, C                                                            identity
 	Repeats, Warmups                                                                      int
+	RSSMethod                                                                             string
+	OutputSink                                                                            string
 	RSSSupported                                                                          bool
 	PerformanceCounters                                                                   string
+	Fixtures                                                                              []fixtureInfo `json:"fixtures,omitempty"`
 	Rows                                                                                  []row
 	Skipped                                                                               []scenario
 }
@@ -77,6 +81,8 @@ func main() {
 	args := os.Args[1:]
 	if len(args) > 0 && args[0] == "legacy-corpus" {
 		command, args = legacyCorpus, args[1:]
+	} else if len(args) > 0 && args[0] == "fixture" {
+		command, args = fixture, args[1:]
 	} else if len(args) > 0 && args[0] == "json-corpus" {
 		command, args = jsonCorpus, args[1:]
 	} else if len(args) > 0 && args[0] == "legacy-compare" {
@@ -196,7 +202,16 @@ func outside(path, root string) error {
 	}
 	return nil
 }
+
+type processUsage struct {
+	UserSeconds, SystemSeconds float64
+	RSSBytes                   *uint64
+}
+
 func process(ctx context.Context, args []string, input, output string) (sample, error) {
+	if len(args) == 0 {
+		return sample{}, errors.New("empty process command")
+	}
 	in, e := os.Open(input)
 	if e != nil {
 		return sample{}, e
@@ -207,7 +222,11 @@ func process(ctx context.Context, args []string, input, output string) (sample, 
 		return sample{}, e
 	}
 	defer out.Close()
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd, collect, cleanup, e := measuredCommand(ctx, args)
+	if e != nil {
+		return sample{}, e
+	}
+	defer cleanup()
 	cmd.Stdin = in
 	cmd.Stdout = out
 	var stderr bytes.Buffer
@@ -216,9 +235,16 @@ func process(ctx context.Context, args []string, input, output string) (sample, 
 	e = cmd.Run()
 	elapsed := time.Since(started).Seconds()
 	if e != nil {
+		if ctx.Err() != nil {
+			return sample{}, fmt.Errorf("%s failed: %w: %w: %s", filepath.Base(args[0]), ctx.Err(), e, stderr.String())
+		}
 		return sample{}, fmt.Errorf("%s failed: %w: %s", filepath.Base(args[0]), e, stderr.String())
 	}
-	return sample{Seconds: elapsed, UserSeconds: cmd.ProcessState.UserTime().Seconds(), SystemSeconds: cmd.ProcessState.SystemTime().Seconds(), RSSBytes: peakRSS(cmd.ProcessState)}, nil
+	usage, e := collect(cmd.ProcessState)
+	if e != nil {
+		return sample{}, fmt.Errorf("%s resource report failed: %w", filepath.Base(args[0]), e)
+	}
+	return sample{Seconds: elapsed, UserSeconds: usage.UserSeconds, SystemSeconds: usage.SystemSeconds, RSSBytes: usage.RSSBytes}, nil
 }
 func equal(a, b string) error {
 	ha, e := digest(a)

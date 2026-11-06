@@ -1,8 +1,44 @@
 //! Streaming BZip2 compression and decompression.
 //!
+//! [`Decoder`] is the native reader API. With the default `compress` feature,
+//! `Encoder` and `EncoderOptions` provide native streaming compression.
+//! The [`read`], [`bufread`] and [`mod@write`] modules provide compatibility adapters;
+//! [`Decompress`] and, with `compress`, `Compress` expose caller-owned buffers.
+//!
+//! Native decoding accepts concatenated streams by default. The compatibility
+//! `BzDecoder` adapters stop at one stream; use their `MultiBzDecoder` reader
+//! adapters for concatenated streams. Native encoder settings follow the 7-Zip
+//! codec; compatibility compression levels use their own block-size mapping.
+//!
+//! # Features
+//!
+//! `compress` enables compression and is enabled by default. Disabling default
+//! features retains decompression and its adapters. This crate uses standard I/O
+//! and is not a `no_std` library.
+//!
+//! # Example
+//!
+//! ```
+//! # #[cfg(feature = "compress")] {
+//! use bzip2_turbo::{Decoder, Encoder, EncoderOptions};
+//! use std::io::{Read, Write};
+//!
+//! let mut encoder = Encoder::new(Vec::new(), EncoderOptions::default());
+//! encoder.write_all(b"a streaming example")?;
+//! let compressed = encoder.finish()?;
+//! let mut restored = Vec::new();
+//! Decoder::new(compressed.as_slice()).read_to_end(&mut restored)?;
+//! assert_eq!(restored, b"a streaming example");
+//! # }
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! Call `Encoder::finish` to write the stream trailer and report final I/O errors;
+//! dropping a native encoder does not finish its stream. Read a decoder through
+//! EOF to validate the complete stream, including its trailer checksum.
+//!
 //! The codec is licensed under LGPL-2.1-or-later; compatibility adapters retain MIT.
-//! See `PORTING.md`
-//! for the reference revision, behavior mapping, and verification evidence.
+//! See the repository `PORTING.md` for reference revisions and verification evidence.
 
 #![deny(unsafe_code)]
 #![cfg_attr(feature = "compress", doc = include_str!("../README.md"))]

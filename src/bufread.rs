@@ -1,4 +1,12 @@
-//! I/O streams for wrapping `BufRead` types as encoders/decoders
+//! Compatibility [`Read`] adapters over caller-supplied [`BufRead`] input.
+//!
+//! The codec consumes only parsed input through [`BufRead::consume`]. A single
+//! [`BzDecoder`] stops at its first member, leaving following bytes in the
+//! underlying buffered reader; [`MultiBzDecoder`] continues through all members.
+//!
+//! When an adapter also implements [`Write`], writes are forwarded directly to
+//! the underlying stream without compression or decompression. Use
+//! [`crate::write`] to transform bytes supplied through `Write`.
 
 // Adapted from bzip2 0.6.1; see LICENSE-BZIP2-MIT for its license.
 
@@ -11,7 +19,7 @@ use crate::{Decompress, Status};
 
 /// A bz2 encoder, or compressor.
 ///
-/// This structure implements a [`BufRead`] interface and will read uncompressed
+/// This structure implements a [`Read`] interface and will read uncompressed
 /// data from an underlying stream and emit a stream of compressed data.
 #[cfg(feature = "compress")]
 pub struct BzEncoder<R> {
@@ -22,7 +30,7 @@ pub struct BzEncoder<R> {
 
 /// A bz2 decoder, or decompressor.
 ///
-/// This structure implements a [`BufRead`] interface and takes a stream of
+/// This structure implements a [`Read`] interface and takes a stream of
 /// compressed data as input, providing the decompressed data when read from.
 pub struct BzDecoder<R> {
     obj: R,
@@ -54,31 +62,27 @@ impl<R> BzEncoder<R> {
     /// Acquires a mutable reference to the underlying stream
     ///
     /// Note that mutation of the stream may result in surprising results if
-    /// this encoder is continued to be used.
+    /// the adapter continues to be used.
     pub fn get_mut(&mut self) -> &mut R {
         &mut self.obj
     }
 
-    /// Consumes this encoder, returning the underlying reader.
+    /// Returns the underlying reader without finishing compression.
+    /// Pending compressed output is discarded.
     pub fn into_inner(self) -> R {
         self.obj
     }
 
-    /// Returns the number of bytes produced by the compressor
-    /// (e.g. the number of bytes read from this stream)
+    /// Number of output bytes produced by the codec.
     ///
-    /// Note that, due to buffering, this only bears any relation to
-    /// total_in() when the compressor chooses to flush its data
-    /// (unfortunately, this won't happen in general
-    /// at the end of the stream, because the compressor doesn't know
-    /// if there's more data to come).  At that point,
-    /// `total_out() / total_in()` would be the compression ratio.
+    /// Buffered output may not yet have reached the caller or underlying writer.
     pub fn total_out(&self) -> u64 {
         self.data.total_out()
     }
 
-    /// Returns the number of bytes consumed by the compressor
-    /// (e.g. the number of bytes read from the underlying stream)
+    /// Number of input bytes consumed by the codec.
+    ///
+    /// This excludes any bytes read ahead but not yet consumed by the codec.
     pub fn total_in(&self) -> u64 {
         self.data.total_in()
     }
@@ -160,25 +164,27 @@ impl<R> BzDecoder<R> {
     /// Acquires a mutable reference to the underlying stream
     ///
     /// Note that mutation of the stream may result in surprising results if
-    /// this encoder is continued to be used.
+    /// the adapter continues to be used.
     pub fn get_mut(&mut self) -> &mut R {
         &mut self.obj
     }
 
-    /// Consumes this decoder, returning the underlying reader.
+    /// Returns the underlying reader without validating any unread trailer.
+    /// Buffered bytes not consumed by the codec remain in that reader.
     pub fn into_inner(self) -> R {
         self.obj
     }
 
-    /// Returns the number of bytes that the decompressor has consumed.
+    /// Number of input bytes consumed by the codec.
     ///
-    /// Note that this will likely be smaller than what the decompressor
-    /// actually read from the underlying stream due to buffering.
+    /// This excludes any bytes read ahead but not yet consumed by the codec.
     pub fn total_in(&self) -> u64 {
         self.data.total_in()
     }
 
-    /// Returns the number of bytes that the decompressor has produced.
+    /// Number of output bytes produced by the codec.
+    ///
+    /// Buffered output may not yet have reached the caller or underlying writer.
     pub fn total_out(&self) -> u64 {
         self.data.total_out()
     }
@@ -263,12 +269,13 @@ impl<R> MultiBzDecoder<R> {
     /// Acquires a mutable reference to the underlying stream.
     ///
     /// Note that mutation of the stream may result in surprising results if
-    /// this encoder is continued to be used.
+    /// the adapter continues to be used.
     pub fn get_mut(&mut self) -> &mut R {
         self.0.get_mut()
     }
 
-    /// Consumes this decoder, returning the underlying reader.
+    /// Returns the underlying reader without validating any unread trailer.
+    /// Buffered bytes not consumed by the codec remain in that reader.
     pub fn into_inner(self) -> R {
         self.0.into_inner()
     }

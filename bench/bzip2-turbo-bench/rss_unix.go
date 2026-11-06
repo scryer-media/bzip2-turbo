@@ -1,15 +1,19 @@
-//go:build darwin || linux
+//go:build darwin
 
 package main
 
 import (
+	"context"
 	"os"
-	"runtime"
+	"os/exec"
 	"syscall"
 )
 
+const rssMethod = "darwin-native-rusage-v1"
+
 const rssSupported = true
-const rssDescription = "child process peak RSS from getrusage; normalized to bytes (Darwin bytes, Linux KiB); descendants excluded"
+const rssDescription = "child process peak RSS from getrusage on Darwin; native byte units"
+const processTimingDescription = "monotonic wall seconds including process startup and I/O; CPU seconds from ProcessState; host idleness not assessed"
 
 func peakRSS(state *os.ProcessState) *uint64 {
 	usage, ok := state.SysUsage().(*syscall.Rusage)
@@ -17,8 +21,12 @@ func peakRSS(state *os.ProcessState) *uint64 {
 		return nil
 	}
 	value := uint64(usage.Maxrss)
-	if runtime.GOOS == "linux" {
-		value *= 1024
-	}
 	return &value
+}
+func measuredCommand(ctx context.Context, args []string) (*exec.Cmd, func(*os.ProcessState) (processUsage, error), func(), error) {
+	command := exec.CommandContext(ctx, args[0], args[1:]...)
+	collect := func(state *os.ProcessState) (processUsage, error) {
+		return processUsage{state.UserTime().Seconds(), state.SystemTime().Seconds(), peakRSS(state)}, nil
+	}
+	return command, collect, func() {}, nil
 }

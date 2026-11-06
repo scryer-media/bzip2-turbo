@@ -46,6 +46,44 @@ impl Flags<'_> {
     }
 }
 
+// SortGroup: retain its original midpoint sequence while skipping partitions
+// known to be empty. Bounds select no new pivot and never reorder a group.
+fn skip_empty_midpoints(
+    mut left: usize,
+    mut range: usize,
+    minimum: usize,
+    maximum: usize,
+) -> (usize, usize) {
+    while range > 1 {
+        let mid = left + range.div_ceil(2);
+        if mid <= minimum {
+            range -= mid - left;
+            left = mid;
+        } else if mid > maximum {
+            range = mid - left;
+        } else {
+            break;
+        }
+    }
+    (left, range)
+}
+
+// Keep the infrequent bounds scan out of the small-group refinement frame.
+#[inline(never)]
+fn rank_bounds<const CAPACITY: usize>(
+    order: &[u32],
+    ranks: &Ranks<'_, CAPACITY>,
+) -> (usize, usize) {
+    let mut minimum = u32::MAX;
+    let mut maximum = 0;
+    for &word in order {
+        let rank = ranks.key(OriginalIndex::unmarked(word));
+        minimum = minimum.min(rank);
+        maximum = maximum.max(rank);
+    }
+    (minimum as usize, maximum as usize)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn refine<const CAPACITY: usize>(
     order: &mut [u32],
@@ -139,6 +177,11 @@ fn refine<const CAPACITY: usize>(
         } else {
             break (low, mid);
         }
+        // An empty partition made no swaps or rank writes. Pay for exact
+        // bounds once, then skip the same empty midpoint decisions without
+        // rescanning the group. The first possible split uses the old loop.
+        let (minimum, maximum) = rank_bounds(order, ranks);
+        (left, range) = skip_empty_midpoints(left, range, minimum, maximum);
     };
     flags.clear(offset + split - 1);
     for &word in &order[split..] {
@@ -298,6 +341,36 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::{Flags, Workspace};
+
+    #[test]
+    fn bounded_midpoints_match_every_original_empty_partition_decision() {
+        for left in [0, 3, 37] {
+            for range in 1usize..=64 {
+                for minimum in left..=left + range + 1 {
+                    for maximum in minimum..=left + range + 1 {
+                        let keys = [minimum, maximum, minimum, maximum];
+                        let (mut expected_left, mut expected_range) = (left, range);
+                        while expected_range > 1 {
+                            let mid = expected_left + expected_range.div_ceil(2);
+                            let low = keys.iter().filter(|&&key| key < mid).count();
+                            if low == 0 {
+                                expected_range -= mid - expected_left;
+                                expected_left = mid;
+                            } else if low == keys.len() {
+                                expected_range = mid - expected_left;
+                            } else {
+                                break;
+                            }
+                        }
+                        assert_eq!(
+                            super::skip_empty_midpoints(left, range, minimum, maximum),
+                            (expected_left, expected_range)
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn word_discovery_matches_bitwise_scans_at_every_alignment_and_tail() {

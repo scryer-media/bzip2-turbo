@@ -12,7 +12,8 @@ bzip2 = { package = "bzip2-turbo", version = "0.1" }
 ```
 
 ```rust
-use bzip2_turbo::{Compression, read::BzDecoder, write::BzEncoder};
+# use bzip2_turbo as bzip2;
+use bzip2::{Compression, read::BzDecoder, write::BzEncoder};
 use std::io::{Read, Write};
 
 let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
@@ -25,8 +26,8 @@ assert_eq!(restored, b"a streaming codec");
 # Ok::<(), std::io::Error>(())
 ```
 
-With the Cargo rename above, imports remain `bzip2::...`; without renaming,
-use `bzip2_turbo::...` as in the example. The adapter surface targets bzip2
+The examples use the Cargo rename above, so imports remain `bzip2::...`.
+Without renaming the dependency, use `bzip2_turbo::...` instead. The adapter surface targets bzip2
 0.6.1: `read`, `write`, `bufread`, `Compression`, `Compress`, `Decompress`,
 `Action`, `Status`, and `Error`. Ordinary `BzDecoder` reads one member;
 `MultiBzDecoder` reads concatenated members. Use `bufread` when bytes after the
@@ -43,7 +44,8 @@ features are not carried over. The default `compress` feature enables encoding;
 ## Explicit 7-Zip settings
 
 ```rust
-use bzip2_turbo::{Encoder, EncoderOptions};
+# use bzip2_turbo as bzip2;
+use bzip2::{Encoder, EncoderOptions};
 use std::io::Write;
 
 let options = EncoderOptions { threads: 4, level: 5, ..Default::default() };
@@ -57,8 +59,8 @@ let compressed = encoder.finish()?;
 Native `Encoder` and `Decoder` default to one thread. Encoding preserves output
 order across bounded worker slots. Decoding uses a parser/reconstruction
 pipeline when threading is requested; requesting eight threads does not imply
-eight reconstruction workers. `Decoder::with_low_memory` selects compact TT
-storage. Memory estimates cover codec allocations, not whole-process RSS.
+eight reconstruction workers. `Decoder::with_low_memory` selects a compact inverse-BWT
+lookup table. Memory estimates cover codec allocations, not whole-process RSS.
 Native `EncoderOptions` follows 7-Zip's level/pass mapping, which differs from
 compatibility `Compression` levels. Native `Decoder` defaults to concatenated
 streams; `set_multistream(false)` selects one member.
@@ -70,9 +72,43 @@ The [porting notes](https://github.com/scryer-media/bzip2-turbo/blob/main/PORTIN
 CI coverage. [Benchmarking](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmarking.md) compares 7zz, turbo, and isolated standard Rust bzip2 pure Rust/C backends with
 verified output, alternating rounds, medians and RSS.
 
-Performance work is paused at the first-pass baseline. Full ARM/x86 ST/MT
-performance parity is **not claimed**. Existing improvements and diagnostic
-evidence are preserved for subsequent work.
+## Benchmarks
+
+Level-5 combined-corpus throughput in MiB/s: total original bytes divided by the sum of each fixture's median wall time. Four balanced measured rounds follow one warmup, using varied JSON, structured logs, repeated text, MKV and ELF. These are whole-process measurements with a uniform null output sink.
+
+### ARM64 — Graviton3
+
+| Engine / budget | Encode | Decode |
+|---|---:|---:|
+| bzip2-turbo / 1T | 10.6 | 47.0 |
+| 7zz / 1T | 6.8 | 46.4 |
+| bzip2 (Rust) / 1T | 8.9 | 34.4 |
+| bzip2 (C) / 1T | 8.5 | 35.7 |
+| bzip2-turbo / 2T | 18.0 | 66.0 |
+| 7zz / 2T | 12.0 | 64.8 |
+| bzip2-turbo / 4T | 32.1 | 65.7 |
+| 7zz / 4T | 21.7 | 64.7 |
+| bzip2-turbo / 8T | 54.0 | 65.0 |
+| 7zz / 8T | 38.1 | 64.5 |
+
+### x86-64 — Intel Xeon
+
+| Engine / budget | Encode | Decode |
+|---|---:|---:|
+| bzip2-turbo / 1T | 13.0 | 84.6 |
+| 7zz / 1T | 9.3 | 71.5 |
+| bzip2 (Rust) / 1T | 11.0 | 42.0 |
+| bzip2 (C) / 1T | 9.8 | 42.5 |
+| bzip2-turbo / 2T | 22.3 | 117.5 |
+| 7zz / 2T | 16.8 | 90.0 |
+| bzip2-turbo / 4T | 39.9 | 112.2 |
+| 7zz / 4T | 30.2 | 88.9 |
+| bzip2-turbo / 8T | 45.9 | 116.5 |
+| 7zz / 8T | 38.0 | 89.1 |
+
+Budgets are requested thread counts. Native bzip2-turbo decoding uses at most two threads including the caller; its 4T/8T rows retain those requests. The pure Rust and C references are serial and appear once at 1T. See [detailed results and methodology](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmark.md) for every fixture, level, budget, peak RSS and source identity.
+
+Aggregate rates do not imply a lead on every fixture.
 
 ## License
 

@@ -1,4 +1,8 @@
-//! Writer-based compression/decompression streams
+//! Compatibility [`Write`] adapters for compression and single-stream decompression.
+//!
+//! Call `finish` or `try_finish` explicitly to report final codec and output
+//! errors. Drop attempts completion but cannot return errors. Counters describe
+//! codec progress, which can precede writes to the underlying writer.
 
 // Adapted from bzip2 0.6.1; see LICENSE-BZIP2-MIT for its license.
 
@@ -11,6 +15,18 @@ use crate::{Decompress, Status};
 
 /// A compression stream which will have uncompressed data written to it and
 /// will write compressed data to an output stream.
+///
+/// ```
+/// use bzip2_turbo::{write::BzEncoder, read::BzDecoder, Compression};
+/// use std::io::{Read, Write};
+/// let mut encoder = BzEncoder::new(Vec::new(), Compression::fast());
+/// encoder.write_all(b"compatibility stream")?;
+/// let encoded = encoder.finish()?;
+/// let mut decoded = Vec::new();
+/// BzDecoder::new(encoded.as_slice()).read_to_end(&mut decoded)?;
+/// assert_eq!(decoded, b"compatibility stream");
+/// # Ok::<(), std::io::Error>(())
+/// ```
 #[cfg(feature = "compress")]
 pub struct BzEncoder<W: Write> {
     data: Compress,
@@ -20,7 +36,7 @@ pub struct BzEncoder<W: Write> {
     panicked: bool,
 }
 
-/// A compression stream which will have compressed data written to it and
+/// A decompression stream which will have compressed data written to it and
 /// will write uncompressed data to an output stream.
 pub struct BzDecoder<W: Write> {
     data: Decompress,
@@ -32,8 +48,7 @@ pub struct BzDecoder<W: Write> {
 
 #[cfg(feature = "compress")]
 impl<W: Write> BzEncoder<W> {
-    /// Create a new compression stream which will compress at the given level
-    /// to write compress output to the give output stream.
+    /// Creates a writer that compresses bytes at the given compatibility level.
     pub fn new(obj: W, level: Compression) -> Self {
         Self {
             data: Compress::new(level, 30),
@@ -97,37 +112,26 @@ impl<W: Write> BzEncoder<W> {
         self.dump()
     }
 
-    /// Consumes this encoder, flushing the output stream.
+    /// Completes the BZip2 stream and returns its writer.
     ///
-    /// This will flush the underlying data stream and then return the contained
-    /// writer if the flush succeeded.
-    ///
-    /// Note that this function may not be suitable to call in a situation where
-    /// the underlying stream is an asynchronous I/O stream. To finish a stream
-    /// the [`try_finish`] (or `shutdown`) method should be used instead. To
-    /// re-acquire ownership of a stream it is safe to call this method after
-    /// [`try_finish`] or `shutdown` has returned `Ok`.
-    ///
-    /// [`try_finish`]: Self::try_finish
+    /// Pending compressed bytes are written, but the underlying writer is not
+    /// flushed. Call its [`Write::flush`] if required. This is blocking I/O;
+    /// [`Self::try_finish`] allows completion before consuming the adapter.
     pub fn finish(mut self) -> io::Result<W> {
         self.try_finish()?;
         Ok(self.obj.take().unwrap())
     }
 
-    /// Returns the number of bytes produced by the compressor
+    /// Number of output bytes produced by the codec.
     ///
-    /// Note that, due to buffering, this only bears any relation to
-    /// [`total_in`] after a call to [`flush`].  At that point,
-    /// `total_out() / total_in()` is the compression ratio.
-    ///
-    /// [`flush`]: Self::flush
-    /// [`total_in`]: Self::total_in
+    /// Buffered output may not yet have reached the caller or underlying writer.
     pub fn total_out(&self) -> u64 {
         self.data.total_out()
     }
 
-    /// Returns the number of bytes consumed by the compressor
-    /// (e.g. the number of bytes written to this stream.)
+    /// Number of input bytes consumed by the codec.
+    ///
+    /// This excludes any bytes read ahead but not yet consumed by the codec.
     pub fn total_in(&self) -> u64 {
         self.data.total_in()
     }
@@ -209,18 +213,10 @@ impl<W: Write> BzDecoder<W> {
         Ok(())
     }
 
-    /// Attempt to finish this output stream, writing out final chunks of data.
+    /// Drains pending output and requires a complete, validated BZip2 stream.
     ///
-    /// Note that this function can only be used once data has finished being
-    /// written to the output stream. After this function is called then further
-    /// calls to [`write`] may result in a panic.
-    ///
-    /// # Panics
-    ///
-    /// Attempts to write data to this stream may result in a panic after this
-    /// function is called.
-    ///
-    /// [`write`]: Self::write
+    /// Returns [`io::ErrorKind::UnexpectedEof`] if the supplied compressed input
+    /// ended before the stream trailer. This does not flush the underlying writer.
     pub fn try_finish(&mut self) -> io::Result<()> {
         while !self.done {
             // The write is effectively a `self.flush()`, but we want to know how many
@@ -234,34 +230,29 @@ impl<W: Write> BzDecoder<W> {
         self.dump()
     }
 
-    /// Unwrap the underlying writer, finishing the compression stream.
+    /// Validates stream completion, writes pending bytes and takes the writer.
     ///
-    /// Note that this function may not be suitable to call in a situation where
-    /// the underlying stream is an asynchronous I/O stream. To finish a stream
-    /// the [`try_finish`] (or `shutdown`) method should be used instead. To
-    /// re-acquire ownership of a stream it is safe to call this method after
-    /// [`try_finish`] or `shutdown` has returned `Ok`.
+    /// This does not flush the underlying writer.
     ///
-    /// [`try_finish`]: Self::try_finish
+    /// # Panics
+    ///
+    /// Panics if the writer was already taken by a successful call to this method.
+    /// Do not use the adapter after taking its writer.
     pub fn finish(&mut self) -> io::Result<W> {
         self.try_finish()?;
         Ok(self.obj.take().unwrap())
     }
 
-    /// Returns the number of bytes produced by the decompressor
+    /// Number of output bytes produced by the codec.
     ///
-    /// Note that, due to buffering, this only bears any relation to
-    /// [`total_in`] after a call to [`flush`].  At that point,
-    /// `total_in() / total_out()` is the compression ratio.
-    ///
-    /// [`flush`]: Self::flush
-    /// [`total_in`]: Self::total_in
+    /// Buffered output may not yet have reached the caller or underlying writer.
     pub fn total_out(&self) -> u64 {
         self.data.total_out()
     }
 
-    /// Returns the number of bytes consumed by the decompressor
-    /// (e.g. the number of bytes written to this stream.)
+    /// Number of input bytes consumed by the codec.
+    ///
+    /// This excludes any bytes read ahead but not yet consumed by the codec.
     pub fn total_in(&self) -> u64 {
         self.data.total_in()
     }

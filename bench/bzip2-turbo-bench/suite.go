@@ -93,6 +93,10 @@ func rssMedian(samples []sample) *float64 {
 	return &value
 }
 func summarize(r *row) {
+	if r.InputBytes > 0 {
+		r.ReferenceEncodedFraction = float64(r.ReferenceOutputBytes) / float64(r.InputBytes)
+		r.OursEncodedFraction = float64(r.OursOutputBytes) / float64(r.InputBytes)
+	}
 	r.ReferenceMedian = median(r.Reference)
 	r.OursMedian = median(r.Ours)
 	r.ReferenceOverOurs = r.ReferenceMedian / r.OursMedian
@@ -107,6 +111,10 @@ func summarize(r *row) {
 
 // generate streams a reproducible corpus without retaining it in memory.
 func generate(path, kind string, size int64) error {
+	if kind == "json" || kind == "repeated-text" || kind == "logs" || kind == "mkv" || kind == "elf" {
+		_, err := createFixture(path, kind, size)
+		return err
+	}
 	if size < 1 {
 		return errors.New("corpus size must be positive")
 	}
@@ -295,6 +303,12 @@ func (t tools) measure(s scenario, input, scratch string, repeats, warmups int) 
 	if e != nil {
 		return nil, e
 	}
+	if s.Corpus == "mkv" && float64(sizes[0])/float64(info.Size()) < 0.99 {
+		return nil, errors.New("generated MKV is compressible: 7zz encoded/input fraction is below 0.99")
+	}
+	if s.Corpus == "elf" && float64(sizes[0])/float64(info.Size()) > 0.90 {
+		return nil, errors.New("generated ELF is not materially compressible: 7zz encoded/input fraction exceeds 0.90")
+	}
 	var rows []row
 	for _, mode := range []string{"encode", "decode"} {
 		source := input
@@ -304,7 +318,7 @@ func (t tools) measure(s scenario, input, scratch string, repeats, warmups int) 
 		samples := make([][]sample, 4)
 		for repetition := 0; repetition < warmups+repeats; repetition++ {
 			for _, which := range order(repetition) {
-				value, e := t.execute(t.command(which, s, mode, source, "-"), source, os.DevNull)
+				value, e := t.execute(t.command(which, s, mode, source, os.DevNull), source, os.DevNull)
 				if e != nil {
 					return nil, e
 				}
@@ -332,7 +346,7 @@ func (t tools) measure(s scenario, input, scratch string, repeats, warmups int) 
 
 func run(args []string) error {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
-		fmt.Println("usage: bzip2-turbo-bench <run|suite|toolchain> [flags]; suite -h for matrix options")
+		fmt.Println("usage: bzip2-turbo-bench <run|suite|toolchain|fixture> [flags]; suite -h for matrix options")
 		return nil
 	}
 	command := args[0]
@@ -345,6 +359,7 @@ func run(args []string) error {
 	pure := fs.String("pure", "", "pure Rust reference driver")
 	c := fs.String("c", "", "C-backed Rust reference driver")
 	sevenzip := fs.String("sevenzip", "7zz", "7-Zip reference binary")
+	fixtureManifest := fs.String("fixture-manifest", "", "run: canonical fixture JSON receipt; SHA256 and actual bytes must match input")
 	input := fs.String("input", "", "run: existing corpus file outside repository")
 	out := fs.String("out", "", "JSON report outside repository (default temporary file)")
 	settings := fs.String("settings", "block-size", "block-size: level*100000 bytes and one pass; sevenzip-level: native 7zip defaults, differing from standard bzip2")
@@ -352,8 +367,11 @@ func run(args []string) error {
 	levelsText := fs.String("levels", "1,5,9", "suite: comma-separated compression levels")
 	threadsText := fs.String("threads", "1,2,4,8", "comma-separated thread counts (1..64)")
 	apiText := fs.String("api", "native", "native, compat or both; suite defaults to both")
-	corporaText := fs.String("corpora", "text,random,periodic,runs", "suite: generated corpus names")
-	sizeKiB := fs.Int64("size-kib", 32768, "suite: bytes per corpus in KiB")
+	corporaText := fs.String("corpora", "text,random,periodic,runs", "suite: text/json, repeated-text, logs, mkv, elf, random, periodic or runs; defaults need no extra tools")
+	mkvSource := fs.String("mkv-source", "big-buck-bunny", "suite MKV source: big-buck-bunny or noise")
+	mkvSourceFile := fs.String("mkv-source-file", "", "verified public MP4/ZIP outside checkout")
+	downloadSource := fs.Bool("download-source", false, "explicitly download pinned public MKV source")
+	sizeKiB := fs.Int64("size-kib", 32768, "suite: target KiB for text/logs/noise; public MKV and ELF use actual fixed excerpt/build bytes")
 	repeats := fs.Int("repeats", 4, "measured repeats, at least 3")
 	warmups := fs.Int("warmups", 1, "discarded four-contender warmup rounds")
 	timeout := fs.Duration("timeout", 10*time.Minute, "timeout per child process")
@@ -363,6 +381,9 @@ func run(args []string) error {
 			return nil
 		}
 		return e
+	}
+	if *fixtureManifest != "" && command != "run" {
+		return errors.New("fixture-manifest requires run")
 	}
 	if *settings != "block-size" && *settings != "sevenzip-level" {
 		return errors.New("settings must be block-size or sevenzip-level")
@@ -401,7 +422,7 @@ func run(args []string) error {
 		}
 		corpora = strings.Split(*corporaText, ",")
 		for _, name := range corpora {
-			if name != "text" && name != "random" && name != "periodic" && name != "runs" {
+			if !validCorpus(name) {
 				return fmt.Errorf("unknown corpus %q", name)
 			}
 		}
@@ -420,6 +441,11 @@ func run(args []string) error {
 	root, e := filepath.Abs(*repo)
 	if e != nil {
 		return e
+	}
+	if *mkvSourceFile != "" {
+		if e = outside(*mkvSourceFile, root); e != nil {
+			return e
+		}
 	}
 	if *driver == "" {
 		*driver = filepath.Join(root, "target", "release", "examples", "codec-bench")
@@ -474,7 +500,7 @@ func run(args []string) error {
 	if b, e := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output(); e == nil {
 		revision = strings.TrimSpace(string(b))
 	}
-	r := report{Schema: 4, Settings: *settings, Pure: pureID, C: cID, Platform: runtime.GOOS + "/" + runtime.GOARCH, StartedUTC: time.Now().UTC().Format(time.RFC3339), SourceSHA256: source, Revision: revision, ReferenceVersion: strings.TrimSpace(string(version)), Driver: driverID, Reference: referenceID, Repeats: *repeats, Warmups: *warmups, RSSSupported: rssSupported, RSSScope: rssDescription, TimingScope: "wall seconds including process startup and I/O; CPU seconds from ProcessState; host idleness not assessed", PerformanceCounters: "not collected: architecture/OS hardware counters require a separate diagnostic collector", Skipped: skipped}
+	r := report{Schema: 5, Settings: *settings, Pure: pureID, C: cID, Platform: runtime.GOOS + "/" + runtime.GOARCH, StartedUTC: time.Now().UTC().Format(time.RFC3339), SourceSHA256: source, Revision: revision, ReferenceVersion: strings.TrimSpace(string(version)), Driver: driverID, Reference: referenceID, Repeats: *repeats, Warmups: *warmups, RSSMethod: rssMethod, OutputSink: os.DevNull, RSSSupported: rssSupported, RSSScope: rssDescription, TimingScope: processTimingDescription, PerformanceCounters: "not collected: architecture/OS hardware counters require a separate diagnostic collector", Skipped: skipped}
 	if command == "toolchain" {
 		b, e := json.MarshalIndent(r, "", "  ")
 		if e == nil {
@@ -507,12 +533,28 @@ func run(args []string) error {
 			return e
 		}
 		paths["input"] = *input
-	} else {
-		for _, name := range corpora {
-			path := filepath.Join(scratch, name+".bin")
-			if e = generate(path, name, *sizeKiB*1024); e != nil {
+		if *fixtureManifest != "" {
+			if e = outside(*fixtureManifest, root); e != nil {
 				return e
 			}
+			info, err := readFixtureManifest(*fixtureManifest, *input)
+			if err != nil {
+				return err
+			}
+			r.Fixtures = append(r.Fixtures, info)
+			for i := range plan {
+				plan[i].Corpus = info.Kind
+			}
+			paths[info.Kind] = *input
+		}
+	} else {
+		for _, name := range corpora {
+			path := filepath.Join(scratch, name+corpusExtension(name))
+			info, err := createFixtureWithOptions(path, name, *sizeKiB*1024, fixtureOptions{MKVSource: *mkvSource, SourceFile: *mkvSourceFile, Download: *downloadSource})
+			if err != nil {
+				return err
+			}
+			r.Fixtures = append(r.Fixtures, info)
 			paths[name] = path
 		}
 	}

@@ -285,7 +285,15 @@ impl StreamBits {
     }
 }
 
-/// An incremental BZip2 writer. `flush` preserves the current block.
+/// A block-bounded native BZip2 [`Write`] encoder.
+///
+/// [`Write::flush`] drains previously submitted blocks and flushes the underlying
+/// writer, but preserves the partially filled block and pending run. Call
+/// [`Self::finish`] to submit that block and write the trailer. Dropping an encoder
+/// joins its workers but does not complete the stream or report pending I/O errors.
+///
+/// With multiple threads, completed blocks are delivered in input order. Write
+/// errors poison the encoder; later operations return an error.
 pub struct Encoder<W: Write> {
     output: Option<W>,
     options: EncoderOptions,
@@ -308,6 +316,8 @@ pub struct Encoder<W: Write> {
 }
 
 impl<W: Write> Encoder<W> {
+    /// Creates an encoder, normalizing options as documented by [`EncoderOptions`].
+    /// Output and workers are initialized lazily as input is written.
     pub fn new(output: W, mut options: EncoderOptions) -> Self {
         options.level = options.level.min(9);
         options.threads = options.threads.clamp(1, 64);
@@ -355,9 +365,13 @@ impl<W: Write> Encoder<W> {
         }
     }
 
+    /// Borrows the output writer. Pending codec bytes may not yet be written.
     pub fn get_ref(&self) -> &W {
         self.output.as_ref().unwrap()
     }
+    /// Mutably borrows the output writer.
+    /// Writing directly to it can corrupt the BZip2 stream; this does not flush
+    /// or finish pending codec output.
     pub fn get_mut(&mut self) -> &mut W {
         self.output.as_mut().unwrap()
     }
@@ -703,6 +717,11 @@ impl<W: Write> Encoder<W> {
         })
     }
 
+    /// Completes the stream, joins pending work and returns the flushed writer.
+    ///
+    /// Submits the current block, writes the combined-checksum trailer and final
+    /// padding, then calls [`Write::flush`] on the underlying writer. Returns
+    /// worker or output errors instead of silently discarding them.
     pub fn finish(mut self) -> io::Result<W> {
         self.guarded(|this| {
             this.emit_run();
