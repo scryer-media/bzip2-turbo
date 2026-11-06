@@ -40,11 +40,9 @@ created. `dry_run` defaults to true for manual runs; a pushed tag publishes.
 Do not push a release tag or dispatch a publishing run without separate release
 authorization. Configuration work does not execute either release route.
 
-The downstream sevenz-turbo manifest declares registry dependency
-`bzip2-turbo = "0.1.0"`. The operator separately authorized local downstream
-version preparation from 0.29.1 to 0.29.2, subject to patch compatibility
-validation; no downstream push, tag or publication is authorized. Local
-integration verification can use an invocation-only Cargo `[patch.crates-io]`
-path override. Do not commit a machine-specific override. Until the standalone
-version is published, unpatched downstream packaging and remote CI cannot
-resolve it from crates.io.
+sevenz-turbo depends on `bzip2-turbo = "0.1.1"` behind its `bzip2` feature.
+Until 0.1.1 is on crates.io, its manifest carries a `[patch.crates-io]` entry
+that points at the 0.1.1 release commit in this repository by `rev`; that
+entry is removed once the crate is published. Local integration checks can
+instead use an invocation-only `[patch.crates-io]` path override. Do not
+commit a machine-specific override.
