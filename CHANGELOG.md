@@ -43,4 +43,5 @@
   largest length it has held.
 - Benchmark harness: decode is measured only at 1 and 2 threads, matching the
   native decoder's two-thread cap; higher budgets still measure encoding and are
-  recorded as skipped decode scenarios.
+  recorded as skipped decode scenarios. `legacy-compare` applies the same
+  cap to its decode timings while still checking bytes at every thread count.

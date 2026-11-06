@@ -8,7 +8,9 @@ The latter accepts the historical level, block-size, passes, runs, warmups,
 hardware, revision, profile, darwin-resources and require-parity options.
 Platform identity values use Go OS/architecture names. These legacy commands
 keep their candidate/reference ratio direction; four-contender reports use
-reference/ours. All raw outputs stay outside the checkout.
+reference/ours. `legacy-compare` checks bytes at 1, 2, 4 and 8 threads but
+times decoding only at 1 and 2, the thread counts the native decoder can use.
+All raw outputs stay outside the checkout.
 Four contenders run in rotating order: 7zz, turbo, Rust bzip2 with its pure Rust
 backend, and Rust bzip2 with its C backend. Every encoded output is decoded by
 every contender before timing. Native turbo output must match 7zz byte for byte;

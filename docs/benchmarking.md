@@ -101,7 +101,9 @@ main text workload. Run from
 `bench/bzip2-turbo-bench`: `go run . legacy-corpus DESTINATION --mib 32`
 and `go run . legacy-compare --codec EXE --oracle EXE --input FILE --results JSON`.
 The corpus bytes, CLI options, report keys, alternating order, Darwin resource
-counters and strict unrounded parity criterion match the historical tools.
+counters and strict unrounded parity criterion match the historical tools,
+except that decode timings stop at two threads, the most the native decoder
+uses; bytes are still checked at every thread count.
 Platform identity fields use Go OS/architecture names; supply `--hardware` for
 a precise machine description. Four 1 MiB corpus SHA-256 characterizations and
 a tiny comparison schema/identity smoke check verified the migration.
