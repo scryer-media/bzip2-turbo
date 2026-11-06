@@ -13,8 +13,9 @@ separately before relying on trusted publishing. The workflow does not bootstrap
 these prerequisites. No signing key or `RELEASE_ALLOWED_SIGNERS` is required by
 the release workflow.
 
-Run `release` from the Actions tab on `main`, enter the manifest `version`
-(for example, `0.1.0`), and leave `dry_run` true to run checks without publishing.
+Run `release` from the Actions tab on `main` and leave the only input,
+`dry_run`, true to run checks without publishing. The workflow reads the version
+from the checked-out `Cargo.toml`; there is no version prompt.
 After separate release authorization, running with `dry_run` false publishes
 through the protected environment, creates `v<version>` at the checked commit,
 and creates the GitHub release. A pre-existing tag is not required for this
