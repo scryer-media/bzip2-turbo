@@ -85,23 +85,39 @@ integrated. Public signatures and dependency versions are unchanged.
 on Linux, is aligned to 2 MiB and advised with `MADV_HUGEPAGE`. Every block of
 every level therefore chases its links through huge-page-backed memory.
 
-On Linux x86-64 and AArch64 the decoder follows that policy with separately
-owned buffers. Every TT and every last column is rounded up to whole 2 MiB
-pages (at least one), aligned to 2 MiB and advised with `MADV_HUGEPAGE`,
-whatever its size. Compact links take 2 MiB for levels 1–5 and 4 MiB for
-levels 6–9; a last column of any level fits one 2 MiB page. The TT is sized
-once at the stream's declared block limit and is never shrunk or reallocated
-while it is large enough; a later member with a larger level grows it once.
-Last columns come from a small recycled pool instead of a fresh allocation per
-block: one owner when single-threaded, returned as soon as its TT is built,
-and at most two when pipelined, each returned with its block's completion
-message. The kernel honours the advice only when transparent huge pages are
-set to `madvise` or `always`; with `never` these buffers use ordinary 4 KiB
-pages, as before. Other targets keep exact-size `Vec` storage, and the
-recycled column is a `Vec` there: extending it to the block limit zero-fills
-only bytes beyond the previous block's length. Native pages are zeroed once,
-when allocated. The parser stores each byte at a bounded index into the
-column, with no per-byte capacity check beyond the declared-size test.
+On Linux x86-64 and AArch64 the streaming `Decoder` follows that policy with
+separately owned buffers. Every TT and every last column is rounded up to
+whole 2 MiB pages (at least one), aligned to 2 MiB and advised with
+`MADV_HUGEPAGE`, whatever its size. This rounding is a deliberate superset of
+`BigAlloc`, which aligns only allocations above 1 MiB and rounds a size up to
+a 2 MiB multiple only when its remainder exceeds 1 MiB. Each buffer is its
+own anonymous private `mmap`, trimmed to the 2 MiB-aligned extent and released
+with `munmap`, so neither Rust's global allocator nor the C `malloc` the
+process links (glibc, mimalloc, jemalloc or another) is involved in its
+placement or release. Nothing is pre-filled, as in `BigAlloc`: the advice is
+applied before any access, and the kernel supplies zeroed pages on first
+touch. Compact links take 2 MiB for levels 1–5 and 4 MiB for levels 6–9; a
+last column of any level fits one 2 MiB page. The TT is sized once at the
+stream's declared block limit and is never shrunk or reallocated while it is
+large enough; a later member with a larger level grows it once. Last columns
+come from a small recycled pool instead of a fresh allocation per block: one
+owner when single-threaded, returned as soon as its TT is built, and at most
+two when pipelined, each returned with its block's completion message. The
+kernel honours the advice only when transparent huge pages are set to
+`madvise` or `always`; with `never` these buffers use ordinary 4 KiB pages, as
+before.
+
+The bzip2-compatible API (`Decompress`, the `read`, `bufread` and `write`
+decoders, and `MultiBzDecoder`) gets the mapped TT only: it still builds each
+block's last column in a plain `Vec`.
+
+Other targets keep exact-size `Vec` storage, and the recycled column is a
+`Vec` there. Each `Vec`-backed buffer tracks its logical length separately
+from its initialized extent, so shrinking and regrowing within the largest
+length it has held neither zero-fills nor exposes uninitialized words; only
+growth past that mark zero-fills the new words, once. The parser stores each
+byte at a bounded index into the column, with no per-byte capacity check
+beyond the declared-size test.
 
 ## Memory and correctness
 

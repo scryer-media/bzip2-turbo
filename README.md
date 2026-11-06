@@ -61,10 +61,14 @@ order across bounded worker slots. Decoding uses a parser/reconstruction
 pipeline when threading is requested; requesting eight threads does not imply
 eight reconstruction workers. `Decoder::with_low_memory` selects a compact inverse-BWT
 lookup table. Memory estimates cover codec allocations, not whole-process RSS.
-On Linux x86-64 and AArch64 the decoder's lookup tables and last columns are
-whole 2 MiB pages advised for transparent huge pages, which the estimates
-count; the kernel uses huge pages only when that setting is `madvise` or
-`always`.
+On Linux x86-64 and AArch64 the streaming `Decoder`'s lookup tables and last
+columns are whole 2 MiB pages advised for transparent huge pages, which the
+estimates count; the bzip2-compatible API (`Decompress`, the `read`, `bufread`
+and `write` decoders and `MultiBzDecoder`) gets the huge-page lookup table only
+and keeps each last column in a plain `Vec`. These pages are mapped directly
+with `mmap`, independent of the process allocator (Rust's global allocator or
+the linked C `malloc`), and the kernel zeroes them on first touch; it uses huge
+pages only when that setting is `madvise` or `always`.
 Native `EncoderOptions` follows 7-Zip's level/pass mapping, which differs from
 compatibility `Compression` levels. Native `Decoder` defaults to concatenated
 streams; `set_multistream(false)` selects one member.

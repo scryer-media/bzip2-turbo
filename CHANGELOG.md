@@ -24,7 +24,11 @@
 - Preserve measured baselines and remaining gaps without claiming complete parity.
 - Queue each parsed block for the decoder's reconstruction worker while it
   still reconstructs the previous block, matching 7-Zip's parser run-ahead.
-- Back every decoder TT and last column on Linux x86-64/AArch64 with whole
-  2 MiB pages advised for transparent huge pages, as 7-Zip's `BigAlloc` does,
-  size the TT once at the declared block limit and recycle at most two last
-  columns; the Linux single-threaded compact estimate is now 8 MiB.
+- Back every streaming `Decoder` TT and last column (the compatibility API's
+  TT only) on Linux x86-64/AArch64 with whole 2 MiB pages advised for
+  transparent huge pages, as 7-Zip's `BigAlloc` does, mapped with anonymous
+  `mmap`/`munmap` independently of the process allocator and faulted in lazily
+  without a pre-fill, size the TT once at the declared block limit and recycle
+  at most two last columns; the Linux single-threaded compact estimate is now
+  8 MiB. `Vec`-backed TT and column storage zero-fills only growth past the
+  largest length it has held.

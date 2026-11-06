@@ -46,9 +46,9 @@ boundary. Decoder output is checked in batches. This is separate from the
 not delegate BZip2 wire checksums to the host.
 
 The encoder and decoder algorithms forbid unsafe code. The private
-`tt_storage::native` module confines Linux allocation/advice FFI: it owns
-aligned storage, initializes its complete allocation, exposes bounded slices
-and frees it with the matching C allocator. Other platforms and Miri use Vec
+`tt_storage::native` module confines Linux mapping/advice FFI: it owns a
+2 MiB-aligned anonymous `mmap` extent, which the kernel zero-initializes, exposes bounded
+slices and releases it with `munmap`, bypassing the process allocator. Other platforms and Miri use Vec
 storage. Native ownership tests and focused CI coverage are inventoried in
 `docs/unsafe-validation.md`; Miri cannot verify the OS calls. Architecture-specific
 SIMD or unsafe kernels selected by `crc-turbo` belong to that dependency and
