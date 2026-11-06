@@ -40,8 +40,8 @@
 - Add contributor rules for version-bump PRs: every code change bumps the
   version, `Cargo.lock` and changelog in the same PR, sized by
   `cargo semver-checks`, under a released `## <version>` heading.
-- Present the README benchmarks as one table per platform with MiB/s in the
-  column headers, and show the serial `bzip2` references at every thread
+- Present the README benchmarks as separate encode and decode tables per
+  platform, narrow enough for crates.io, with MiB/s in the header, and show the serial `bzip2` references at every thread
   budget instead of only at 1T.
 
 ## 0.1.0

@@ -64,21 +64,35 @@ better. 1T–8T is the requested thread count.
 
 ### ARM64 (Graviton3)
 
-| Engine | Encode 1T (MiB/s) | Encode 2T (MiB/s) | Encode 4T (MiB/s) | Encode 8T (MiB/s) | Decode 1T (MiB/s) | Decode 2T (MiB/s) |
-|---|---:|---:|---:|---:|---:|---:|
-| **bzip2-turbo** | **10.6** | **18.0** | **32.1** | **54.0** | **47.0** | **66.0** |
-| 7zz | 6.8 | 12.0 | 21.7 | 38.1 | 46.4 | 64.8 |
-| bzip2 (Rust) | 8.9 | 8.9 | 8.9 | 8.9 | 34.4 | 34.5 |
-| bzip2 (C) | 8.5 | 8.5 | 8.4 | 8.4 | 35.7 | 35.7 |
+| Encode MiB/s | 1T | 2T | 4T | 8T |
+|---|---:|---:|---:|---:|
+| **bzip2-turbo** | **10.6** | **18.0** | **32.1** | **54.0** |
+| 7zz | 6.8 | 12.0 | 21.7 | 38.1 |
+| bzip2 (Rust) | 8.9 | 8.9 | 8.9 | 8.9 |
+| bzip2 (C) | 8.5 | 8.5 | 8.4 | 8.4 |
+
+| Decode MiB/s | 1T | 2T |
+|---|---:|---:|
+| **bzip2-turbo** | **47.0** | **66.0** |
+| 7zz | 46.4 | 64.8 |
+| bzip2 (Rust) | 34.4 | 34.5 |
+| bzip2 (C) | 35.7 | 35.7 |
 
 ### x86-64 (Intel Xeon)
 
-| Engine | Encode 1T (MiB/s) | Encode 2T (MiB/s) | Encode 4T (MiB/s) | Encode 8T (MiB/s) | Decode 1T (MiB/s) | Decode 2T (MiB/s) |
-|---|---:|---:|---:|---:|---:|---:|
-| **bzip2-turbo** | **13.0** | **22.3** | **39.9** | **45.9** | **84.6** | **117.5** |
-| 7zz | 9.3 | 16.8 | 30.2 | 38.0 | 71.5 | 90.0 |
-| bzip2 (Rust) | 11.0 | 10.9 | 10.9 | 10.8 | 42.0 | 42.1 |
-| bzip2 (C) | 9.8 | 9.7 | 9.7 | 9.7 | 42.5 | 42.7 |
+| Encode MiB/s | 1T | 2T | 4T | 8T |
+|---|---:|---:|---:|---:|
+| **bzip2-turbo** | **13.0** | **22.3** | **39.9** | **45.9** |
+| 7zz | 9.3 | 16.8 | 30.2 | 38.0 |
+| bzip2 (Rust) | 11.0 | 10.9 | 10.9 | 10.8 |
+| bzip2 (C) | 9.8 | 9.7 | 9.7 | 9.7 |
+
+| Decode MiB/s | 1T | 2T |
+|---|---:|---:|
+| **bzip2-turbo** | **84.6** | **117.5** |
+| 7zz | 71.5 | 90.0 |
+| bzip2 (Rust) | 42.0 | 42.1 |
+| bzip2 (C) | 42.5 | 42.7 |
 
 - Decoding uses at most two threads, so it is measured at 1T and 2T only.
 - The standard `bzip2` crate is single-threaded, so its rate stays flat as
