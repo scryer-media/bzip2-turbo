@@ -40,6 +40,25 @@ flow, table construction and storage lifetime together.
   blocks. Rebuilding clears canonical metadata, symbols and fast-table sentinels.
   Published blocks own their data and never borrow this scratch storage.
 
+## Compact reconstruction loop
+
+The compact kernel follows the loop shape of `CSpecState::Decode`. Per output
+byte it keeps only the output index, the chained position, the previous byte
+and the reference's signed `reps` countdown live; the previous-byte test
+updates `reps` with a conditional select. Because each symbol other than a
+repeat count yields one byte, the remaining-symbol count is carried as the
+output index where the block ends, so the inner loop has a single exit
+compare against the nearer of the output and block limits. Repeat counts
+leave the inner loop for a cold run-fill helper, and loop state is written
+back only when a read returns. The link load keeps its safe bounds check
+against a register-held length. The CRC is still computed in one batch per
+read, runs still carry across reads, and decoded bytes and errors are
+unchanged; a unit test compares every read result, output buffer and state
+with the previous loop. Generated AArch64 and x86-64 code was inspected for
+this shape, including the absence of stack reloads in the loop. It has not
+yet been timed against 7zz on the Linux hosts; no performance result is
+claimed here.
+
 These are safe Rust changes. The decoder's existing unsafe-code prohibition
 remains in place; no unchecked lookup experiment or experimental CI change was
 integrated. Public signatures and dependency versions are unchanged.
