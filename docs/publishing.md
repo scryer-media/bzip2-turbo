@@ -5,50 +5,39 @@ The public repository is
 reviewed, signed source history before remote validation and publication.
 Implementation and validation work do not authorize publication, tags or pushes.
 
-Before an explicitly authorized publication, the operator must configure the
-repository variable `RELEASE_ALLOWED_SIGNERS` with SSH allowed-signers entries,
-protect the `crates-io` GitHub environment with the desired approval policy,
-and register the crates.io trusted publisher for this repository's
-`.github/workflows/release.yml` workflow and `crates-io` environment. First-crate
-ownership and registration must be established with crates.io before relying on
-that workflow. Do not place private signing material in the repository.
+Before publication, protect the `crates-io` GitHub environment with the desired
+approval policy and register the crates.io trusted publisher for this
+repository's `.github/workflows/release.yml` workflow and `crates-io` environment.
+The initial crate publication, ownership and registration must be established
+separately before relying on trusted publishing. The workflow does not bootstrap
+these prerequisites. No signing key or `RELEASE_ALLOWED_SIGNERS` is required by
+the release workflow.
 
-Run the `release` workflow manually from the Actions tab on `main`. Enter
-`version` exactly as in `Cargo.toml` (for example, `0.1.0`). `dry_run` defaults
-to true and performs validation without uploading or creating a GitHub release.
-After separate release authorization, set `dry_run` to false to publish through
-the protected `crates-io` environment and create the GitHub release.
+Run `release` from the Actions tab on `main`, enter the manifest `version`
+(for example, `0.1.0`), and leave `dry_run` true to run checks without publishing.
+After separate release authorization, running with `dry_run` false publishes
+through the protected environment, creates `v<version>` at the checked commit,
+and creates the GitHub release. A pre-existing tag is not required for this
+manual route. The workflow creates the tag through `gh release --target`, just
+as sevenz-turbo does. A tag already present at another commit is rejected.
 
-An existing, remotely pushed SSH-signed annotated `vX.Y.Z` tag is required even
-for validation. The workflow has no private signing key and never creates or
-moves tags; the operator must prepare that signed tag separately after release
-authorization. Both tag and source commit are verified against the allowed
-signers. The exact source commit must be on `main` and have a successful push
-run of `ci.yml` on `main`. All later jobs check out that immutable commit.
+Manual runs require `ci-complete` success on that exact commit. They check the
+manifest version and the matching changelog heading, rejecting an `Unreleased`
+heading, then perform API compatibility and package checks. For the first
+publication only, a crates.io 404 means there is no published API baseline;
+subsequent releases run `cargo semver-checks`. Other registry errors fail that
+baseline check. The changelog heading check and notes extraction follow the
+sevenz-turbo workflow, including its first-section notes fallback.
 
-The manifest must match the requested version. `CHANGELOG.md` must contain
-exactly one heading `## X.Y.Z - YYYY-MM-DD` with a valid calendar date and
-nonempty release notes. The initial `## 0.1.0` heading is deliberately undated
-and must be dated separately during authorized release preparation. Validation
-runs `cargo publish --locked --dry-run`; platform tests are covered by the
-required exact-commit CI run. There is no published semver baseline for the
-first release, so this workflow does not assume one exists.
+The same workflow also accepts pushed `v*` tags, testing them with Nextest and
+doctests before the shared checks and publication. That route uses the existing
+tag with `--verify-tag` when creating the GitHub release. Manual workflow tags
+created using the workflow token do not trigger a second tag-push workflow.
 
-Publication retries skip an already uploaded crates.io version. Any registry
-response other than success or not-found stops publication. A subsequent GitHub
-release step checks that the remote tag object still matches the verified tag,
-then uses `--verify-tag`; it never asks GitHub to create an unsigned tag. Release
-notes come only from the matching dated changelog section. Retrying updates
-notes on an existing release. Runs are serialized, including across versions.
-These controls do not bootstrap a first crates.io publication: crate ownership
-and trusted publisher registration must already be established separately.
-Do not bypass signature verification when any prerequisite fails.
-
-The operator's next steps are to review the implementation and validation,
-push reviewed signed source history, obtain successful remote CI, configure
-the publication prerequisites, and separately authorize the release. These are
-pending actions, not completed work. Release validation and publication must
-remain separate from the implementation handoff.
+Retries skip crate versions already published and GitHub releases already
+created. `dry_run` defaults to true for manual runs; a pushed tag publishes.
+Do not push a release tag or dispatch a publishing run without separate release
+authorization. Configuration work does not execute either release route.
 
 The downstream sevenz-turbo manifest declares registry dependency
 `bzip2-turbo = "0.1.0"`. The operator separately authorized local downstream

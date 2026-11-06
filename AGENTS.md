@@ -19,8 +19,11 @@ adapters. Keep source reference identities and required legal notices intact.
   renovate.json and honor disabled packages, ranges and version restrictions.
 - main is stable. Work on feature/, bugfix/ or hotfix/ branches; worktrees belong
   under .worktrees/. Never reset, clean, restore or stash a shared checkout.
-- Commits and tags must be SSH-signed. Never bypass signing. Do not push unless
-  explicitly instructed. Release and publication require separate authorization.
+- Commits and operator-created tags must be SSH-signed. The manually dispatched
+  release workflow is authorized to create its release tag through GitHub, as
+  sevenz-turbo does; that workflow-created tag does not require SSH signing.
+  Do not bypass commit signing or push unless explicitly instructed. Release
+  and publication require separate authorization.
 - Enable hooks with git config core.hooksPath .githooks. Go and gitleaks
   are required. The hooks check complete staged blobs and commit messages.
 - Never commit credentials, personal home paths, account names or private
