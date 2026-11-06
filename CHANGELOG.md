@@ -17,6 +17,10 @@
   for longer codes, with no bit-serial reads. Incomplete and oversubscribed
   trees keep their existing acceptance and rejection, and decoded bytes are
   unchanged.
+- Scatter inverse-BWT links through a per-block table of bucket counter
+  references, two positions per step, so each counter is addressed through one
+  register as in 7-Zip's `DecodeBlock1`; x86-64 level 5 and 9 decoding reaches
+  7zz parity on the measured Intel host.
 - Reduce native decoder parsing and output-storage work, reuse bounded parser
   scratch, and retain source-faithful Linux ARM64 MTF traversal.
 - Reshape the compact inverse-BWT reconstruction loop after

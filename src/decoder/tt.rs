@@ -1,6 +1,7 @@
 //! Inverse BWT links, based on the 7-Zip BZip2 DecodeBlock1 function.
 //! SPDX-License-Identifier: LGPL-2.1-or-later
 use super::super::tt_storage::{TtBuffer, Word};
+use core::cell::Cell;
 
 pub(super) trait LinkWord: Word {
     fn set_low(&mut self, low: u32);
@@ -119,10 +120,8 @@ pub(super) fn build_links<W: LinkWord>(
     if !mostly_long_runs(last) {
         let mut counts = starts(counts);
         let mut links = links.resized(last.len());
-        // DecodeBlock1 carries the current byte while fetching its successor
-        // before the current bucket/scatter chain. The tail is explicit: no
-        // sentinel byte is read beyond the supplied last column.
-        if let Some((&first, tail)) = last.split_first() {
+        let words: &mut [W] = &mut links[..last.len()];
+        if let Some(final_index) = last.len().checked_sub(1) {
             // Both slices are bound once to the same length. Starts from the
             // histogram of last never exceed the final index, so clamping is
             // the identity for parser blocks; it is branch-free and lets the
@@ -131,19 +130,39 @@ pub(super) fn build_links<W: LinkWord>(
             // The bucket counter is advanced unclamped, so the chain carried
             // through a repeated bucket stays load, increment, store; the
             // clamp only feeds this iteration's accesses.
-            let words: &mut [W] = &mut links[..last.len()];
-            let final_index = tail.len();
-            let mut byte = first;
-            for (index, &next) in tail.iter().enumerate() {
-                let bucket = usize::from(byte);
-                let start = counts[bucket];
-                byte = next;
-                counts[bucket] = start + 1;
+            let slots = Cell::from_mut(&mut counts).as_array_of_cells().each_ref();
+            let mut scatter = |slot: &Cell<usize>, index: usize| {
+                let start = slot.get();
+                slot.set(start + 1);
                 let destination = start.min(final_index);
                 words[destination].set_low(((index as u32) << 8) | u32::from(last[destination]));
+            };
+            // Like DecodeBlock1, each counter is loaded and stored through
+            // one plain address register: slots come from the table of
+            // counter references one pair ahead, so the scatter chain never
+            // waits on that lookup. Two positions per step keep the clamp a
+            // conditional move; equal buckets within a pair share one cell
+            // and update it in order. No byte is read beyond last.
+            if let [first, second, ahead @ ..] = last {
+                let mut pairs = ahead.chunks_exact(2);
+                let mut current = slots[usize::from(*first)];
+                let mut successor = slots[usize::from(*second)];
+                let mut index = 0;
+                for pair in pairs.by_ref() {
+                    scatter(current, index);
+                    scatter(successor, index + 1);
+                    current = slots[usize::from(pair[0])];
+                    successor = slots[usize::from(pair[1])];
+                    index += 2;
+                }
+                scatter(current, index);
+                scatter(successor, index + 1);
+                if let [byte] = pairs.remainder() {
+                    scatter(slots[usize::from(*byte)], index + 2);
+                }
+            } else {
+                scatter(slots[usize::from(last[0])], 0);
             }
-            let destination = counts[usize::from(byte)].min(final_index);
-            words[destination].set_low(((final_index as u32) << 8) | u32::from(last[destination]));
         }
         return W::finish(links);
     }

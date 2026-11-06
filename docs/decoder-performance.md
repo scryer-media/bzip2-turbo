@@ -50,16 +50,24 @@ flow, table construction and storage lifetime together.
 - Use the reference's forward word-at-a-time MTF carry loop on Linux ARM64.
   Native differential tests compare every position and evolving MTF state.
   Other platforms retain their previous MTF selection.
-- Carry the next last-column byte through scalar inverse-BWT table construction,
-  as in `DecodeBlock1`. An explicit final element avoids reading a sentinel
-  outside the input; the existing long-run specialization remains intact.
-  The ordinary scatter binds the link and last-column slices to one length and
-  clamps each bucket start to the final index. For a parser histogram the clamp
-  is the identity; it compiles to a conditional select, so the loop keeps only
-  its back-edge branch, as `DecodeBlock1` does, with no per-byte bounds checks.
-  The bucket counter advances unclamped, keeping the select off the
-  load-increment-store chain carried through repeated buckets. The paired
-  successor pass clamps its source index the same way.
+- Scatter inverse-BWT links as `DecodeBlock1` does, with each bucket counter
+  loaded and stored through one plain address register. The ordinary scatter
+  builds a table of references to the 256 counter cells once per block, walks
+  the last column two positions per step, and fetches the next pair's counter
+  references one step ahead so the load-increment-store chain carried through
+  repeated buckets never waits on that lookup; equal buckets within a pair
+  share one cell and update in order, and no byte is read beyond the input.
+  The link and last-column slices are bound to one length and each bucket
+  start is clamped to the final index. For a parser histogram the clamp is the
+  identity; it compiles to a conditional select, so the loop keeps only its
+  back-edge branch with no per-byte bounds checks. The counter advances
+  unclamped. Generated x86-64 code went from 14 to 12 instructions per
+  position with scaled-index counter addressing replaced by register-indirect
+  addressing, which on the Intel host closed the level 5 and 9 scatter gap
+  (logs.l5 1T from 1.070 to 1.016 of the 7zz time); AArch64 code went from 13
+  to 12.5 instructions per position with no timing change. The existing
+  long-run specialization remains intact, and the paired successor pass clamps
+  its source index the same way.
 - Reuse initialized output storage and track its valid prefix separately.
   Unobserved single-threaded decoding uses a 1 MiB buffer. Callback and worker
   chunk boundaries remain unchanged. A failed block cannot expose stale bytes.
