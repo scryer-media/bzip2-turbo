@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.0
+
+- Decode with every thread of the budget. `Decoder::with_threads(reader, N)`
+  with N above one now runs N block workers (budgets clamp to 1..=64;
+  WebAssembly stays single-threaded) instead of at most one reconstruction
+  worker. The calling thread reads input in 1 MiB chunks and scans every bit
+  offset for the block magic; workers decode each candidate speculatively
+  (entropy decode, inverse BWT, output), and an in-order chain keeps a
+  candidate only where the previous block, stream trailer and any next stream
+  header end, discarding magics that occur inside block data. Output order,
+  concatenated streams, randomised blocks, block and stream CRCs and the
+  error-not-panic behaviour are unchanged.
+- Bound multithreaded decoder memory by the budget: N workers, at most 2N open
+  blocks holding at most 2 MiB of undelivered output each, and input read no
+  further than a fixed window past the oldest block still needed.
+  `memory_usage` and `low_memory_usage` grow linearly with N and report this
+  bound; multithreaded workers use the compact inverse-BWT table on every
+  platform, so on macOS ARM64 `memory_usage(N)` equals `low_memory_usage(N)`
+  for N above one. A block encoded beyond a worker's 1.25 MiB lookahead, which
+  ordinary encoders never produce, is decoded serially from there on.
+- With an output callback and several threads, workers call it one chunk at a
+  time in stream order. Dropping or `into_inner` cancels and joins every
+  worker.
+- Encode the two halves of a recursive optimisation trial (level 9's seven
+  passes, levels 7 and 8's two) on a spare thread of the encoder's budget when
+  fewer blocks than threads are in flight, such as the last blocks of a
+  stream. Output bytes are unchanged.
+
 ## 0.1.1
 
 - Decode native parser Huffman symbols with 7-Zip's `CDecoder` structure: one
