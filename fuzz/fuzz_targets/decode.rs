@@ -21,6 +21,7 @@ fn drain(reader: impl Read) {
 
 fuzz_target!(|data: &[u8]| {
     drain(bzip2_turbo::Decoder::with_threads(data, 1));
+    drain(bzip2_turbo::Decoder::with_threads(data, 4));
     drain(bzip2_turbo::read::BzDecoder::new(data));
     drain(bzip2_turbo::read::MultiBzDecoder::new(data));
     drain(bzip2_turbo::bufread::BzDecoder::new(data));
