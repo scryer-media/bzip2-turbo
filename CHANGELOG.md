@@ -51,11 +51,18 @@
 
   One pass grows the binaries by 2.3% over seven and leaves them 0.4% larger
   than `lbzip2 -9`; JSON grows by 0.01% and stays smaller than both.
+- `EncoderOptions::threads` now counts compression threads. With N above one
+  the encoder starts up to N workers as blocks arrive, and the calling thread
+  only reads input, run-length encodes it into blocks and writes the encoded
+  blocks in order; it no longer encodes blocks itself, so the encoder uses
+  N + 1 threads. This is how `Decoder::with_threads` and `lbzip2 -n N` count.
+  One thread still encodes every block on the calling thread. Output bytes
+  are unchanged.
 - Encoder scratch (sort, entropy and trial buffers) now belongs to threads:
-  each worker, the calling thread and each lent helper owns one. A block slot
-  keeps only its input and its encoded output, and up to four slots per
-  thread may be open, so workers keep running while an earlier block
-  finishes. Output bytes are unchanged.
+  each worker and each lent helper owns one, as does the calling thread of a
+  one-thread encoder. A block slot keeps only its input and its encoded
+  output, and up to four slots per worker may be open, so workers keep
+  running while an earlier block finishes. Output bytes are unchanged.
 
 ## 0.1.1
 

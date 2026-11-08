@@ -16,7 +16,7 @@ use std::{
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicIsize, Ordering},
-        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+        mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
     },
     thread::{self, JoinHandle},
 };
@@ -228,9 +228,10 @@ impl Drop for Claim<'_> {
     }
 }
 
-/// The encoding scratch a thread owns: each worker, the caller and every
-/// helper keep one, allocated on its first block. A one-element vector gives
-/// fallible allocation, and fixed Huffman arrays never move between threads.
+/// The encoding scratch a thread owns: each worker and every helper keep one,
+/// as does the caller of a serial encoder, allocated on its first block. A
+/// one-element vector gives fallible allocation, and fixed Huffman arrays
+/// never move between threads.
 fn owned_scratch(owned: &mut Vec<Scratch>) -> io::Result<&mut Scratch> {
     if owned.is_empty() {
         owned.try_reserve_exact(1).map_err(io::Error::other)?;
@@ -239,14 +240,16 @@ fn owned_scratch(owned: &mut Vec<Scratch>) -> io::Result<&mut Scratch> {
     Ok(&mut owned[0])
 }
 
-/// Open slots per thread of the budget. Slots hold only input and encoded
-/// output, so several per thread are cheap; they let workers run ahead of a
-/// slow block while the caller still delivers in input order.
+/// Open slots per worker. Slots hold only input and encoded output, so
+/// several per worker are cheap; they let workers run ahead of a slow block
+/// while the caller still delivers in input order.
 ///
-/// Memory: each thread that encodes (N workers including the caller, plus
-/// at most N lent helpers) owns one `Scratch`, whose trial output stays below
-/// 4 MiB; each of the at most 4N slots holds a block of input and that
-/// block's selected output, at most 17n/8 + 6060 bytes for n input bytes.
+/// Memory for a budget of N above one: each thread that encodes (N workers,
+/// plus at most N lent helpers while the encoder drains) owns one `Scratch`,
+/// whose trial output stays below 4 MiB; the caller owns none. Each of the at
+/// most 4N slots holds a block of input and that block's selected output, at
+/// most 17n/8 + 6060 bytes for n input bytes. A serial encoder owns one
+/// `Scratch` and one slot.
 const SLOTS_PER_THREAD: usize = 4;
 
 /// A block's selected bits and CRCs, copied out of the encoding thread's
@@ -356,63 +359,82 @@ struct Pool {
     jobs: Option<SyncSender<Job>>,
     results: Option<Receiver<Completed>>,
     input: Arc<Mutex<Receiver<Job>>>,
+    // Kept until every worker has started, to give each new worker a sender.
+    output: Option<Sender<Completed>>,
     workers: Vec<JoinHandle<()>>,
+    threads: usize,
     cancelled: Arc<AtomicBool>,
     helpers: Arc<Helpers>,
 }
 
 impl Pool {
+    /// A pool of up to `threads` workers, started by [`Self::grow`]. The
+    /// caller never encodes a block itself.
     fn new(threads: usize, slots: usize, lending: bool) -> io::Result<Self> {
         // Every open slot can wait queued, so submitting never blocks.
         let (jobs, input) = mpsc::sync_channel::<Job>(slots);
-        let input = Arc::new(Mutex::new(input));
         let (output, results) = mpsc::channel();
-        let mut pool = Self {
+        let mut workers = Vec::new();
+        workers
+            .try_reserve_exact(threads)
+            .map_err(io::Error::other)?;
+        Ok(Self {
             jobs: Some(jobs),
             results: Some(results),
-            input: input.clone(),
-            workers: Vec::new(),
+            input: Arc::new(Mutex::new(input)),
+            output: Some(output),
+            workers,
+            threads,
             cancelled: Arc::new(AtomicBool::new(false)),
             helpers: Arc::new(Helpers::new(threads, lending)),
-        };
-        pool.workers
-            .try_reserve_exact(threads - 1)
-            .map_err(io::Error::other)?;
-        for _ in 1..threads {
-            let input = input.clone();
-            let output = output.clone();
-            let cancelled = pool.cancelled.clone();
-            let worker = thread::Builder::new().spawn(move || {
-                let mut scratch = Vec::new();
-                loop {
-                    if cancelled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let job = match input.lock() {
-                        Ok(input) => input.recv(),
-                        Err(_) => break,
-                    };
-                    let Ok(job) = job else {
-                        break;
-                    };
-                    if cancelled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let completed = execute(job, &mut scratch);
-                    let failed = completed.result.is_err();
-                    if output.send(completed).is_err() || failed {
-                        break;
-                    }
-                }
-            })?;
-            // The pool already owns all earlier handles if spawning fails.
-            pool.workers.push(worker);
-        }
-        Ok(pool)
+        })
     }
 
-    fn take_job(&self) -> Option<Job> {
-        self.input.try_lock().ok()?.try_recv().ok()
+    /// Starts workers until there are `wanted`, at most the thread budget.
+    /// Workers start as blocks are submitted, so a short stream starts only
+    /// as many as it has blocks.
+    fn grow(&mut self, wanted: usize) -> io::Result<()> {
+        let wanted = wanted.min(self.threads);
+        while self.workers.len() < wanted {
+            let input = self.input.clone();
+            let Some(output) = self.output.clone() else {
+                return Err(io::Error::other("BZip2 result channel closed"));
+            };
+            let cancelled = self.cancelled.clone();
+            let worker = thread::Builder::new()
+                .name("bzip2-encode".into())
+                .spawn(move || {
+                    let mut scratch = Vec::new();
+                    loop {
+                        if cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let job = match input.lock() {
+                            Ok(input) => input.recv(),
+                            Err(_) => break,
+                        };
+                        let Ok(job) = job else {
+                            break;
+                        };
+                        if cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let completed = execute(job, &mut scratch);
+                        let failed = completed.result.is_err();
+                        if output.send(completed).is_err() || failed {
+                            break;
+                        }
+                    }
+                })?;
+            // The pool already owns all earlier handles if spawning fails.
+            self.workers.push(worker);
+        }
+        if self.workers.len() == self.threads {
+            // Once every worker holds a sender, the result channel closes
+            // when the last worker exits.
+            self.output = None;
+        }
+        Ok(())
     }
 }
 
@@ -505,7 +527,7 @@ pub struct Encoder<W: Write> {
     // Every allocated slot is exactly one of free, filling, or pending. Queued,
     // executing and completed jobs all occupy their existing pending entry.
     // At most `max_slots` are allocated: one serially, otherwise
-    // `SLOTS_PER_THREAD` per thread of the budget.
+    // `SLOTS_PER_THREAD` per worker.
     max_slots: usize,
     free: Vec<Slot>,
     filling: Option<Slot>,
@@ -513,7 +535,11 @@ pub struct Encoder<W: Write> {
     pending: VecDeque<Option<Slot>>,
     output_sequence: usize,
     pool: Option<Pool>,
-    // The caller's own scratch, for serial blocks and queued jobs it runs.
+    // One thread encodes every block on the caller. Otherwise the pool's
+    // `threads` workers encode and the caller only reads, run-length encodes,
+    // submits and writes.
+    serial: bool,
+    // The caller's own scratch, used only when serial.
     scratch: Vec<Scratch>,
     // Whether the pool may lend threads to trial halves; see `drain`.
     lending: bool,
@@ -549,7 +575,8 @@ impl<W: Write> Encoder<W> {
                 })
                 .clamp(1, 10),
         );
-        let max_slots = if options.threads == 1 {
+        let serial = options.threads == 1;
+        let max_slots = if serial {
             1
         } else {
             options.threads * SLOTS_PER_THREAD
@@ -571,6 +598,7 @@ impl<W: Write> Encoder<W> {
             pending: VecDeque::new(),
             output_sequence: 0,
             pool: None,
+            serial,
             scratch: Vec::new(),
             lending: false,
             failure: false,
@@ -700,11 +728,6 @@ impl<W: Write> Encoder<W> {
             return Ok(());
         }
         while self.pending.front().is_some_and(Option::is_none) {
-            if let Some(job) = self.pool.as_ref().unwrap().take_job() {
-                let completed = execute(job, &mut self.scratch);
-                self.store(completed)?;
-                continue;
-            }
             let completed = self
                 .pool
                 .as_ref()
@@ -762,7 +785,7 @@ impl<W: Write> Encoder<W> {
         {
             return Ok(());
         }
-        if self.options.threads == 1 {
+        if self.serial {
             // Serial blocks are written straight from the caller's trial.
             let mut slot = self.filling.take().unwrap();
             let mut owned = std::mem::take(&mut self.scratch);
@@ -799,24 +822,14 @@ impl<W: Write> Encoder<W> {
                 #[cfg(test)]
                 panic: false,
             };
-            match self
-                .pool
-                .as_ref()
-                .unwrap()
-                .jobs
+            let pool = self.pool.as_mut().unwrap();
+            // The queue holds every open slot, so it is never full here.
+            pool.jobs
                 .as_ref()
                 .unwrap()
                 .try_send(job)
-            {
-                Ok(()) => {}
-                Err(TrySendError::Full(job)) => {
-                    let completed = execute(job, &mut self.scratch);
-                    self.store(completed)?;
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    return Err(io::Error::other("BZip2 job channel closed"));
-                }
-            }
+                .map_err(|_| io::Error::other("BZip2 job channel closed"))?;
+            pool.grow(self.pending.len())?;
         }
         self.check_slots();
         Ok(())
@@ -1172,9 +1185,10 @@ mod tests {
                 assert_eq!(encoder.free.len(), encoder.allocated);
                 assert!(encoder.pending.is_empty());
             }
+            // One block at a time starts only one worker.
             assert_eq!(
                 encoder.pool.as_ref().map_or(0, |p| p.workers.len()),
-                encoder.options.threads - 1
+                usize::from(budget > 1)
             );
             let expected_slots = if budget == 1 {
                 1
@@ -1183,8 +1197,9 @@ mod tests {
             };
             assert_eq!(encoder.max_slots, expected_slots);
             // Threads own the scratch; slots keep only input and encoded
-            // output. The serial caller has encoded every block itself.
-            assert!(budget > 1 || !encoder.scratch.is_empty());
+            // output. The serial caller has encoded every block itself, and
+            // a multithreaded caller none.
+            assert_eq!(encoder.scratch.is_empty(), budget > 1);
             let scratch = scratch_capacities(&encoder.scratch);
             let slot = &encoder.free[0];
             let capacity = capacities(slot);
@@ -1202,6 +1217,53 @@ mod tests {
             assert_eq!(capacities(&encoder.free[0]), capacity);
             assert_eq!(scratch_capacities(&encoder.scratch), scratch);
             encoder.finish().unwrap();
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_budget_counts_workers_and_the_caller_encodes_no_block() {
+        // Workers start as blocks are submitted and stop at the budget; the
+        // result channel closes with the last worker once all have started.
+        let mut pool = Pool::new(4, 16, false).unwrap();
+        pool.grow(2).unwrap();
+        assert_eq!(pool.workers.len(), 2);
+        assert!(pool.output.is_some());
+        pool.grow(10).unwrap();
+        assert_eq!(pool.workers.len(), 4);
+        assert!(pool.output.is_none());
+        assert_eq!(pool.helpers.idle.load(Ordering::Acquire), 4);
+        drop(pool);
+        let input: Vec<u8> = (0..450_000u32).map(|i| (i * 7 % 253) as u8).collect();
+        let encode = |threads| {
+            let mut encoder = Encoder::new(
+                Vec::new(),
+                EncoderOptions {
+                    threads,
+                    block_size: Some(100_000),
+                    passes: Some(2),
+                    ..Default::default()
+                },
+            );
+            encoder.write_all(&input).unwrap();
+            encoder.flush().unwrap();
+            // Five blocks start at most five workers, never more than the
+            // budget, and the caller owns no scratch: it encoded nothing.
+            let workers = encoder.pool.as_ref().map_or(0, |p| p.workers.len());
+            assert!(workers >= usize::from(threads > 1), "threads={threads}");
+            assert!(workers <= threads.min(5), "threads={threads}");
+            assert_eq!(encoder.scratch.is_empty(), threads > 1);
+            let slots = if threads > 1 {
+                threads * SLOTS_PER_THREAD
+            } else {
+                1
+            };
+            assert_eq!(encoder.max_slots, slots);
+            encoder.finish().unwrap()
+        };
+        let serial = encode(1);
+        for threads in [2, 4, 16] {
+            assert!(encode(threads) == serial, "threads={threads}");
         }
     }
 
@@ -1403,7 +1465,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let pool = Pool::new(2, 2, false).unwrap();
+        let mut pool = Pool::new(2, 2, false).unwrap();
+        pool.grow(1).unwrap();
         let gate = Arc::new(std::sync::Barrier::new(2));
         let mut first = job(0, b"first owned block");
         first.gate = Some(gate.clone());
@@ -1429,16 +1492,12 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn worker_and_caller_panics_report_sequence_and_cancel_queued_slots() {
-        let pool = Pool::new(2, 2, false).unwrap();
+        let mut pool = Pool::new(2, 2, false).unwrap();
+        pool.grow(1).unwrap();
         let mut bad = job(17, b"panic block");
         bad.panic = true;
         assert!(pool.jobs.as_ref().unwrap().send(bad).is_ok());
-        let result = pool
-            .results
-            .as_ref()
-            .unwrap()
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
+        let result = pool.results.as_ref().unwrap().recv().unwrap();
         assert_eq!(result.sequence, 17);
         assert!(result.result.is_err());
         for sequence in 18..20 {

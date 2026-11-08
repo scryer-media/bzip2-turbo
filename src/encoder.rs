@@ -28,7 +28,11 @@ pub struct EncoderOptions {
     /// Compression level, clamped to zero through nine.
     /// Zero still emits compressed BZip2 data; it is not a stored-data mode.
     pub level: u32,
-    /// Thread budget including the calling thread, clamped to 1..=64.
+    /// Compression threads, clamped to 1..=64. One encodes every block on
+    /// the calling thread. N above one starts up to N worker threads, as
+    /// blocks arrive, that each encode whole blocks; the calling thread then
+    /// only reads input, run-length encodes it into blocks and writes the
+    /// encoded blocks in input order, so the encoder uses N + 1 threads.
     /// WebAssembly targets always use one thread.
     pub threads: usize,
     /// Requested block size in bytes, rounded down to a 100,000-byte step.
