@@ -224,6 +224,29 @@ impl TrialWriter {
         Ok(Choice::Whole)
     }
 
+    /// Appends another writer's output and CRCs, exactly as if they had been
+    /// written here.
+    pub(super) fn append(&mut self, other: &TrialWriter) -> io::Result<()> {
+        let output = other.output();
+        for word in output[..other.bits / 8].chunks(4) {
+            let value = word
+                .iter()
+                .fold(0u32, |value, &byte| (value << 8) | u32::from(byte));
+            self.put(value, word.len() as u8 * 8)?;
+        }
+        let partial = other.bits & 7;
+        if partial != 0 {
+            self.put(
+                u32::from(output[other.bits / 8] >> (8 - partial)),
+                partial as u8,
+            )?;
+        }
+        for &crc in other.crcs() {
+            self.commit_crc(crc)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn bit_len(&self) -> usize {
         self.bits
     }
@@ -386,6 +409,32 @@ mod tests {
                 assert_eq!(writer.output(), packed(&expected));
                 assert_eq!(writer.bits, expected.len());
                 assert_eq!(&writer.crcs[..writer.crc_count], crcs);
+            }
+        }
+    }
+
+    #[test]
+    fn appending_a_writer_matches_writing_its_bits_in_place() {
+        for alignment in 0..8 {
+            for other_len in [0, 1, 7, 8, 9, 31, 32, 33, 64, 65, 1000] {
+                let mut writer = TrialWriter::new();
+                let prefix: Vec<_> = (0..16 + alignment).map(|i| i % 3 == 1).collect();
+                write(&mut writer, &prefix);
+                writer.commit_crc(7).unwrap();
+                let mut other = TrialWriter::new();
+                let tail: Vec<_> = (0..other_len).map(|i| i % 7 < 3).collect();
+                write(&mut other, &tail);
+                other.commit_crc(8).unwrap();
+                other.commit_crc(9).unwrap();
+                writer.append(&other).unwrap();
+                let expected = [prefix, tail].concat();
+                assert_eq!(writer.output(), packed(&expected));
+                assert_eq!(writer.bits, expected.len());
+                assert_eq!(writer.crcs(), &[7, 8, 9]);
+                // Later writes continue from the appended partial byte.
+                writer.put(0b101, 3).unwrap();
+                let expected = [expected, vec![true, false, true]].concat();
+                assert_eq!(writer.output(), packed(&expected));
             }
         }
     }

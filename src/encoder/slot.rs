@@ -1,7 +1,8 @@
 //! Move-owned reusable worker slots for incremental BZip2 encoding.
 // Translation of BZip2Encoder.cpp from 7-Zip, LGPL-2.1-or-later.
 // https://github.com/ip7z/7zip/blob/9128b80e3a471108678e2b3ec3c985861c8d7b0f/CPP/7zip/Compress/BZip2Encoder.cpp
-// Changes: bounded owned slots, initialized typed storage and joined teardown.
+// Changes: bounded owned slots, initialized typed storage, joined teardown and
+// helper threads for the independent halves of a recursive trial.
 
 use super::{
     EncoderOptions, block_crc, entropy::Entropy, flag_sort::Workspace, repeated_prefix,
@@ -12,8 +13,8 @@ use std::{
     io::{self, Write},
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicIsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -74,7 +75,13 @@ impl Scratch {
     }
 
     // EncodeBlock2: alternatives share one output region and CRC prefix.
-    fn tree(&mut self, input: &[u8], passes: u32, optimize: bool) -> io::Result<()> {
+    fn tree(
+        &mut self,
+        input: &[u8],
+        passes: u32,
+        optimize: bool,
+        helpers: Option<&Helpers>,
+    ) -> io::Result<()> {
         let start = self.trial.checkpoint();
         if passes > 1 && input.len() >= 1024 {
             let mut split = input.len() / 2;
@@ -84,8 +91,11 @@ impl Scratch {
                 split += 1;
             }
             if split < input.len() {
-                self.tree(&input[..split], passes - 1, optimize)?;
-                self.tree(&input[split..], passes - 1, optimize)?;
+                let (left, right) = input.split_at(split);
+                if !self.halves(left, right, passes - 1, optimize, helpers)? {
+                    self.tree(left, passes - 1, optimize, helpers)?;
+                    self.tree(right, passes - 1, optimize, helpers)?;
+                }
                 let divided = self.trial.checkpoint();
                 let whole_start = self.trial.begin_whole(start, divided)?;
                 let crc = self.block(input, optimize)?;
@@ -95,6 +105,116 @@ impl Scratch {
         }
         let crc = self.block(input, optimize)?;
         self.trial.commit_crc(crc)
+    }
+
+    /// Encodes the right half's subtree on a spare thread while this thread
+    /// encodes the left half's, then appends the right half's selected bits
+    /// and CRCs. A subtree's selected output does not depend on the bit
+    /// alignment it starts at, and every choice compares only lengths, so the
+    /// bytes equal the serial order's. Returns false, having written nothing,
+    /// when no thread is spare.
+    fn halves(
+        &mut self,
+        left: &[u8],
+        right: &[u8],
+        passes: u32,
+        optimize: bool,
+        helpers: Option<&Helpers>,
+    ) -> io::Result<bool> {
+        if right.len() < MIN_HELPED_INPUT {
+            return Ok(false);
+        }
+        let Some(mut claim) = helpers.and_then(Helpers::claim) else {
+            return Ok(false);
+        };
+        let helper = &mut claim.scratch[0];
+        helper.trial.reset();
+        let joined = thread::scope(|scope| {
+            let task = thread::Builder::new()
+                .name("bzip2-encode-half".into())
+                .spawn_scoped(scope, || helper.tree(right, passes, optimize, helpers))
+                .ok()?;
+            let left = self.tree(left, passes, optimize, helpers);
+            Some((left, task.join()))
+        });
+        let Some((left, right)) = joined else {
+            return Ok(false);
+        };
+        left?;
+        right.unwrap_or_else(|payload| resume_unwind(payload))?;
+        self.trial.append(&claim.scratch[0].trial)?;
+        Ok(true)
+    }
+}
+
+/// Inputs below this size are never split across threads.
+const MIN_HELPED_INPUT: usize = 1 << 15;
+
+/// Threads of an encoder's budget that are not encoding a block, lent to the
+/// halves of recursive trials.
+struct Helpers {
+    /// The budget minus executing block jobs and running helpers. A block job
+    /// that starts while every thread helps may take it below zero briefly.
+    idle: AtomicIsize,
+    /// Reusable helper scratch, at most one per thread of the budget.
+    spare: Mutex<Vec<Vec<Scratch>>>,
+}
+
+impl Helpers {
+    fn new(threads: usize) -> Self {
+        Self {
+            idle: AtomicIsize::new(threads as isize),
+            spare: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn claim(&self) -> Option<Claim<'_>> {
+        self.idle
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |idle| {
+                (idle > 0).then(|| idle - 1)
+            })
+            .ok()?;
+        let spare = self
+            .spare
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let scratch = match spare {
+            Some(scratch) => scratch,
+            None => {
+                let mut scratch = Vec::new();
+                if scratch.try_reserve_exact(1).is_err() {
+                    self.idle.fetch_add(1, Ordering::AcqRel);
+                    return None;
+                }
+                scratch.push(Scratch::new());
+                scratch
+            }
+        };
+        Some(Claim {
+            helpers: self,
+            scratch,
+        })
+    }
+}
+
+/// One lent thread and its scratch; dropping it returns both.
+struct Claim<'a> {
+    helpers: &'a Helpers,
+    scratch: Vec<Scratch>,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        // Scratch interrupted by a panic is discarded rather than reused.
+        if !thread::panicking() {
+            self.helpers
+                .spare
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(std::mem::take(&mut self.scratch));
+        }
+        self.helpers.idle.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -117,10 +237,10 @@ impl Slot {
         Ok(Self { input, scratch })
     }
 
-    fn encode(&mut self, passes: u32) -> io::Result<()> {
+    fn encode(&mut self, passes: u32, helpers: Option<&Helpers>) -> io::Result<()> {
         let scratch = &mut self.scratch[0];
         scratch.trial.reset();
-        scratch.tree(&self.input, passes, passes > 1)
+        scratch.tree(&self.input, passes, passes > 1, helpers)
     }
 }
 
@@ -128,6 +248,7 @@ struct Job {
     sequence: usize,
     slot: Slot,
     passes: u32,
+    helpers: Option<Arc<Helpers>>,
     #[cfg(test)]
     gate: Option<Arc<std::sync::Barrier>>,
     #[cfg(test)]
@@ -141,6 +262,10 @@ struct Completed {
 }
 
 fn execute(mut job: Job) -> Completed {
+    let helpers = job.helpers.take();
+    if let Some(helpers) = &helpers {
+        helpers.idle.fetch_sub(1, Ordering::AcqRel);
+    }
     let result = catch_unwind(AssertUnwindSafe(|| {
         #[cfg(test)]
         if let Some(gate) = &job.gate {
@@ -148,9 +273,12 @@ fn execute(mut job: Job) -> Completed {
         }
         #[cfg(test)]
         assert!(!job.panic, "injected encoder job panic");
-        job.slot.encode(job.passes)
+        job.slot.encode(job.passes, helpers.as_deref())
     }))
     .unwrap_or_else(|_| Err(io::Error::other("BZip2 worker panicked")));
+    if let Some(helpers) = &helpers {
+        helpers.idle.fetch_add(1, Ordering::AcqRel);
+    }
     Completed {
         sequence: job.sequence,
         slot: job.slot,
@@ -164,6 +292,7 @@ struct Pool {
     input: Arc<Mutex<Receiver<Job>>>,
     workers: Vec<JoinHandle<()>>,
     cancelled: Arc<AtomicBool>,
+    helpers: Arc<Helpers>,
 }
 
 impl Pool {
@@ -177,6 +306,7 @@ impl Pool {
             input: input.clone(),
             workers: Vec::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            helpers: Arc::new(Helpers::new(threads)),
         };
         pool.workers
             .try_reserve_exact(threads - 1)
@@ -548,7 +678,7 @@ impl<W: Write> Encoder<W> {
         }
         if self.options.threads == 1 {
             let mut slot = self.filling.take().unwrap();
-            slot.encode(self.options.passes.unwrap())?;
+            slot.encode(self.options.passes.unwrap(), None)?;
             self.accept(slot)?;
         } else {
             if self.pool.is_none() {
@@ -564,6 +694,7 @@ impl<W: Write> Encoder<W> {
                 sequence,
                 slot,
                 passes: self.options.passes.unwrap(),
+                helpers: Some(Arc::clone(&self.pool.as_ref().unwrap().helpers)),
                 #[cfg(test)]
                 gate: None,
                 #[cfg(test)]
@@ -985,6 +1116,84 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn helped_trials_match_serial_trials_byte_for_byte() {
+        let mut state = 0x2545_f491u32;
+        let mut noise = |len: usize, alphabet: u32| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    (state % alphabet) as u8
+                })
+                .collect()
+        };
+        let text: Vec<u8> = b"{\"id\": 17, \"name\": \"bzip2\", \"tags\": [\"a\", \"bb\"]}\n"
+            .iter()
+            .copied()
+            .cycle()
+            .take(400_000)
+            .zip(noise(400_000, 3))
+            .map(|(byte, jitter)| byte.wrapping_add(jitter * (byte & 1)))
+            .collect();
+        let inputs = [
+            noise(899_999, 256),
+            noise(300_000, 4),
+            text,
+            noise(70_000, 50),
+            noise(5_000, 9),
+        ];
+        let mut serial = Scratch::new();
+        for (index, input) in inputs.iter().enumerate() {
+            let passes: &[u32] = if index == 3 { &[2, 3, 10] } else { &[2, 7] };
+            for &passes in passes {
+                for threads in [2, 16] {
+                    let helpers = Helpers::new(threads);
+                    serial.trial.reset();
+                    serial.tree(input, passes, true, None).unwrap();
+                    let mut helped = Scratch::new();
+                    helped.tree(input, passes, true, Some(&helpers)).unwrap();
+                    let label = format!("len={},passes={passes},threads={threads}", input.len());
+                    assert!(helped.trial.output() == serial.trial.output(), "{label}");
+                    assert_eq!(helped.trial.bit_len(), serial.trial.bit_len(), "{label}");
+                    assert_eq!(helped.trial.crcs(), serial.trial.crcs(), "{label}");
+                    // Every lent thread came back, and halves large enough
+                    // to split did run on helpers.
+                    assert_eq!(helpers.idle.load(Ordering::Acquire), threads as isize);
+                    let spare = helpers.spare.lock().unwrap().len();
+                    assert!(spare <= threads, "{label}");
+                    assert_eq!(spare > 0, input.len() >= 2 * MIN_HELPED_INPUT, "{label}");
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_helper_panic_fails_the_block_and_returns_the_thread() {
+        let helpers = Arc::new(Helpers::new(4));
+        let mut slot = job(0, &[0u8; 4]).slot;
+        slot.input.clear();
+        // A helped block encodes and returns every lent thread.
+        slot.input.extend((0..100_000u32).map(|i| (i % 251) as u8));
+        let mut good = Job {
+            helpers: Some(Arc::clone(&helpers)),
+            passes: 7,
+            ..job(1, &[])
+        };
+        good.slot = slot;
+        let completed = execute(good);
+        assert!(completed.result.is_ok());
+        assert_eq!(helpers.idle.load(Ordering::Acquire), 4);
+        let mut bad = job(2, b"panicking block");
+        bad.helpers = Some(Arc::clone(&helpers));
+        bad.panic = true;
+        assert!(execute(bad).result.is_err());
+        assert_eq!(helpers.idle.load(Ordering::Acquire), 4);
+    }
+
     fn job(sequence: usize, input: &[u8]) -> Job {
         let mut slot = Slot::new(100000).unwrap();
         slot.input.extend_from_slice(input);
@@ -992,6 +1201,7 @@ mod tests {
             sequence,
             slot,
             passes: 1,
+            helpers: None,
             gate: None,
             panic: false,
         }
@@ -1176,7 +1386,7 @@ mod tests {
     fn retirement_overflow_is_a_sticky_error_without_writing_the_slot() {
         let mut encoder = Encoder::new(Vec::new(), EncoderOptions::default());
         let mut slot = job(0, b"retirement overflow block").slot;
-        slot.encode(1).unwrap();
+        slot.encode(1, None).unwrap();
         encoder.allocated = 1;
         encoder.pending.push_back(Some(slot));
         encoder.output_sequence = usize::MAX;
