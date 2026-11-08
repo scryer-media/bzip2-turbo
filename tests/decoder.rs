@@ -500,10 +500,9 @@ fn parser_error_after_queued_blocks_delivers_their_output_first() {
     assert!(blocks.len() >= 5);
     let prefix = blocks[0] + blocks[1];
     let mut corrupt = encoded.clone();
-    // Break the third block's marker. With two threads the parser reaches it
-    // only after Finished for the first block (at most two blocks are in
-    // flight), so only the second block is in flight when the error is hit;
-    // its output must still be delivered before the error.
+    // Break the third block's marker. Whether serial or on workers, the first
+    // two blocks decode and the error is found where the third should start;
+    // their output must still be delivered before the error.
     let bit = after_block_magic(&corrupt, 3) - 1;
     flip_bit(&mut corrupt, bit);
     for threads in [1, 2, 4] {

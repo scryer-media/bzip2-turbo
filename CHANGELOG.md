@@ -54,8 +54,8 @@
 - `EncoderOptions::threads` now counts compression threads. With N above one
   the encoder starts up to N workers as blocks arrive, and the calling thread
   only reads input, run-length encodes it into blocks and writes the encoded
-  blocks in order; it no longer encodes blocks itself, so the encoder uses
-  N + 1 threads. This is how `Decoder::with_threads` and `lbzip2 -n N` count.
+  blocks in order; it no longer encodes blocks itself, so at most N threads
+  encode at once. This is how `Decoder::with_threads` and `lbzip2 -n N` count.
   One thread still encodes every block on the calling thread. Output bytes
   are unchanged.
 - Encoder scratch (sort, entropy and trial buffers) now belongs to threads:

@@ -131,10 +131,9 @@ the source identity root. No tools are built or downloaded automatically.
 `--list` prints the matrix without requiring tools. Corpora are deterministic
 text, random, periodic and runs. Compatibility turbo is serial and skipped for
 thread counts above one. Native scenarios above two threads time encoding
-only. That cap dates from 0.1, whose native decoder used at most two threads
-(parser and one reconstruction worker); the 0.2 decoder runs N block workers,
-so the cap is now the harness's, not the decoder's. Their decode mode, for turbo and 7zz
-alike, is listed in `Skipped` with `"mode": "decode"`. Every encoder's stream is
+only; that cap is the harness's, left from 0.1, whose native decoder used at
+most two threads (the 0.2 decoder runs N block workers). Their decode mode,
+for turbo and 7zz alike, is listed in `Skipped` with `"mode": "decode"`. Every encoder's stream is
 still cross-decoded by every decoder at the scenario's thread count before
 timing. Pure Rust and C references always run one real thread;
 `reference_threads` records this even when native turbo and 7zz use more threads.

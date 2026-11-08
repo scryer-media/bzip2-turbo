@@ -32,7 +32,9 @@ pub struct EncoderOptions {
     /// the calling thread. N above one starts up to N worker threads, as
     /// blocks arrive, that each encode whole blocks; the calling thread then
     /// only reads input, run-length encodes it into blocks and writes the
-    /// encoded blocks in input order, so the encoder uses N + 1 threads.
+    /// encoded blocks in input order. At most N threads encode at once:
+    /// while the encoder drains its last blocks, budget no block is using
+    /// encodes the halves of recursive trials on short-lived helper threads.
     /// WebAssembly targets always use one thread.
     pub threads: usize,
     /// Requested block size in bytes, rounded down to a 100,000-byte step.

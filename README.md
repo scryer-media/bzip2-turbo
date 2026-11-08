@@ -10,10 +10,10 @@ blocks per worker in flight, while the calling thread reads input, run-length
 encodes it into blocks and writes the encoded blocks in input order. Decoding
 runs N block workers while the calling thread finds block boundaries and
 delivers output in order. One thread encodes or decodes on the calling
-thread alone. The native
-encoder reproduces 7-Zip's bytes for matching settings; compressed bytes can
-differ from libbz2. The crate documentation lists every behavioral
-difference from the `bzip2` crate.
+thread alone. The native encoder reproduces 7-Zip's bytes for matching
+settings (7-Zip's level 9 is `passes: Some(7)`); compressed bytes can differ
+from libbz2. The crate documentation lists every behavioral difference from
+the `bzip2` crate.
 
 ## Usage
 
@@ -83,16 +83,9 @@ Encoding, level 9 (one pass, the default), against `lbzip2 -9`:
 
 A recheck of the binaries at 8 and 16 threads with eleven runs gave 0.39 s
 for both at 8 threads, and 0.23 s against lbzip2's 0.21 s at 16. Peak RSS at
-16 threads on the binaries is 238 MB against lbzip2's 136 MB.
-
-Encoding, level 1, against `lbzip2 -1`:
-
-| Seconds | 1T | 2T | 4T | 8T | 16T |
-|---|---:|---:|---:|---:|---:|
-| JSON, bzip2-turbo | **5.94** | **2.98** | **1.56** | **0.85** | **0.52** |
-| JSON, lbzip2 | 7.90 | 3.96 | 2.07 | 1.07 | 0.64 |
-| Binaries, bzip2-turbo | **2.85** | **1.41** | **0.75** | **0.40** | **0.24** |
-| Binaries, lbzip2 | 3.07 | 1.54 | 0.81 | 0.42 | 0.26 |
+16 threads on the binaries is 238 MB against lbzip2's 136 MB. At level 1
+against `lbzip2 -1`, bzip2-turbo is 19 to 25% faster on the JSON and 5 to 8%
+faster on the binaries at every thread count.
 
 More passes (`passes: Some(2)` or more) also run 7-Zip's Huffman table
 optimisation, which is several times slower; those timings were not
