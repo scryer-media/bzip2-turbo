@@ -82,15 +82,15 @@ fn compact_budget_factories_keep_callbacks_bytes_and_repeated_eof() {
     };
     assert_eq!(Decoder::<&[u8]>::low_memory_usage(1), serial << 20);
     // Eight workers: per worker a 4 MiB TT, a last column (one 2 MiB page on
-    // Linux), 1 MiB of entropy scratch and one 1 MiB output chunk; 16 open
-    // blocks of at most 3 MiB output; a read window of 18 lookaheads of
+    // Linux), 1 MiB of entropy scratch and one 1 MiB output chunk; 32 open
+    // blocks of at most 3 MiB output; a read window of 34 lookaheads of
     // 1.25 MiB and two input chunks, eight job windows of 1.25 + 2 MiB and the
     // caller's output chunk.
     let column = if serial == 8 { 2 } else { 1 };
     let parallel = if cfg!(target_family = "wasm") {
         serial << 20
     } else {
-        ((8 * (6 + column) + 48 + 1) << 20) + (18 + 8) * 1_310_720 + (2 + 16) * (1 << 20)
+        ((8 * (6 + column) + 96 + 1) << 20) + (34 + 8) * 1_310_720 + (2 + 16) * (1 << 20)
     };
     assert_eq!(Decoder::<&[u8]>::low_memory_usage(8), parallel);
     // The bound grows linearly with the budget and stops at 64 workers.
@@ -591,7 +591,7 @@ fn worker_reconstructs_the_queued_successor_while_the_caller_waits() {
             while observed.load(Ordering::SeqCst) < target && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            // Up to twice the budget of blocks may be decoded ahead.
+            // Up to four times the budget of blocks may be decoded ahead.
             assert!(
                 observed.load(Ordering::SeqCst) >= target,
                 "the second block was not reconstructed ahead of the caller"
