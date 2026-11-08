@@ -215,7 +215,6 @@ impl<W: Write> Encoder<W> {
             options
                 .passes
                 .unwrap_or(match options.level {
-                    9 => 7,
                     7 | 8 => 2,
                     _ => 1,
                 })

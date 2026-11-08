@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.2.0
+
+- Decode with every thread of the budget. `Decoder::with_threads(reader, N)`
+  with N above one now runs N block workers (budgets clamp to 1..=64;
+  WebAssembly stays single-threaded) instead of at most one reconstruction
+  worker. The calling thread reads input in 1 MiB chunks and scans every bit
+  offset for the block magic; workers decode each candidate speculatively
+  (entropy decode, inverse BWT, output), and an in-order chain keeps a
+  candidate only where the previous block, stream trailer and any next stream
+  header end, discarding magics that occur inside block data. Output order,
+  concatenated streams, randomised blocks, block and stream CRCs and the
+  error-not-panic behaviour are unchanged.
+- Bound multithreaded decoder memory by the budget: N workers, at most 2N open
+  blocks holding at most 2 MiB of undelivered output each, and input read no
+  further than a fixed window past the oldest block still needed.
+  `memory_usage` and `low_memory_usage` grow linearly with N and report this
+  bound; multithreaded workers use the compact inverse-BWT table on every
+  platform, so on macOS ARM64 `memory_usage(N)` equals `low_memory_usage(N)`
+  for N above one. A block encoded beyond a worker's 1.25 MiB lookahead, which
+  ordinary encoders never produce, is decoded serially from there on. At
+  N = 16 on macOS ARM64 the bound is 305.5 MiB.
+- With an output callback and several threads, workers call it one chunk at a
+  time in stream order. Dropping or `into_inner` cancels and joins every
+  worker.
+- Encode the two halves of a recursive optimisation trial (two passes by
+  default at levels 7 and 8, or any explicit `passes` above one) on a spare
+  thread of the encoder's budget while the encoder drains its last blocks
+  (`finish`, `flush`, `flush_block`) and fewer blocks than threads are in
+  flight. Output bytes are unchanged.
+- Sort each block's rotations with a cyclic induced sorter (SA-IS class,
+  written for rotations: no sentinel and no doubled input). A block is
+  primitive when it is not a repetition of a shorter string; a primitive
+  block has exactly one rotation order, so the BWT and origin, and therefore
+  the output bytes, equal the previous sorter's. Blocks below 2,048 bytes and
+  repetitions keep the previous sorter. The two sorters share one buffer, so
+  sort memory is the larger of their needs: at a 900,000-byte block about
+  7.5 MB on macOS ARM64 and 8.1 MB elsewhere.
+- Level 9 now runs one optimisation pass by default instead of seven, so its
+  default output equals level 5's. Any pass count above one also runs 7-Zip's
+  Huffman table optimisation, which made level 9 about four times slower than
+  `lbzip2 -9`. `EncoderOptions { passes: Some(7), .. }` keeps the previous
+  level-9 output, which is 7-Zip's level 9 byte for byte; the new default
+  matches 7-Zip's `-mx=9 -mpass=1`. Measured on an Apple M5 Max:
+
+  | Bytes | 1 pass (new default) | 2 passes | 7 passes (old default) | `lbzip2 -9` | `bzip2 -9` |
+  |---|---:|---:|---:|---:|---:|
+  | 256 MiB JSON | 37,924,470 | 37,919,682 | 37,919,682 | 38,092,338 | 37,924,937 |
+  | 96 MiB build binaries | 40,497,139 | 40,146,131 | 39,575,538 | 40,326,306 | 40,499,587 |
+
+  One pass grows the binaries by 2.3% over seven and leaves them 0.4% larger
+  than `lbzip2 -9`; JSON grows by 0.01% and stays smaller than both.
+- `EncoderOptions::threads` now counts compression threads. With N above one
+  the encoder starts up to N workers as blocks arrive, and the calling thread
+  only reads input, run-length encodes it into blocks and writes the encoded
+  blocks in order; it no longer encodes blocks itself, so at most N threads
+  encode at once. This is how `Decoder::with_threads` and `lbzip2 -n N` count.
+  One thread still encodes every block on the calling thread. Output bytes
+  are unchanged.
+- Encoder scratch (sort, entropy and trial buffers) now belongs to threads:
+  each worker and each lent helper owns one, as does the calling thread of a
+  one-thread encoder. A block slot keeps only its input and its encoded
+  output, and up to four slots per worker may be open, so workers keep
+  running while an earlier block finishes. Output bytes are unchanged.
+
 ## 0.1.1
 
 - Decode native parser Huffman symbols with 7-Zip's `CDecoder` structure: one

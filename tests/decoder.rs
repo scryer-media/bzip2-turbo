@@ -81,12 +81,35 @@ fn compact_budget_factories_keep_callbacks_bytes_and_repeated_eof() {
         6
     };
     assert_eq!(Decoder::<&[u8]>::low_memory_usage(1), serial << 20);
+    // Eight workers: per worker a 4 MiB TT, a last column (one 2 MiB page on
+    // Linux), 1 MiB of entropy scratch and one 1 MiB output chunk; 16 open
+    // blocks of at most 3 MiB output; a read window of 18 lookaheads of
+    // 1.25 MiB and two input chunks, eight job windows of 1.25 + 2 MiB and the
+    // caller's output chunk.
+    let column = if serial == 8 { 2 } else { 1 };
     let parallel = if cfg!(target_family = "wasm") {
-        serial
+        serial << 20
     } else {
-        12
+        ((8 * (6 + column) + 48 + 1) << 20) + (18 + 8) * 1_310_720 + (2 + 16) * (1 << 20)
     };
-    assert_eq!(Decoder::<&[u8]>::low_memory_usage(8), parallel << 20);
+    assert_eq!(Decoder::<&[u8]>::low_memory_usage(8), parallel);
+    // The bound grows linearly with the budget and stops at 64 workers.
+    if !cfg!(target_family = "wasm") {
+        let step = Decoder::<&[u8]>::low_memory_usage(3) - Decoder::<&[u8]>::low_memory_usage(2);
+        assert_eq!(
+            Decoder::<&[u8]>::low_memory_usage(10) - Decoder::<&[u8]>::low_memory_usage(2),
+            8 * step
+        );
+        assert_eq!(
+            Decoder::<&[u8]>::low_memory_usage(65),
+            Decoder::<&[u8]>::low_memory_usage(64)
+        );
+        // Multithreaded workers use compact words on every platform.
+        assert_eq!(
+            Decoder::<&[u8]>::memory_usage(8),
+            Decoder::<&[u8]>::low_memory_usage(8)
+        );
+    }
     let expected = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         10
     } else {
@@ -293,7 +316,7 @@ fn single_stream_mode_ignores_padding_but_validates_the_stream_crc() {
 }
 
 #[test]
-fn many_small_blocks_share_one_worker_and_teardown_on_error_or_drop() {
+fn many_small_blocks_are_observed_on_workers_and_teardown_on_error_or_drop() {
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -322,7 +345,9 @@ fn many_small_blocks_share_one_worker_and_teardown_on_error_or_drop() {
     assert_eq!(decoded, data);
     assert_eq!(observed.0, data);
     assert!(observed.1.len() > 12);
-    assert!(observed.1.iter().all(|id| *id == observed.1[0]));
+    // Workers run the callback, one call at a time, never the caller.
+    let caller = std::thread::current().id();
+    assert!(observed.1.iter().all(|id| *id != caller));
     drop(observed);
     struct Owned(Arc<AtomicBool>);
     impl Drop for Owned {
@@ -475,10 +500,9 @@ fn parser_error_after_queued_blocks_delivers_their_output_first() {
     assert!(blocks.len() >= 5);
     let prefix = blocks[0] + blocks[1];
     let mut corrupt = encoded.clone();
-    // Break the third block's marker. With two threads the parser reaches it
-    // only after Finished for the first block (at most two blocks are in
-    // flight), so only the second block is in flight when the error is hit;
-    // its output must still be delivered before the error.
+    // Break the third block's marker. Whether serial or on workers, the first
+    // two blocks decode and the error is found where the third should start;
+    // their output must still be delivered before the error.
     let bit = after_block_magic(&corrupt, 3) - 1;
     flip_bit(&mut corrupt, bit);
     for threads in [1, 2, 4] {
@@ -566,9 +590,9 @@ fn worker_reconstructs_the_queued_successor_while_the_caller_waits() {
             while observed.load(Ordering::SeqCst) < target && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            assert_eq!(
-                observed.load(Ordering::SeqCst),
-                target,
+            // Up to twice the budget of blocks may be decoded ahead.
+            assert!(
+                observed.load(Ordering::SeqCst) >= target,
                 "the second block was not reconstructed ahead of the caller"
             );
             drop(decoder);

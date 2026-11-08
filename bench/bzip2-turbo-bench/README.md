@@ -9,7 +9,8 @@ hardware, revision, profile, darwin-resources and require-parity options.
 Platform identity values use Go OS/architecture names. These legacy commands
 keep their candidate/reference ratio direction; four-contender reports use
 reference/ours. `legacy-compare` checks bytes at 1, 2, 4 and 8 threads but
-times decoding only at 1 and 2, the thread counts the native decoder can use.
+times decoding only at 1 and 2, the thread counts the 0.1 native decoder could
+use; the 0.2 decoder runs N block workers, so this is now a harness limit.
 All raw outputs stay outside the checkout.
 Four contenders run in rotating order: 7zz, turbo, Rust bzip2 with its pure Rust
 backend, and Rust bzip2 with its C backend. Every encoded output is decoded by
@@ -129,10 +130,10 @@ See the reference-build README for explicit equivalent environment overrides.
 the source identity root. No tools are built or downloaded automatically.
 `--list` prints the matrix without requiring tools. Corpora are deterministic
 text, random, periodic and runs. Compatibility turbo is serial and skipped for
-thread counts above one. Native decoding uses at most two threads (parser and
-one reconstruction worker, `Decoder::with_mode`'s clamp), so native scenarios
-above two threads time encoding only; their decode mode, for turbo and 7zz
-alike, is listed in `Skipped` with `"mode": "decode"`. Every encoder's stream is
+thread counts above one. Native scenarios above two threads time encoding
+only; that cap is the harness's, left from 0.1, whose native decoder used at
+most two threads (the 0.2 decoder runs N block workers). Their decode mode,
+for turbo and 7zz alike, is listed in `Skipped` with `"mode": "decode"`. Every encoder's stream is
 still cross-decoded by every decoder at the scenario's thread count before
 timing. Pure Rust and C references always run one real thread;
 `reference_threads` records this even when native turbo and 7zz use more threads.
@@ -147,7 +148,9 @@ Matching block/pass counts do not make the encoders' algorithms identical.
 Optional `--settings sevenzip-level` retains historical native 7zip defaults.
 For example native level 5 uses a 900,000-byte block while standard bzip2 level 5
 uses 500,000; native level 9 uses seven recursive optimization passes while the
-standard pipeline uses one. These rows explicitly report each contender's
+standard pipeline uses one. Turbo's own level 9 default has been one pass since
+0.2, so the harness passes seven to turbo explicitly at level 9. These rows
+explicitly report each contender's
 `block_bytes`, `optimization_passes`, policy and whether block/pass counts match.
 Compatibility turbo always uses standard block sizing and one pass, and 7zz is
 aligned to it even under the historical setting policy. Such historical rows

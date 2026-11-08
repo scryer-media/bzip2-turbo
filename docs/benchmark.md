@@ -1,5 +1,13 @@
 # Benchmark details
 
+> **Version note.** These are older results for 0.1 (source `f6cb7d2`),
+> measured on Linux Graviton3 and Intel Xeon hosts, not on the hardware behind
+> the README's 0.2 tables. They describe 0.1's behaviour: a native decoder of
+> at most two threads, and an encoder whose thread budget included the calling
+> thread. In 0.2 the decoder runs N block workers, the encoder's `threads`
+> counts compression workers, and level 9 defaults to one pass. These tables
+> use explicit one-pass settings and have not been re-measured for 0.2.
+
 Measured 2026-11-05 from the current signed source. Each host contains 60 settings: five fixtures, levels 1/5/9 and requested budgets 1/2/4/8. All engines use `level × 100,000`-byte blocks. Native turbo and 7zz use one optimization pass; the serial Rust/C references do not expose that pass option. All four encoders were cross-decoded by all four decoders before timing; native turbo/7zz encoded bytes matched. Every timed decoder reads the same 7zz stream. Four balanced measured rounds follow one warmup. Rates use actual original input bytes and per-fixture median wall seconds; MiB is 1,048,576 bytes.
 
 At approximately 22:48 UTC, the scheduled shutdown timer on each task host was extended while its suite continued. This small administrative event is recorded in the evidence. All measured samples are retained; no codec run was restarted, filtered or rerun. Source, commands and codec settings were unchanged.

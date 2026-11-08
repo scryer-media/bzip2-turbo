@@ -27,7 +27,7 @@ fn empty_stream_has_the_canonical_bytes() {
 }
 
 #[test]
-fn default_options_match_reference_default_and_differ_from_level_nine() {
+fn default_options_match_reference_default_and_level_nine_but_not_level_eight() {
     let mut input = b"one stream has regions with different symbol statistics.\n".repeat(2048);
     let mut state = 0x12345678u32;
     for _ in 0..65536 {
@@ -42,13 +42,20 @@ fn default_options_match_reference_default_and_differ_from_level_nine() {
         encoder.finish().unwrap()
     };
     let actual = encode(EncoderOptions::default());
-    let high = encode(EncoderOptions {
+    // Levels five and nine share the 900,000-byte block and one pass; level
+    // eight's two passes must change this fixture's bytes.
+    let nine = encode(EncoderOptions {
         level: 9,
         ..Default::default()
     });
+    assert!(actual == nine, "level nine's default must be one pass");
+    let eight = encode(EncoderOptions {
+        level: 8,
+        ..Default::default()
+    });
     assert!(
-        actual != high,
-        "fixture must distinguish one-pass and seven-pass defaults"
+        actual != eight,
+        "fixture must distinguish one-pass and two-pass defaults"
     );
     let executable = std::env::var_os("BZIP2_TURBO_7ZZ").unwrap_or_else(|| "7zz".into());
     let mut child = Command::new(executable)

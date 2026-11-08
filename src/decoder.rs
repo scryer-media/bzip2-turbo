@@ -4,9 +4,7 @@
 //! Modified: safe Rust ownership, standard I/O, and bounded reconstruction jobs.
 use super::tt_storage::TtBuffer;
 use std::io::{self, Read};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -19,6 +17,10 @@ struct Bits<R> {
     end: usize,
     bits: u64,
     count: u32,
+    // Bytes returned before the reader's; a multithreaded decoder hands its
+    // buffered input to the serial parser here.
+    replay: Vec<u8>,
+    replayed: usize,
 }
 impl<R: Read> Bits<R> {
     fn new(reader: R) -> Self {
@@ -29,9 +31,40 @@ impl<R: Read> Bits<R> {
             end: 0,
             bits: 0,
             count: 0,
+            replay: Vec::new(),
+            replayed: 0,
         }
     }
+    /// Starts over on a new reader, keeping the buffer allocation.
+    fn reset(&mut self, reader: R) {
+        self.reader = reader;
+        self.pos = 0;
+        self.end = 0;
+        self.bits = 0;
+        self.count = 0;
+        self.replay = Vec::new();
+        self.replayed = 0;
+    }
+    /// Returns `bytes` before any further reader bytes. Only valid with
+    /// nothing buffered.
+    fn replay(&mut self, bytes: Vec<u8>) {
+        debug_assert!(self.pos == self.end && self.count == 0 && self.replay.is_empty());
+        self.replay = bytes;
+        self.replayed = 0;
+    }
     fn byte(&mut self) -> io::Result<Option<u8>> {
+        if self.pos == self.end && self.replayed < self.replay.len() {
+            let count = (self.replay.len() - self.replayed).min(self.buffer.len());
+            self.buffer[..count]
+                .copy_from_slice(&self.replay[self.replayed..self.replayed + count]);
+            self.replayed += count;
+            if self.replayed == self.replay.len() {
+                self.replay = Vec::new();
+                self.replayed = 0;
+            }
+            self.pos = 0;
+            self.end = count;
+        }
         if self.pos == self.end {
             self.end = loop {
                 match self.reader.read(self.buffer.as_mut_slice()) {
@@ -703,12 +736,11 @@ struct Block {
     crc: u32,
 }
 
-/// Last-column owners a decoder ever creates. CDecoder keeps the column inside
-/// its single `_counters` allocation. Here a single-threaded decoder holds one
-/// column, and returns it as soon as its TT is built. A pipelined decoder parses
-/// only while fewer than two blocks are in flight, and each submitted block's
-/// column returns with its Finished message, so at most two exist.
-const COLUMN_OWNERS: usize = 2;
+/// Last-column owners a serial parser ever creates. CDecoder keeps the column
+/// inside its single `_counters` allocation. Here a single-threaded decoder holds
+/// one column, and returns it as soon as its TT is built. Multithreaded decoding
+/// gives each worker its own column instead.
+const COLUMN_OWNERS: usize = 1;
 
 // Owners are created lazily and reused for every later block and stream.
 #[derive(Default)]
@@ -768,30 +800,18 @@ impl<R: Read> Parser<R> {
         }
     }
     fn header(&mut self, first: bool) -> io::Result<bool> {
-        self.bits.align();
-        let byte = if self.bits.count >= 8 {
-            Some(self.bits.take(8)? as u8)
-        } else {
-            self.bits.byte()?
-        };
-        let Some(byte) = byte else {
-            if first {
-                return Err(invalid("missing BZip2 header"));
-            }
+        let Some(limit) = read_stream_header(&mut self.bits, first)? else {
             return Ok(false);
         };
-        if byte != b'B' || self.bits.take(16)? != u32::from_be_bytes([0, 0, b'Z', b'h']) {
-            return Err(invalid("invalid BZip2 header"));
-        }
-        let digit = self.bits.take(8)?;
-        if !(49..=57).contains(&digit) {
-            return Err(invalid("invalid BZip2 block size"));
-        }
-        self.limit = (digit as usize - 48) * 100_000;
+        self.limit = limit;
         self.combined = 0;
         self.started = true;
         Ok(true)
     }
+    // Keep the entropy loop in its own frame, as before `next_output` lost its
+    // pipelined worker path. Inlined there, a single-thread decode retired 3
+    // to 4% more instructions.
+    #[inline(never)]
     fn next(&mut self) -> io::Result<Option<Block>> {
         if self.finished {
             return Ok(None);
@@ -801,7 +821,7 @@ impl<R: Read> Parser<R> {
         }
         loop {
             let magic = (u64::from(self.bits.take(24)?) << 24) | u64::from(self.bits.take(24)?);
-            if magic == 0x177245385090 {
+            if magic == STREAM_END_MAGIC {
                 if self.bits.take(32)? != self.combined {
                     return Err(invalid("BZip2 combined CRC mismatch"));
                 }
@@ -816,213 +836,258 @@ impl<R: Read> Parser<R> {
                 }
                 continue;
             }
-            if magic != 0x314159265359 {
+            if magic != BLOCK_MAGIC {
                 return Err(invalid("invalid BZip2 block marker"));
             }
-            let crc = self.bits.take(32)?;
-            let randomized = self.bits.take(1)? != 0;
-            let origin = self.bits.take(24)? as usize;
-            let groups = self.bits.take(16)?;
-            let alphabet = &mut self.workspace.alphabet;
-            alphabet.clear();
-            alphabet.reserve_exact(256);
-            for group in 0..16 {
-                if groups & (1 << (15 - group)) != 0 {
-                    let mask = self.bits.take(16)?;
-                    for low in 0..16 {
-                        if mask & (1 << (15 - low)) != 0 {
-                            alphabet.push((group * 16 + low) as u8);
-                        }
-                    }
-                }
-            }
-            if alphabet.is_empty() {
-                return Err(invalid("empty BZip2 alphabet"));
-            }
-            let alphabet_size = alphabet.len() + 2;
-            let table_count = self.bits.take(3)? as usize;
-            let selector_count = self.bits.take(15)? as usize;
-            if !(2..=6).contains(&table_count) || selector_count == 0 {
-                return Err(invalid("invalid BZip2 Huffman groups"));
-            }
-            let mut selector_mtf = [0u8, 1, 2, 3, 4, 5];
-            let selectors = &mut self.workspace.selectors;
-            selectors.clear();
-            selectors.reserve_exact(selector_count.min(18002));
-            for _ in 0..selector_count {
-                let mut index = 0;
-                while self.bits.take(1)? != 0 {
-                    index += 1;
-                    if index >= table_count {
-                        return Err(invalid("invalid BZip2 selector"));
-                    }
-                }
-                let selected = selector_mtf[index];
-                selector_mtf[..=index].rotate_right(1);
-                if selectors.len() < 18002 {
-                    selectors.push(selected);
-                }
-            }
-            let tables = &mut self.workspace.tables;
-            tables.reserve_exact(table_count.saturating_sub(tables.len()));
-            for table_index in 0..table_count {
-                let mut length = self.bits.take(5)? as i32;
-                if !(1..=20).contains(&length) {
-                    return Err(invalid("invalid Huffman length"));
-                }
-                let lengths = &mut self.workspace.lengths;
-                lengths.clear();
-                lengths.reserve_exact(alphabet_size);
-                for _ in 0..alphabet_size {
-                    while self.bits.take(1)? != 0 {
-                        length += if self.bits.take(1)? == 0 { 1 } else { -1 };
-                        if !(1..=20).contains(&length) {
-                            return Err(invalid("invalid Huffman length delta"));
-                        }
-                    }
-                    if !(1..=20).contains(&length) {
-                        return Err(invalid("invalid Huffman length"));
-                    }
-                    lengths.push(length as u8);
-                }
-                if table_index == tables.len() {
-                    append_huffman(tables, lengths)?;
-                } else {
-                    tables[table_index].rebuild(lengths)?;
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            let mut mtf = {
-                let mut bytes = [0u8; 256];
-                bytes[..alphabet.len()].copy_from_slice(alphabet);
-                bytes
-            };
-            #[cfg(not(target_arch = "x86_64"))]
-            let mut mtf = {
-                let mut words = [0u64; 32];
-                for (index, &byte) in alphabet.iter().enumerate() {
-                    words[index / 8] |= u64::from(byte) << ((index & 7) * 8);
-                }
-                words
-            };
-            let mut counts = [0usize; 256];
-            let limit = self.limit;
-            // ReadBlock2 stores the column in place; a recycled owner already
-            // covers the declared limit, so each byte is one bounded indexed store.
-            let mut column = self
-                .columns
-                .take()
-                .with_capacity_at_least(limit)
-                .resized(limit);
-            let last: &mut [u8] = &mut column[..limit];
-            let mut length = 0usize;
-            let mut selector_index = 0;
-            let mut group_left = 0;
-            let mut huffman = &tables[0];
-            let mut run = 0usize;
-            let mut weight = 1usize;
-            // Linux ARM64 refills byte-wise on blocks whose selectors weight
-            // the tables to at least six expected bits per code, where the
-            // word refill's branch mispredicts; text blocks sit near three
-            // bits and keep the word refill, which is faster there.
-            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-            let bytewise = {
-                let mut weights = [0u32; 6];
-                for &selector in selectors.iter() {
-                    weights[usize::from(selector)] += 1;
-                }
-                let mut total = 0u64;
-                for (table, &weight) in tables.iter().zip(&weights) {
-                    total += u64::from(table.expected_code_bits_q8()) * u64::from(weight);
-                }
-                total >= 6 * 256 * selectors.len() as u64
-            };
-            #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
-            let bytewise = false;
-            macro_rules! symbols {
-                ($bytewise:expr) => {
-                    loop {
-                        if group_left == 0 {
-                            let selector = *selectors
-                                .get(selector_index)
-                                .ok_or_else(|| invalid("missing BZip2 selector"))?;
-                            huffman = &tables[usize::from(selector)];
-                            selector_index += 1;
-                            group_left = 50;
-                        }
-                        let symbol = huffman.symbol::<R, $bytewise>(&mut self.bits)?;
-                        group_left -= 1;
-                        if symbol <= 1 {
-                            run = run
-                                .checked_add(weight * (symbol + 1))
-                                .ok_or_else(|| invalid("BZip2 run overflow"))?;
-                            if run > limit - length {
-                                return Err(invalid("BZip2 block exceeds declared size"));
-                            }
-                            weight = weight
-                                .checked_mul(2)
-                                .ok_or_else(|| invalid("BZip2 run overflow"))?;
-                            continue;
-                        }
-                        if run != 0 {
-                            #[cfg(target_arch = "x86_64")]
-                            let byte = mtf[0];
-                            #[cfg(not(target_arch = "x86_64"))]
-                            let byte = mtf[0] as u8;
-                            counts[byte as usize] += run;
-                            last[length..length + run].fill(byte);
-                            length += run;
-                            run = 0;
-                            weight = 1;
-                        }
-                        if symbol == alphabet_size - 1 {
-                            break;
-                        }
-                        let index = symbol - 1;
-                        if index >= alphabet.len() {
-                            return Err(invalid("invalid BZip2 MTF index"));
-                        }
-                        #[cfg(target_arch = "x86_64")]
-                        let byte = mtf[index];
-                        #[cfg(not(target_arch = "x86_64"))]
-                        let (next, byte) = {
-                            let next = mtf[index / 8];
-                            (next, (next >> ((index & 7) * 8)) as u8)
-                        };
-                        if length == limit {
-                            return Err(invalid("BZip2 block exceeds declared size"));
-                        }
-                        // ReadBlock2 publishes the byte and histogram before moving MTF words.
-                        last[length] = byte;
-                        length += 1;
-                        counts[byte as usize] += 1;
-                        #[cfg(target_arch = "x86_64")]
-                        move_mtf_bytes(&mut mtf, index, byte);
-                        #[cfg(not(target_arch = "x86_64"))]
-                        move_mtf(&mut mtf, index, next, byte);
-                    }
-                };
-            }
-            if bytewise {
-                symbols!(true);
-            } else {
-                symbols!(false);
-            }
-            if origin >= length {
-                return Err(invalid("invalid BZip2 BWT origin"));
-            }
-            self.combined = self.combined.rotate_left(1) ^ crc;
-            return Ok(Some(Block {
-                // Only the logical extent shrinks; the owner keeps its capacity.
-                last: column.resized(length),
-                limit,
-                counts,
-                origin,
-                randomized,
-                crc,
-            }));
+            let column = self.columns.take();
+            let block = read_block(&mut self.bits, &mut self.workspace, column, self.limit)?;
+            self.combined = self.combined.rotate_left(1) ^ block.crc;
+            return Ok(Some(block));
         }
     }
+}
+
+/// The 48-bit marker that opens every block (BCD pi).
+const BLOCK_MAGIC: u64 = 0x3141_5926_5359;
+/// The 48-bit marker that precedes a stream's combined CRC (BCD sqrt(pi)).
+const STREAM_END_MAGIC: u64 = 0x1772_4538_5090;
+/// The largest declared block size, `BZh9`.
+const MAX_BLOCK: usize = 900_000;
+
+/// Reads a byte-aligned `BZh1`..`BZh9` stream header and returns its block-size
+/// limit, or `None` at end of input when this is not the first stream.
+fn read_stream_header<R: Read>(bits: &mut Bits<R>, first: bool) -> io::Result<Option<usize>> {
+    bits.align();
+    let byte = if bits.count >= 8 {
+        Some(bits.take(8)? as u8)
+    } else {
+        bits.byte()?
+    };
+    let Some(byte) = byte else {
+        if first {
+            return Err(invalid("missing BZip2 header"));
+        }
+        return Ok(None);
+    };
+    if byte != b'B' || bits.take(16)? != u32::from_be_bytes([0, 0, b'Z', b'h']) {
+        return Err(invalid("invalid BZip2 header"));
+    }
+    let digit = bits.take(8)?;
+    if !(49..=57).contains(&digit) {
+        return Err(invalid("invalid BZip2 block size"));
+    }
+    Ok(Some((digit as usize - 48) * 100_000))
+}
+
+/// ReadBlock2 from the block CRC through the end-of-block symbol; the block
+/// magic has been consumed. `column` is a recycled last-column owner; it is
+/// sized to `limit` and moved into the block, or dropped on error.
+///
+/// The column stays a by-value local sized after the Huffman tables, as it was
+/// when this loop lived in `Parser::next`. Taking it by reference and sizing it
+/// first cost the single-thread decoder 2 to 4% more instructions.
+fn read_block<R: Read>(
+    bits: &mut Bits<R>,
+    workspace: &mut ParserWorkspace,
+    column: TtBuffer<u8>,
+    limit: usize,
+) -> io::Result<Block> {
+    let crc = bits.take(32)?;
+    let randomized = bits.take(1)? != 0;
+    let origin = bits.take(24)? as usize;
+    let groups = bits.take(16)?;
+    let alphabet = &mut workspace.alphabet;
+    alphabet.clear();
+    alphabet.reserve_exact(256);
+    for group in 0..16 {
+        if groups & (1 << (15 - group)) != 0 {
+            let mask = bits.take(16)?;
+            for low in 0..16 {
+                if mask & (1 << (15 - low)) != 0 {
+                    alphabet.push((group * 16 + low) as u8);
+                }
+            }
+        }
+    }
+    if alphabet.is_empty() {
+        return Err(invalid("empty BZip2 alphabet"));
+    }
+    let alphabet_size = alphabet.len() + 2;
+    let table_count = bits.take(3)? as usize;
+    let selector_count = bits.take(15)? as usize;
+    if !(2..=6).contains(&table_count) || selector_count == 0 {
+        return Err(invalid("invalid BZip2 Huffman groups"));
+    }
+    let mut selector_mtf = [0u8, 1, 2, 3, 4, 5];
+    let selectors = &mut workspace.selectors;
+    selectors.clear();
+    selectors.reserve_exact(selector_count.min(18002));
+    for _ in 0..selector_count {
+        let mut index = 0;
+        while bits.take(1)? != 0 {
+            index += 1;
+            if index >= table_count {
+                return Err(invalid("invalid BZip2 selector"));
+            }
+        }
+        let selected = selector_mtf[index];
+        selector_mtf[..=index].rotate_right(1);
+        if selectors.len() < 18002 {
+            selectors.push(selected);
+        }
+    }
+    let tables = &mut workspace.tables;
+    tables.reserve_exact(table_count.saturating_sub(tables.len()));
+    for table_index in 0..table_count {
+        let mut length = bits.take(5)? as i32;
+        if !(1..=20).contains(&length) {
+            return Err(invalid("invalid Huffman length"));
+        }
+        let lengths = &mut workspace.lengths;
+        lengths.clear();
+        lengths.reserve_exact(alphabet_size);
+        for _ in 0..alphabet_size {
+            while bits.take(1)? != 0 {
+                length += if bits.take(1)? == 0 { 1 } else { -1 };
+                if !(1..=20).contains(&length) {
+                    return Err(invalid("invalid Huffman length delta"));
+                }
+            }
+            if !(1..=20).contains(&length) {
+                return Err(invalid("invalid Huffman length"));
+            }
+            lengths.push(length as u8);
+        }
+        if table_index == tables.len() {
+            append_huffman(tables, lengths)?;
+        } else {
+            tables[table_index].rebuild(lengths)?;
+        }
+    }
+    // ReadBlock2 stores the column in place; a recycled owner already
+    // covers the declared limit, so each byte is one bounded indexed store.
+    let mut column = column.with_capacity_at_least(limit).resized(limit);
+    let last: &mut [u8] = &mut column[..limit];
+    #[cfg(target_arch = "x86_64")]
+    let mut mtf = {
+        let mut bytes = [0u8; 256];
+        bytes[..alphabet.len()].copy_from_slice(alphabet);
+        bytes
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let mut mtf = {
+        let mut words = [0u64; 32];
+        for (index, &byte) in alphabet.iter().enumerate() {
+            words[index / 8] |= u64::from(byte) << ((index & 7) * 8);
+        }
+        words
+    };
+    let mut counts = [0usize; 256];
+    let mut length = 0usize;
+    let mut selector_index = 0;
+    let mut group_left = 0;
+    let mut huffman = &tables[0];
+    let mut run = 0usize;
+    let mut weight = 1usize;
+    // Linux ARM64 refills byte-wise on blocks whose selectors weight
+    // the tables to at least six expected bits per code, where the
+    // word refill's branch mispredicts; text blocks sit near three
+    // bits and keep the word refill, which is faster there.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let bytewise = {
+        let mut weights = [0u32; 6];
+        for &selector in selectors.iter() {
+            weights[usize::from(selector)] += 1;
+        }
+        let mut total = 0u64;
+        for (table, &weight) in tables.iter().zip(&weights) {
+            total += u64::from(table.expected_code_bits_q8()) * u64::from(weight);
+        }
+        total >= 6 * 256 * selectors.len() as u64
+    };
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    let bytewise = false;
+    macro_rules! symbols {
+        ($bytewise:expr) => {
+            loop {
+                if group_left == 0 {
+                    let selector = *selectors
+                        .get(selector_index)
+                        .ok_or_else(|| invalid("missing BZip2 selector"))?;
+                    huffman = &tables[usize::from(selector)];
+                    selector_index += 1;
+                    group_left = 50;
+                }
+                let symbol = huffman.symbol::<R, $bytewise>(bits)?;
+                group_left -= 1;
+                if symbol <= 1 {
+                    run = run
+                        .checked_add(weight * (symbol + 1))
+                        .ok_or_else(|| invalid("BZip2 run overflow"))?;
+                    if run > limit - length {
+                        return Err(invalid("BZip2 block exceeds declared size"));
+                    }
+                    weight = weight
+                        .checked_mul(2)
+                        .ok_or_else(|| invalid("BZip2 run overflow"))?;
+                    continue;
+                }
+                if run != 0 {
+                    #[cfg(target_arch = "x86_64")]
+                    let byte = mtf[0];
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let byte = mtf[0] as u8;
+                    counts[byte as usize] += run;
+                    last[length..length + run].fill(byte);
+                    length += run;
+                    run = 0;
+                    weight = 1;
+                }
+                if symbol == alphabet_size - 1 {
+                    break;
+                }
+                let index = symbol - 1;
+                if index >= alphabet.len() {
+                    return Err(invalid("invalid BZip2 MTF index"));
+                }
+                #[cfg(target_arch = "x86_64")]
+                let byte = mtf[index];
+                #[cfg(not(target_arch = "x86_64"))]
+                let (next, byte) = {
+                    let next = mtf[index / 8];
+                    (next, (next >> ((index & 7) * 8)) as u8)
+                };
+                if length == limit {
+                    return Err(invalid("BZip2 block exceeds declared size"));
+                }
+                // ReadBlock2 publishes the byte and histogram before moving MTF words.
+                last[length] = byte;
+                length += 1;
+                counts[byte as usize] += 1;
+                #[cfg(target_arch = "x86_64")]
+                move_mtf_bytes(&mut mtf, index, byte);
+                #[cfg(not(target_arch = "x86_64"))]
+                move_mtf(&mut mtf, index, next, byte);
+            }
+        };
+    }
+    if bytewise {
+        symbols!(true);
+    } else {
+        symbols!(false);
+    }
+    if origin >= length {
+        return Err(invalid("invalid BZip2 BWT origin"));
+    }
+    Ok(Block {
+        // Only the logical extent shrinks; the owner keeps its capacity.
+        last: column.resized(length),
+        limit,
+        counts,
+        origin,
+        randomized,
+        crc,
+    })
 }
 
 // CMtf8Decoder::GetAndMove with byte storage: short prefixes use paired word
@@ -1316,188 +1381,18 @@ fn observe_output(callback: &Option<OutputCallback>, bytes: &[u8]) -> io::Result
 }
 
 const OUTPUT_CHUNK: usize = 65536;
-const OUTPUT_OWNERS: usize = 18;
+mod parallel;
 #[cfg(test)]
 mod pool_tests;
-
-struct OutputPool {
-    returned: std::sync::mpsc::Receiver<Vec<u8>>,
-    allocated: usize,
-}
-impl OutputPool {
-    fn take(&mut self) -> Option<Vec<u8>> {
-        use std::sync::mpsc::TryRecvError;
-        let mut bytes = match self.returned.try_recv() {
-            Ok(bytes) => bytes,
-            Err(TryRecvError::Disconnected) => return None,
-            Err(TryRecvError::Empty) if self.allocated < OUTPUT_OWNERS => {
-                self.allocated += 1;
-                Vec::with_capacity(OUTPUT_CHUNK)
-            }
-            Err(TryRecvError::Empty) => self.returned.recv().ok()?,
-        };
-        bytes.resize(OUTPUT_CHUNK, 0);
-        Some(bytes)
-    }
-}
-
-enum WorkerMessage {
-    Data(Vec<u8>),
-    /// The finished block's last column, returned to the caller's pool.
-    Finished(TtBuffer<u8>),
-    Error(io::Error),
-}
-struct Worker {
-    jobs: Option<std::sync::mpsc::SyncSender<Block>>,
-    receiver: Option<std::sync::mpsc::Receiver<WorkerMessage>>,
-    returned: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
-    /// Set on drop before the job queue closes, so a block still buffered in
-    /// the queue is discarded instead of reconstructed for nobody.
-    cancelled: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-}
-impl Worker {
-    fn start(callback: Option<OutputCallback>, mode: Mode) -> io::Result<Self> {
-        let (jobs, blocks) = std::sync::mpsc::sync_channel(1);
-        // The 1 MiB ring lets a normal block finish while the caller parses
-        // its successor, without expanding an RLE-heavy block into one allocation.
-        let (sender, receiver) = std::sync::mpsc::sync_channel(16);
-        let (returned, buffers) = std::sync::mpsc::sync_channel(OUTPUT_OWNERS);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancel = Arc::clone(&cancelled);
-        let handle = std::thread::Builder::new()
-            .name("bzip2-reconstruct".into())
-            .spawn(move || {
-                let mut links = Links::new(mode);
-                let mut pool = OutputPool {
-                    returned: buffers,
-                    allocated: 0,
-                };
-                while let Ok(block) = blocks.recv() {
-                    // A closed queue still yields its buffered block; skip the
-                    // table build and callback once the decoder is dropping.
-                    if cancel.load(Ordering::Acquire) {
-                        return;
-                    }
-                    let mut output = BlockOutput::new(&block, links.take());
-                    // The column travels back with Finished, so the caller never
-                    // waits for an owner and the in-flight count bounds them.
-                    let column = block.last;
-                    loop {
-                        let Some(mut bytes) = pool.take() else {
-                            return;
-                        };
-                        match output.read(&mut bytes) {
-                            Ok(n) => {
-                                bytes.truncate(n);
-                                if let Err(error) = observe_output(&callback, &bytes) {
-                                    let _ = sender.send(WorkerMessage::Error(error));
-                                    return;
-                                }
-                                if sender.send(WorkerMessage::Data(bytes)).is_err() {
-                                    return;
-                                }
-                                if output.finished() {
-                                    if sender.send(WorkerMessage::Finished(column)).is_err() {
-                                        return;
-                                    }
-                                    break;
-                                }
-                            }
-                            Err(error) => {
-                                let _ = sender.send(WorkerMessage::Error(error));
-                                return;
-                            }
-                        }
-                    }
-                    links = output.into_links();
-                }
-            })?;
-        Ok(Self {
-            jobs: Some(jobs),
-            receiver: Some(receiver),
-            returned: Some(returned),
-            cancelled,
-            handle: Some(handle),
-        })
-    }
-    fn recycle(&self, bytes: Vec<u8>) {
-        if bytes.capacity() >= OUTPUT_CHUNK {
-            // Each unique owner returns at most once. This never waits for a
-            // worker that may itself be blocked on the forward queue.
-            let result = self
-                .returned
-                .as_ref()
-                .expect("live return queue")
-                .try_send(bytes);
-            debug_assert!(
-                !matches!(result, Err(std::sync::mpsc::TrySendError::Full(_))),
-                "output owner returned twice or return queue undersized"
-            );
-        }
-    }
-    fn submit(&self, block: Block) -> io::Result<()> {
-        self.jobs
-            .as_ref()
-            .expect("live worker job queue")
-            .send(block)
-            .map_err(|_| io::Error::other("BZip2 worker stopped before accepting a block"))
-    }
-    /// Queues the successor of the one in-flight block; returns it only when
-    /// the worker has exited. The caller keeps it staged and then drains
-    /// output, where an exited worker reports its own error.
-    ///
-    /// A full slot still holds the in-flight block: the worker is between
-    /// blocks (in `recv` or `into_links`), never waiting on output delivery or
-    /// an owner, since every earlier Finished has been received. It takes that
-    /// block promptly, so waiting for the slot cannot deadlock.
-    fn submit_successor(&self, block: Block) -> Option<Block> {
-        use std::sync::mpsc::TrySendError;
-        let jobs = self.jobs.as_ref().expect("live worker job queue");
-        match jobs.try_send(block) {
-            Ok(()) => None,
-            Err(TrySendError::Full(block)) => jobs.send(block).err().map(|error| error.0),
-            Err(TrySendError::Disconnected(block)) => Some(block),
-        }
-    }
-    fn receive(&mut self) -> io::Result<WorkerMessage> {
-        match self.receiver.as_ref().expect("live worker receiver").recv() {
-            Ok(message) => Ok(message),
-            Err(_) => {
-                let panicked = self
-                    .handle
-                    .take()
-                    .is_some_and(|handle| handle.join().is_err());
-                Err(io::Error::other(if panicked {
-                    "BZip2 worker panicked"
-                } else {
-                    "BZip2 worker stopped before finishing a block"
-                }))
-            }
-        }
-    }
-}
-impl Drop for Worker {
-    fn drop(&mut self) {
-        // Cancel a still-queued block first, then close every channel before
-        // joining: the worker can wait for output delivery, a returned owner,
-        // or the next block.
-        self.cancelled.store(true, Ordering::Release);
-        self.receiver.take();
-        self.returned.take();
-        self.jobs.take();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
 
 /// A bounded [`Read`] decoder that accepts concatenated BZip2 streams by default.
 ///
 /// Construction is lazy: headers are parsed on the first nonempty read. One
-/// thread runs on the caller; larger budgets overlap caller-side entropy parsing
-/// with one reconstruction worker. Input and output may be read ahead. Dropping
-/// the decoder cancels its pipeline and joins its worker.
+/// thread decodes on the caller. A larger budget of N threads runs N decode
+/// workers, each parsing, reconstructing and producing whole blocks; the caller
+/// reads input, finds block starts and copies output out in order. Input and
+/// output may be read ahead. Dropping the decoder cancels its workers and joins
+/// them.
 ///
 /// Read through EOF to validate every block and the combined stream checksum.
 /// Earlier output chunks may already have been delivered when a later checksum
@@ -1507,18 +1402,14 @@ pub struct Decoder<R: Read> {
     parser: Parser<R>,
     mode: Mode,
     threads: usize,
-    worker: Option<Worker>,
-    // Blocks submitted to the worker whose Finished has not been received:
-    // at most the one being reconstructed plus the one-slot job queue. A
-    // staged block exists only below two, so at most two parsed blocks live.
-    // Each holds one last column until its Finished arrives (COLUMN_OWNERS).
-    in_flight: u8,
-    staged: Option<Block>,
+    // Set once a multithreaded decoder hands the rest of the input to the
+    // serial parser (a block encoded beyond a job's lookahead).
+    serial: bool,
+    pool: Option<parallel::Pool>,
     active: Option<BlockOutput>,
     output: Vec<u8>,
     output_end: usize,
     position: usize,
-    error: Option<io::Error>,
     failed: bool,
     callback: Option<OutputCallback>,
 }
@@ -1527,17 +1418,21 @@ impl<R: Read> Decoder<R> {
     pub fn new(reader: R) -> Self {
         Self::with_threads(reader, 1)
     }
-    /// Creates a decoder with a total thread budget including the caller.
+    /// Creates a decoder with a thread budget.
     ///
-    /// Budgets are clamped to `1..=2`; WebAssembly always uses one thread. A
-    /// budget above two does not add more reconstruction workers.
+    /// A budget of one decodes on the calling thread. A budget of N above one
+    /// runs N decode workers, started as blocks are found, while the calling
+    /// thread reads input, scans it for block starts and delivers output.
+    /// Budgets are clamped to `1..=64`; WebAssembly always uses one thread.
     pub fn with_threads(reader: R, threads: usize) -> Self {
         Self::with_mode(reader, threads, Mode::platform())
     }
     /// Creates a compact decoder for an explicitly constrained memory budget.
     ///
     /// This selects one 32-bit TT word per raw symbol on every platform. The
-    /// ordinary constructors select paired words only on macOS ARM64.
+    /// ordinary constructors select paired words only on macOS ARM64, and only
+    /// for single-threaded decoding; multithreaded workers always use compact
+    /// words.
     pub fn with_low_memory(reader: R, threads: usize) -> Self {
         Self::with_mode(reader, threads, Mode::Compact)
     }
@@ -1545,31 +1440,36 @@ impl<R: Read> Decoder<R> {
         Self {
             parser: Parser::new(reader),
             mode,
-            threads: if cfg!(target_family = "wasm") {
-                1
-            } else {
-                threads.clamp(1, 2)
-            },
-            worker: None,
-            in_flight: 0,
-            staged: None,
+            threads: Self::budget(threads),
+            serial: false,
+            pool: None,
             active: None,
             output: Vec::new(),
             output_end: 0,
             position: 0,
-            error: None,
             failed: false,
             callback: None,
         }
     }
+    const fn budget(threads: usize) -> usize {
+        if cfg!(target_family = "wasm") || threads == 0 {
+            1
+        } else if threads > parallel::MAX_WORKERS {
+            parallel::MAX_WORKERS
+        } else {
+            threads
+        }
+    }
     /// Observes each reconstructed output chunk before it is queued for delivery.
     ///
-    /// With multiple threads the callback runs on the reconstruction worker;
-    /// single-threaded decoding invokes it on the caller. It may observe read-ahead
-    /// bytes before they are delivered, including bytes discarded on early drop.
-    /// Callback chunks contain at most 65,536 bytes and preserve stream order.
-    /// A callback is an observer, not a guarantee that the complete stream or
-    /// current block has passed its final checksum.
+    /// With multiple threads the callback runs on the decode workers, one call
+    /// at a time and in stream order; a block's output is produced only after
+    /// every earlier block's, so a callback serializes that final stage.
+    /// Single-threaded decoding invokes it on the caller. It may observe
+    /// read-ahead bytes before they are delivered, including bytes discarded on
+    /// early drop. Callback chunks contain at most 65,536 bytes and preserve
+    /// stream order. A callback is an observer, not a guarantee that the
+    /// complete stream or current block has passed its final checksum.
     ///
     /// A caller-thread callback panic propagates and leaves the decoder failed
     /// if caught. A worker callback panic is reported as a read error. Callbacks
@@ -1610,18 +1510,20 @@ impl<R: Read> Decoder<R> {
     /// allocated by an output callback. Reusable scratch and output/TT capacity
     /// are included. Thread budgets follow [`Self::with_threads`].
     ///
+    /// With N threads above one, each of the N workers owns a compact TT and a
+    /// last column sized for the format maximum, up to 2N blocks are open with
+    /// at most 3 MiB of output each, and the retained input is bounded by the
+    /// lookahead of every open block and worker; the bound grows linearly in N
+    /// and is the same as [`Self::low_memory_usage`].
+    ///
     /// On Linux x86-64 and AArch64 every TT and last-column buffer is a whole
     /// number of 2 MiB pages advised with `MADV_HUGEPAGE`; the bound counts those
     /// rounded extents. The kernel honours the advice only when transparent huge
     /// pages are set to `madvise` or `always`; with `never` the same allocations
     /// use ordinary pages.
     pub const fn memory_usage(threads: usize) -> u64 {
-        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            if threads > 1 {
-                16 * 1024 * 1024
-            } else {
-                10 * 1024 * 1024
-            }
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) && Self::budget(threads) == 1 {
+            10 * 1024 * 1024
         } else {
             Self::low_memory_usage(threads)
         }
@@ -1631,24 +1533,51 @@ impl<R: Read> Decoder<R> {
     ///
     /// Single-threaded: 6 MiB, or 8 MiB on Linux x86-64 and AArch64, where the
     /// level-9 TT rounds to 4 MiB and the last column to one 2 MiB page.
-    /// Multithreaded: 12 MiB, which also covers the second last column and the
-    /// worker's output ring.
+    /// Multithreaded: the per-worker, per-block and input terms described in
+    /// [`Self::memory_usage`], with a 4 MiB TT per worker.
     pub const fn low_memory_usage(threads: usize) -> u64 {
-        if threads > 1 && !cfg!(target_family = "wasm") {
-            12 * 1024 * 1024
+        let threads = Self::budget(threads);
+        if threads > 1 {
+            Self::parallel_usage(threads, 4 << 20)
         } else if super::tt_storage::NATIVE_HUGE_PAGES {
             8 * 1024 * 1024
         } else {
             6 * 1024 * 1024
         }
     }
-    /// Cancels and joins any worker, then returns the input reader.
+    /// The multithreaded bound for `workers` workers whose TT takes `tt` bytes.
+    const fn parallel_usage(workers: usize, tt: u64) -> u64 {
+        const MIB: u64 = 1 << 20;
+        let workers = workers as u64;
+        let slots = workers * parallel::SLOTS_PER_WORKER as u64;
+        // A last column of 900,000 bytes, one 2 MiB page natively.
+        let column = if super::tt_storage::NATIVE_HUGE_PAGES {
+            2 * MIB
+        } else {
+            MIB
+        };
+        // Entropy scratch (bit buffer, tables, selectors) stays below 1 MiB;
+        // each worker also holds one output chunk while it fills it.
+        let worker = tt + column + MIB + MIB;
+        // A slot admits another chunk below its cap: cap plus one chunk.
+        let slot = parallel::OUTPUT_CAP as u64 + MIB;
+        // The caller reads no further than `parallel::window` past the oldest
+        // open slot, the next candidate or the chain's expected block; each
+        // worker's job holds at most a lookahead plus two partial chunks of
+        // input the caller has already released.
+        let lookahead = parallel::LOOKAHEAD as u64;
+        let chunk = parallel::INPUT_CHUNK as u64;
+        let input = parallel::retained(slots as usize) + workers * (lookahead + 2 * chunk);
+        // The caller's own output chunk.
+        workers * worker + slots * slot + input + MIB
+    }
+    /// Cancels and joins any workers, then returns the input reader.
     ///
     /// Buffered compressed bytes and undelivered output are discarded; this does
     /// not validate an unread trailer. The returned reader may be ahead of the
     /// last byte delivered to the caller because of input buffering/read-ahead.
     pub fn into_inner(mut self) -> R {
-        self.worker.take();
+        self.pool.take();
         self.parser.bits.reader
     }
     /// Borrows the input reader.
@@ -1660,113 +1589,86 @@ impl<R: Read> Decoder<R> {
         &mut self.parser.bits.reader
     }
     fn next_output(&mut self) -> io::Result<bool> {
-        if self.threads == 1 {
-            if self.active.as_ref().is_none_or(BlockOutput::finished) {
-                let links = self
-                    .active
-                    .take()
-                    .map_or_else(|| Links::new(self.mode), BlockOutput::into_links);
-                self.active = match self.parser.next()? {
-                    Some(block) => {
-                        let output = BlockOutput::new(&block, links);
-                        // DecodeBlock1 has consumed the column; reuse it at once.
-                        self.parser.columns.give(block.last);
-                        Some(output)
-                    }
-                    None => return Ok(false),
-                };
+        if self.threads > 1 && !self.serial {
+            if self.parser.finished {
+                return Ok(false);
             }
-            // Match CDecoder's 1 MiB buffer for unobserved ST
-            // output; preserve callback chunk boundaries and worker buffers.
-            let chunk = if self.callback.is_some() {
-                OUTPUT_CHUNK
-            } else {
-                1 << 20
-            };
-            self.output.resize(chunk, 0);
-            let n = self
-                .active
-                .as_mut()
-                .expect("active block")
-                .read(&mut self.output)?;
-            self.output_end = n;
-            if self.callback.is_some() {
-                // A callback panic may be caught by the caller. Keep that decoder
-                // failed so its unobserved buffered bytes cannot then be delivered.
-                self.failed = true;
-                observe_output(&self.callback, &self.output[..n])?;
-                self.failed = false;
-            }
-            self.position = 0;
-            return Ok(true);
-        }
-        if let Some(worker) = &self.worker {
-            worker.recycle(std::mem::take(&mut self.output));
+            let multistream = self.parser.multistream;
+            let pool = self.pool.get_or_insert_with(|| {
+                // Workers use the compact TT whatever the platform mode: under
+                // parallel load the paired TT's extra cache traffic costs more
+                // than its single-thread gain.
+                parallel::Pool::new(
+                    self.threads,
+                    Mode::Compact,
+                    self.callback.clone(),
+                    multistream,
+                )
+            });
+            let recycled = std::mem::take(&mut self.output);
             self.output_end = 0;
             self.position = 0;
+            match pool.next(&mut self.parser.bits.reader, recycled)? {
+                parallel::Step::Chunk(bytes) => {
+                    self.output_end = bytes.len();
+                    self.output = bytes;
+                    return Ok(true);
+                }
+                parallel::Step::End => {
+                    self.parser.finished = true;
+                    self.pool.take();
+                    return Ok(false);
+                }
+                parallel::Step::Serial(resume) => {
+                    // Continue on the caller exactly where the block starts.
+                    self.pool.take();
+                    self.serial = true;
+                    self.parser.bits.replay(resume.bytes);
+                    self.parser.bits.take(resume.skip)?;
+                    self.parser.limit = resume.limit;
+                    self.parser.combined = resume.combined;
+                    self.parser.started = true;
+                }
+            }
         }
-        loop {
-            // RunScout / DecodeStreams overlap exactly one entropy parser and
-            // one reconstruction worker, irrespective of a larger thread request.
-            // Like RunScout, the caller parses one block ahead of the block being
-            // reconstructed and publishes it at once (DecoderEvent.Set), so the
-            // worker finds its successor queued at a block boundary instead of
-            // waiting for this thread to observe Finished.
-            if self.staged.is_none()
-                && self.in_flight < 2
-                && self.error.is_none()
-                && !self.parser.finished
-            {
-                match self.parser.next() {
-                    Ok(block) => self.staged = block,
-                    Err(error) => self.error = Some(error),
+        if self.active.as_ref().is_none_or(BlockOutput::finished) {
+            let links = self
+                .active
+                .take()
+                .map_or_else(|| Links::new(self.mode), BlockOutput::into_links);
+            self.active = match self.parser.next()? {
+                Some(block) => {
+                    let output = BlockOutput::new(&block, links);
+                    // DecodeBlock1 has consumed the column; reuse it at once.
+                    self.parser.columns.give(block.last);
+                    Some(output)
                 }
-            }
-            if let Some(block) = self.staged.take() {
-                // A block is staged only while fewer than two are in flight.
-                debug_assert!(self.in_flight < 2, "staged block beyond the job queue");
-                if self.worker.is_none() {
-                    self.worker = Some(Worker::start(self.callback.clone(), self.mode)?);
-                }
-                let worker = self.worker.as_ref().expect("started worker");
-                if self.in_flight == 0 {
-                    // Every submitted block has been taken and finished, so the
-                    // queue is empty and the idle worker produces no output.
-                    worker.submit(block)?;
-                    self.in_flight = 1;
-                    continue;
-                }
-                // Exactly one block is in flight. If it still fills the slot,
-                // the worker has not taken it, so it is between blocks rather
-                // than waiting on output: wait for the slot. Only an exited
-                // worker leaves this one staged, and receive then reports why.
-                match worker.submit_successor(block) {
-                    None => self.in_flight += 1,
-                    Some(block) => self.staged = Some(block),
-                }
-            }
-            if self.in_flight > 0 {
-                match self.worker.as_mut().expect("active worker").receive()? {
-                    WorkerMessage::Data(bytes) => {
-                        self.output_end = bytes.len();
-                        self.output = bytes;
-                        self.position = 0;
-                        return Ok(true);
-                    }
-                    WorkerMessage::Finished(column) => {
-                        self.in_flight -= 1;
-                        self.parser.columns.give(column);
-                        continue;
-                    }
-                    WorkerMessage::Error(error) => return Err(error),
-                }
-            }
-            if let Some(error) = self.error.take() {
-                return Err(error);
-            }
-            self.worker.take();
-            return Ok(false);
+                None => return Ok(false),
+            };
         }
+        // Match CDecoder's 1 MiB buffer for unobserved ST
+        // output; preserve callback chunk boundaries.
+        let chunk = if self.callback.is_some() {
+            OUTPUT_CHUNK
+        } else {
+            1 << 20
+        };
+        self.output.resize(chunk, 0);
+        let n = self
+            .active
+            .as_mut()
+            .expect("active block")
+            .read(&mut self.output)?;
+        self.output_end = n;
+        if self.callback.is_some() {
+            // A callback panic may be caught by the caller. Keep that decoder
+            // failed so its unobserved buffered bytes cannot then be delivered.
+            self.failed = true;
+            observe_output(&self.callback, &self.output[..n])?;
+            self.failed = false;
+        }
+        self.position = 0;
+        Ok(true)
     }
 }
 impl<R: Read> Read for Decoder<R> {
@@ -1783,7 +1685,7 @@ impl<R: Read> Read for Decoder<R> {
                 Ok(false) => return Ok(0),
                 Err(error) => {
                     self.failed = true;
-                    self.worker.take();
+                    self.pool.take();
                     return Err(error);
                 }
             }

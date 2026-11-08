@@ -7,6 +7,7 @@
 mod baseline;
 mod entropy;
 mod flag_sort;
+mod induced_sort;
 mod marked_sort;
 mod slot;
 #[cfg(test)]
@@ -27,7 +28,13 @@ pub struct EncoderOptions {
     /// Compression level, clamped to zero through nine.
     /// Zero still emits compressed BZip2 data; it is not a stored-data mode.
     pub level: u32,
-    /// Thread budget including the calling thread, clamped to 1..=64.
+    /// Compression threads, clamped to 1..=64. One encodes every block on
+    /// the calling thread. N above one starts up to N worker threads, as
+    /// blocks arrive, that each encode whole blocks; the calling thread then
+    /// only reads input, run-length encodes it into blocks and writes the
+    /// encoded blocks in input order. At most N threads encode at once:
+    /// while the encoder drains its last blocks, budget no block is using
+    /// encodes the halves of recursive trials on short-lived helper threads.
     /// WebAssembly targets always use one thread.
     pub threads: usize,
     /// Requested block size in bytes, rounded down to a 100,000-byte step.
@@ -37,8 +44,10 @@ pub struct EncoderOptions {
     /// block, not necessarily the number of original input bytes.
     pub block_size: Option<u32>,
     /// Recursive block optimization passes, clamped to 1..=10.
-    /// `None` selects seven passes at level nine, two at seven/eight, and one
-    /// at all other levels.
+    /// `None` selects two passes at levels seven and eight and one at all
+    /// other levels, so level nine's default output equals level five's.
+    /// 7-Zip runs seven at level nine; `Some(7)` reproduces its level-nine
+    /// output.
     pub passes: Option<u32>,
 }
 
