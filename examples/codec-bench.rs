@@ -8,8 +8,8 @@
 //! Native encoding accepts block/pass overrides. Decoding uses stream settings,
 //! so level/block/pass arguments do not configure the decoder. Compatibility
 //! mode requires one thread and no overrides; its decoder stops at one member.
-//! Native decoder thread budgets above two still use only one reconstruction
-//! worker. The driver validates levels `1..=9` even when decoding.
+//! A native decoder thread budget of N above one runs N block workers. The
+//! driver validates levels `1..=9` even when decoding.
 use bzip2_turbo::{Compression, Decoder, Encoder, EncoderOptions, read, write};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Write};
