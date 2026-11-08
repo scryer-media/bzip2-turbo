@@ -69,11 +69,11 @@ pub(super) fn is_proper_power(input: &[u8]) -> bool {
     let mut rest = len;
     let mut prime = 2;
     while prime * prime <= rest {
-        if rest % prime == 0 {
+        if rest.is_multiple_of(prime) {
             if periodic(len / prime) {
                 return true;
             }
-            while rest % prime == 0 {
+            while rest.is_multiple_of(prime) {
                 rest /= prime;
             }
         }

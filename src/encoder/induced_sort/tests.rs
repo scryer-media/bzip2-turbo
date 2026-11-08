@@ -31,7 +31,7 @@ fn prefix_function_power(input: &[u8]) -> bool {
         border[i] = k;
     }
     let period = input.len() - border.last().copied().unwrap_or(0);
-    period < input.len() && input.len() % period == 0
+    period < input.len() && input.len().is_multiple_of(period)
 }
 
 // Checks the induced path itself, below the size threshold too, against the
@@ -233,7 +233,7 @@ fn full_size_blocks_match_the_existing_sorter() {
     let mut random = Random(0x9e37_79b9);
     let record = b"{\"id\":1234,\"name\":\"value\",\"tags\":[\"a\",\"b\"]}\n";
     let text: Vec<u8> = (0..900_000)
-        .map(|i| record[i % record.len()] ^ u8::from(random.next() % 23 == 0))
+        .map(|i| record[i % record.len()] ^ u8::from(random.next().is_multiple_of(23)))
         .collect();
     for input in [random.bytes(900_000, 256), random.bytes(900_000, 4), text] {
         check_induced(&mut induced, &mut fallback, &input);
