@@ -222,6 +222,12 @@ impl Workspace {
         self.storage.capacity()
     }
 
+    // The induced sorter borrows this buffer, so one block's sort never holds
+    // both sorters' storage at once. Every sort initializes what it reads.
+    pub(super) fn storage(&mut self) -> &mut Vec<u32> {
+        &mut self.storage
+    }
+
     pub(super) fn sort(&mut self, input: &[u8]) -> std::io::Result<(&[u32], usize)> {
         assert!(!input.is_empty() && input.len() <= 900_000);
         match input.len() {
@@ -413,6 +419,7 @@ mod tests {
     fn flags_preserve_full_bwt_and_origin_across_capacities_periods_and_reuse() {
         let mut flags = Workspace::default();
         let mut marked = super::super::marked_sort::Workspace::default();
+        let mut induced = super::super::induced_sort::Workspace::default();
         let mut state = 0x1923_ab5du32;
         for size in (1..128).chain([
             255, 256, 257, 1024, 1025, 4095, 4096, 4097, 65535, 65536, 65537, 900000,
@@ -430,7 +437,19 @@ mod tests {
                         }
                     })
                     .collect();
+                let (routed, routed_origin) = induced.sort(&input).unwrap();
+                let routed = routed.to_vec();
+                let primitive = size >= 2 && !super::super::induced_sort::is_proper_power(&input);
+                let direct = primitive.then(|| induced.induced(&input).unwrap().0.to_vec());
                 let (actual, origin) = flags.sort(&input).unwrap();
+                assert_eq!(routed_origin, origin, "induced size={size},period={period}");
+                assert!(
+                    routed == actual,
+                    "induced order size={size},period={period}"
+                );
+                if let Some(direct) = direct {
+                    assert!(direct == actual, "direct order size={size},period={period}");
+                }
                 let (expected, expected_origin) = marked.sort(&input).unwrap();
                 assert_eq!(origin, expected_origin, "size={size},period={period}");
                 assert_eq!(
@@ -450,6 +469,7 @@ mod tests {
         let initialized = flags.storage.len();
         for input in [b"x".as_slice(), b"small repeated buffer", b"xyxyxyxyx"] {
             assert_eq!(flags.sort(input).unwrap(), marked.sort(input).unwrap());
+            assert_eq!(induced.sort(input).unwrap(), marked.sort(input).unwrap());
             assert_eq!(flags.storage.capacity(), capacity);
             assert_eq!(flags.storage.len(), initialized);
         }

@@ -5,7 +5,7 @@
 // helper threads for the independent halves of a recursive trial.
 
 use super::{
-    EncoderOptions, block_crc, entropy::Entropy, flag_sort::Workspace, repeated_prefix,
+    EncoderOptions, block_crc, entropy::Entropy, induced_sort::Workspace, repeated_prefix,
     trial::TrialWriter,
 };
 use std::{

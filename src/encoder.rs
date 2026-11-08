@@ -7,6 +7,7 @@
 mod baseline;
 mod entropy;
 mod flag_sort;
+mod induced_sort;
 mod marked_sort;
 mod slot;
 #[cfg(test)]
