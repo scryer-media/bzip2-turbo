@@ -5,8 +5,10 @@ Streaming BZip2 compression and decompression in Rust, translated from the
 and a native API with explicit threading and memory settings. CRC-32/BZIP2
 comes from `crc-turbo`. No libbz2 or C build is required.
 
-Encoding runs across bounded worker slots with output order preserved.
-Decoding pipelines parsing and reconstruction across two threads. The native
+With a budget of N threads, encoding runs N block workers (the calling thread
+is one of them) with up to four blocks per thread in flight, and writes blocks
+in input order. Decoding runs N block workers: the calling thread finds block
+boundaries and delivers output in order while the workers decode blocks. The native
 encoder reproduces 7-Zip's bytes for matching settings; compressed bytes can
 differ from libbz2. The crate documentation lists every behavioral
 difference from the `bzip2` crate.
@@ -59,49 +61,58 @@ and the decoder's design are in the crate documentation and under
 
 ## Benchmarks
 
-Level 5, all fixtures combined (JSON, logs, repeated text, MKV, ELF). Higher is
-better. 1T–8T is the requested thread count.
+Measured on one Apple M5 Max (18 cores, macOS 26.6) on 2026-11-08 against
+lbzip2 (source revision 724352c). Other work was running (load average 7 to
+20), so treat gaps under about 5% as noise. Each cell is the median wall time
+in seconds of five interleaved runs; lower is better. Inputs are a 256 MiB
+JSON corpus and 96 MiB of concatenated build binaries. bzip2-turbo is the
+`codec-bench` example built with `cargo build --release` and LTO off.
 
-### ARM64 (Graviton3)
+Encoding, level 9, one pass (`passes: Some(1)`), against `lbzip2 -9`:
 
-| Encode MiB/s | 1T | 2T | 4T | 8T |
+| Seconds | 1T | 2T | 4T | 8T | 16T |
+|---|---:|---:|---:|---:|---:|
+| JSON, bzip2-turbo | **6.00** | **3.03** | **1.58** | **0.86** | **0.63** |
+| JSON, lbzip2 | 8.68 | 4.29 | 2.25 | 1.17 | 0.91 |
+| Binaries, bzip2-turbo | 2.98 | 1.53 | 0.79 | 0.44 | 0.32 |
+| Binaries, lbzip2 | **2.89** | **1.46** | **0.76** | **0.40** | **0.29** |
+
+Encoding, level 1, against `lbzip2 -1`:
+
+| Seconds | 1T | 2T | 4T | 8T | 16T |
+|---|---:|---:|---:|---:|---:|
+| JSON, bzip2-turbo | **6.09** | **3.14** | **2.00** | **0.90** | **0.50** |
+| JSON, lbzip2 | 7.89 | 4.03 | 2.06 | 1.05 | 0.56 |
+| Binaries, bzip2-turbo | **2.88** | **1.52** | **0.80** | 0.43 | 0.23 |
+| Binaries, lbzip2 | 3.11 | 1.58 | 0.81 | **0.42** | **0.22** |
+
+Level 9's default of two passes also runs 7-Zip's Huffman table
+optimisation. It takes 23.80 s (JSON) and 11.25 s (binaries) on one thread
+and 2.22 s and 1.14 s on 16, about four times `lbzip2 -9`, for smaller
+output:
+
+| Bytes | Level 9 (2 passes) | 7 passes | `lbzip2 -9` | `bzip2 -9` |
 |---|---:|---:|---:|---:|
-| **bzip2-turbo** | **10.6** | **18.0** | **32.1** | **54.0** |
-| 7zz | 6.8 | 12.0 | 21.7 | 38.1 |
-| bzip2 (Rust) | 8.9 | 8.9 | 8.9 | 8.9 |
-| bzip2 (C) | 8.5 | 8.5 | 8.4 | 8.4 |
+| JSON | 37,919,682 | 37,919,682 | 38,092,338 | 37,924,937 |
+| Binaries | 40,118,359 | 39,501,755 | 40,423,634 | 40,496,770 |
 
-| Decode MiB/s | 1T | 2T |
-|---|---:|---:|
-| **bzip2-turbo** | **47.0** | **66.0** |
-| 7zz | 46.4 | 64.8 |
-| bzip2 (Rust) | 34.4 | 34.5 |
-| bzip2 (C) | 35.7 | 35.7 |
+Decoding a bzip2-turbo level-9 stream:
 
-### x86-64 (Intel Xeon)
+| Seconds | 1T | 2T | 4T | 8T | 16T |
+|---|---:|---:|---:|---:|---:|
+| JSON, bzip2-turbo | **2.96** | **2.05** | **1.06** | **0.89** | **0.79** |
+| JSON, lbzip2 | 3.36 | 2.06 | 1.23 | 0.97 | 0.82 |
+| Binaries, bzip2-turbo | **1.13** | **0.62** | **0.31** | **0.18** | **0.11** |
+| Binaries, lbzip2 | 1.27 | 0.69 | 0.35 | 0.21 | 0.12 |
 
-| Encode MiB/s | 1T | 2T | 4T | 8T |
-|---|---:|---:|---:|---:|
-| **bzip2-turbo** | **13.0** | **22.3** | **39.9** | **45.9** |
-| 7zz | 9.3 | 16.8 | 30.2 | 38.0 |
-| bzip2 (Rust) | 11.0 | 10.9 | 10.9 | 10.8 |
-| bzip2 (C) | 9.8 | 9.7 | 9.7 | 9.7 |
-
-| Decode MiB/s | 1T | 2T |
-|---|---:|---:|
-| **bzip2-turbo** | **84.6** | **117.5** |
-| 7zz | 71.5 | 90.0 |
-| bzip2 (Rust) | 42.0 | 42.1 |
-| bzip2 (C) | 42.5 | 42.7 |
-
-- Decoding uses at most two threads, so it is measured at 1T and 2T only.
-- The standard `bzip2` crate is single-threaded, so its rate stays flat as
-  threads are added: at 2T bzip2-turbo encodes 2x and decodes 1.9x (ARM64)
-  to 2.8x (x86-64) faster.
-- These are combined totals; bzip2-turbo does not lead on every fixture.
-- [Per-fixture results, all levels and peak RSS](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmark.md),
-  [how to reproduce them](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmarking.md),
-  and the [decoder compared with 7zz case by case](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/decoder-performance.md).
+- bzip2-turbo's thread budget includes the calling thread, which also reads
+  input and writes output. `lbzip2 -n N` runs N compression threads plus
+  separate input and output threads.
+- The [benchmark notes](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmark.md),
+  [how to reproduce them](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmarking.md)
+  and the [decoder compared with 7zz](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/decoder-performance.md)
+  were measured on 0.1 on other hardware and describe its two-thread
+  decoder and seven-pass level 9.
 
 ## Attribution
 

@@ -12,21 +12,43 @@
   header end, discarding magics that occur inside block data. Output order,
   concatenated streams, randomised blocks, block and stream CRCs and the
   error-not-panic behaviour are unchanged.
-- Bound multithreaded decoder memory by the budget: N workers, at most 2N open
+- Bound multithreaded decoder memory by the budget: N workers, at most 4N open
   blocks holding at most 2 MiB of undelivered output each, and input read no
   further than a fixed window past the oldest block still needed.
   `memory_usage` and `low_memory_usage` grow linearly with N and report this
   bound; multithreaded workers use the compact inverse-BWT table on every
   platform, so on macOS ARM64 `memory_usage(N)` equals `low_memory_usage(N)`
   for N above one. A block encoded beyond a worker's 1.25 MiB lookahead, which
-  ordinary encoders never produce, is decoded serially from there on.
+  ordinary encoders never produce, is decoded serially from there on. At
+  N = 16 on macOS ARM64 the bound is 441.5 MiB.
 - With an output callback and several threads, workers call it one chunk at a
   time in stream order. Dropping or `into_inner` cancels and joins every
   worker.
-- Encode the two halves of a recursive optimisation trial (level 9's seven
-  passes, levels 7 and 8's two) on a spare thread of the encoder's budget
-  while the encoder drains its last blocks (`finish`, `flush`, `flush_block`)
-  and fewer blocks than threads are in flight. Output bytes are unchanged.
+- Encode the two halves of a recursive optimisation trial (two passes by
+  default at levels 7 to 9, or any explicit `passes` above one) on a spare
+  thread of the encoder's budget while the encoder drains its last blocks
+  (`finish`, `flush`, `flush_block`) and fewer blocks than threads are in
+  flight. Output bytes are unchanged.
+- Sort each block's rotations with a cyclic induced sorter (SA-IS class,
+  written for rotations: no sentinel and no doubled input). A block is
+  primitive when it is not a repetition of a shorter string; a primitive
+  block has exactly one rotation order, so the BWT and origin, and therefore
+  the output bytes, equal the previous sorter's. Blocks below 2,048 bytes and
+  repetitions keep the previous sorter. The two sorters share one buffer, so
+  sort memory is the larger of their needs: at a 900,000-byte block about
+  7.5 MB on macOS ARM64 and 8.1 MB elsewhere.
+- Level 9 now runs two optimisation passes by default instead of seven.
+  `EncoderOptions { passes: Some(7), .. }` keeps the previous level-9 output,
+  which is 7-Zip's level 9 byte for byte; the new default matches 7-Zip's
+  `-mx=9 -mpass=2`. Measured on an Apple M5 Max: a 256 MiB JSON corpus
+  encodes to the same 37,919,682 bytes either way; a 96 MiB corpus of build
+  binaries grows from 39,501,755 to 40,118,359 bytes (+1.6%). Both stay below
+  `lbzip2 -9` (38,092,338 and 40,423,634 bytes).
+- Encoder scratch (sort, entropy and trial buffers) now belongs to threads:
+  each worker, the calling thread and each lent helper owns one. A block slot
+  keeps only its input and its encoded output, and up to four slots per
+  thread may be open, so workers keep running while an earlier block
+  finishes. Output bytes are unchanged.
 
 ## 0.1.1
 

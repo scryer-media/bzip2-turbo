@@ -46,7 +46,8 @@
 //!   reproduce 7-Zip's bytes.
 //! - Compatibility [`Compression`] levels select 100,000-byte block increments
 //!   with a default of six; native `EncoderOptions` keeps 7-Zip's level and
-//!   pass mapping with a default of five.
+//!   pass mapping with a default of five, except that level nine runs two
+//!   passes where 7-Zip runs seven.
 //! - `work_factor` is validated in `0..=250` but does not tune the 7-Zip
 //!   sorter.
 //! - Compact decoding (`Decompress::new(true)`, [`Decoder::with_low_memory`])
