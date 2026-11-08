@@ -1,5 +1,14 @@
 # Native decoder improvements
 
+> **Version note.** Most of this document describes the 0.1 decoder and was
+> measured on Linux Graviton3 and Intel Xeon hosts. Those results are older
+> and come from other hardware; they have not been re-measured for 0.2. In
+> 0.2, a thread budget of N above one runs N block workers instead of 0.1's
+> parser plus one reconstruction worker (see
+> [Follow the complete stream](#follow-the-complete-stream)). The only 0.2
+> decode measurements are the README's, taken on one Apple M5 Max against
+> lbzip2.
+
 The native `Decoder` changes in runtime commit `8a2188e6b667` were selected
 from paired measurements against the pinned 7-Zip 26.04 reference. The
 decode-parity follow-up measured below brings native decoding to 7zz's time or
@@ -14,8 +23,24 @@ separate incremental parser; native-parser timings do not measure that API.
 Single-threaded decoding parses one compressed block, constructs its inverse-BWT
 lookup table, reconstructs bounded chunks, updates the CRC and supplies bytes
 through `Read`. CRC verification completes at the block boundary; a later
-CRC error cannot retract a prefix already returned to the caller. Multithreaded decoding overlaps parsing with one
-reconstruction worker. Increasing the requested thread count above two does
+CRC error cannot retract a prefix already returned to the caller.
+
+In 0.2, multithreaded decoding with a budget of N runs N block workers. The
+calling thread reads input in 1 MiB chunks, scans every bit offset for the
+block magic and delivers output in order; each worker decodes one candidate
+block at a time, speculatively: entropy decode, inverse-BWT table and output.
+An in-order chain keeps a candidate only where the previous block, any stream
+trailer and any following stream header end, and discards magics found inside
+block data. At most two blocks per worker are open; a worker pauses a block
+once it holds 2 MiB of undelivered output, so each holds at most 3 MiB. The
+caller reads no further than a fixed
+window past the oldest input it still needs (`src/decoder/parallel.rs`).
+Workers always use the compact inverse-BWT table, and each owns its own TT and
+last column.
+
+The rest of this section describes the 0.1 multithreaded decoder, which the
+measurements below used. It overlapped parsing with one
+reconstruction worker. Increasing the requested thread count above two did
 not create more reconstruction workers. As in `RunScout`, the parser queues
 the next block as soon as it is parsed, so the worker can start it at a block
 boundary without waiting for the caller to observe the previous block's end.
@@ -133,8 +158,9 @@ last column of any level fits one 2 MiB page. The TT is sized once at the
 stream's declared block limit and is never shrunk or reallocated while it is
 large enough; a later member with a larger level grows it once. Last columns
 come from a small recycled pool instead of a fresh allocation per block: one
-owner when single-threaded, returned as soon as its TT is built, and at most
-two when pipelined, each returned with its block's completion message. The
+owner when single-threaded, returned as soon as its TT is built. In 0.1's
+pipelined mode there were at most two, each returned with its block's
+completion message; in 0.2 each multithreaded worker owns one. The
 kernel honours the advice only when transparent huge pages are set to
 `madvise` or `always`; with `never` these buffers use ordinary 4 KiB pages, as
 before.
@@ -158,9 +184,14 @@ requested-allocation subtotal is 7,421,148 bytes, below the documented 8 MiB
 estimate: a 4 MiB level-9 TT, one 2 MiB last-column page, the 1 MiB output
 buffer, the 32 KiB input buffer and 48,348 bytes of retained entropy tables.
 On other 64-bit targets the exact-size TT and 900,000-byte last column give
-5,629,692 bytes, below the 6 MiB estimate. With two threads, the Linux
-subtotal is 9,649,372 bytes, below 12 MiB: the TT, two last-column pages,
-eighteen 64 KiB worker output chunks, the input buffer and the tables.
+5,629,692 bytes, below the 6 MiB estimate. With two threads, 0.1's Linux
+subtotal was 9,649,372 bytes, below 12 MiB: the TT, two last-column pages,
+eighteen 64 KiB worker output chunks, the input buffer and the tables. That
+figure does not apply to 0.2. There, `Decoder::memory_usage(N)` for N above
+one grows linearly with N: each worker's compact TT, last column, entropy
+scratch and output chunk, at most 2N open blocks of up to 3 MiB each, and the
+bounded input window. At N = 16 on macOS ARM64 the bound is 305.5 MiB,
+computed from the code's bound, not measured.
 These exclude the reader, stack, allocator metadata and other exclusions
 stated by the public memory estimate; they are not a whole-process RSS
 promise. Byte selectors offset the larger single-threaded output buffer.
@@ -174,6 +205,9 @@ CRC rejection and callback failure. Existing interoperability tests verify
 reference bytes and malformed-stream handling.
 
 ## Measured results
+
+These are older 0.1 results from other hardware, taken before the 0.2
+N-worker decoder; "2T" below means the parser plus one reconstruction worker.
 
 The decode-parity follow-up (the clamped and register-addressed scatter,
 run-ahead, huge-page TT storage mapped through `mmap`, the CDecoder Huffman

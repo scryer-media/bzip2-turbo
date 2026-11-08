@@ -32,9 +32,13 @@ and `bzip2-sys` 0.1.13+1.0.8 for `c`. The pure graph must exclude `bzip2-sys`;
 the C graph must exclude `libbz2-rs-sys`. Both drivers require one thread and
 use the same standard I/O buffering as the turbo compatibility driver. Native
 turbo and 7zz can use matching explicit worker counts; reports retain the
-serial reference thread count. Native decoding uses at most two threads, so the
+serial reference thread count. Since 0.2, native turbo's encoder `threads = N`
+above one runs N compression workers plus the calling thread for input and
+output; one thread encodes on the calling thread alone. The
 suite times decode at 1 and 2 threads only; higher budgets time encoding and
-record decode as a skipped scenario. This is benchmark-only isolation, not a library
+record decode as a skipped scenario. That cap dates from 0.1, whose native
+decoder used at most two threads. The 0.2 decoder runs N block workers, so the
+cap is now the harness's, not the decoder's. This is benchmark-only isolation, not a library
 backend feature or runtime dependency.
 
 The harness defaults to `--settings block-size`: indices 1, 5 and 9 mean
@@ -47,7 +51,9 @@ counts do not make the encoder algorithms identical.
 Optional `--settings sevenzip-level` preserves historical native defaults;
 numeric levels alone then differ in effective settings. Native level 5 uses a
 900,000-byte block versus standard bzip2's 500,000, and native level 9 uses
-seven recursive passes versus the standard pipeline's one. Reports record
+seven recursive passes versus the standard pipeline's one. Turbo's own level 9
+default has been one pass since 0.2, so the harness passes seven to turbo
+explicitly at level 9 to keep this series comparable. Reports record
 per-contender block bytes, passes, policy and matching flags. Interpret these
 historical rows with those differences; they are not equal-setting comparisons.
 Compatibility turbo always uses standard block sizing and one pass, with 7zz
@@ -102,8 +108,8 @@ main text workload. Run from
 and `go run . legacy-compare --codec EXE --oracle EXE --input FILE --results JSON`.
 The corpus bytes, CLI options, report keys, alternating order, Darwin resource
 counters and strict unrounded parity criterion match the historical tools,
-except that decode timings stop at two threads, the most the native decoder
-uses; bytes are still checked at every thread count.
+except that decode timings stop at two threads, the most the 0.1 native
+decoder used; bytes are still checked at every thread count.
 Platform identity fields use Go OS/architecture names; supply `--hardware` for
 a precise machine description. Four 1 MiB corpus SHA-256 characterizations and
 a tiny comparison schema/identity smoke check verified the migration.
