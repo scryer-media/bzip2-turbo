@@ -24,9 +24,9 @@
   time in stream order. Dropping or `into_inner` cancels and joins every
   worker.
 - Encode the two halves of a recursive optimisation trial (level 9's seven
-  passes, levels 7 and 8's two) on a spare thread of the encoder's budget when
-  fewer blocks than threads are in flight, such as the last blocks of a
-  stream. Output bytes are unchanged.
+  passes, levels 7 and 8's two) on a spare thread of the encoder's budget
+  while the encoder drains its last blocks (`finish`, `flush`, `flush_block`)
+  and fewer blocks than threads are in flight. Output bytes are unchanged.
 
 ## 0.1.1
 

@@ -153,6 +153,11 @@ const MIN_HELPED_INPUT: usize = 1 << 15;
 /// Threads of an encoder's budget that are not encoding a block, lent to the
 /// halves of recursive trials.
 struct Helpers {
+    /// Whether threads may be lent. The encoder opens lending only while it
+    /// drains its last pending blocks: while blocks still arrive, a thread
+    /// that is idle for a moment is not spare, and lending it left the block
+    /// jobs and their helpers competing for cores once the next block came.
+    lending: AtomicBool,
     /// The budget minus executing block jobs and running helpers. A block job
     /// that starts while every thread helps may take it below zero briefly.
     idle: AtomicIsize,
@@ -161,14 +166,18 @@ struct Helpers {
 }
 
 impl Helpers {
-    fn new(threads: usize) -> Self {
+    fn new(threads: usize, lending: bool) -> Self {
         Self {
+            lending: AtomicBool::new(lending),
             idle: AtomicIsize::new(threads as isize),
             spare: Mutex::new(Vec::new()),
         }
     }
 
     fn claim(&self) -> Option<Claim<'_>> {
+        if !self.lending.load(Ordering::Acquire) {
+            return None;
+        }
         self.idle
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |idle| {
                 (idle > 0).then(|| idle - 1)
@@ -296,7 +305,7 @@ struct Pool {
 }
 
 impl Pool {
-    fn new(threads: usize) -> io::Result<Self> {
+    fn new(threads: usize, lending: bool) -> io::Result<Self> {
         let (jobs, input) = mpsc::sync_channel::<Job>(threads);
         let input = Arc::new(Mutex::new(input));
         let (output, results) = mpsc::channel();
@@ -306,7 +315,7 @@ impl Pool {
             input: input.clone(),
             workers: Vec::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
-            helpers: Arc::new(Helpers::new(threads)),
+            helpers: Arc::new(Helpers::new(threads, lending)),
         };
         pool.workers
             .try_reserve_exact(threads - 1)
@@ -442,6 +451,8 @@ pub struct Encoder<W: Write> {
     pending: VecDeque<Option<Slot>>,
     output_sequence: usize,
     pool: Option<Pool>,
+    // Whether the pool may lend threads to trial halves; see `drain`.
+    lending: bool,
     failure: bool,
 }
 
@@ -491,6 +502,7 @@ impl<W: Write> Encoder<W> {
             pending: VecDeque::new(),
             output_sequence: 0,
             pool: None,
+            lending: false,
             failure: false,
         }
     }
@@ -682,7 +694,7 @@ impl<W: Write> Encoder<W> {
             self.accept(slot)?;
         } else {
             if self.pool.is_none() {
-                self.pool = Some(Pool::new(self.options.threads)?);
+                self.pool = Some(Pool::new(self.options.threads, self.lending)?);
             }
             let sequence = self
                 .output_sequence
@@ -840,12 +852,37 @@ impl<W: Write> Encoder<W> {
     pub(crate) fn flush_block(&mut self) -> io::Result<()> {
         self.guarded(|this| {
             this.emit_run();
-            this.submit()?;
-            while !this.pending.is_empty() {
-                this.wait_first()?;
-            }
+            this.drain(true)?;
             this.header()
         })
+    }
+
+    /// Submits the filling block when `submit` is set, then waits for every
+    /// pending block. No block follows until this returns, so a thread that
+    /// finishes its block is truly spare; only here may the pool lend it to
+    /// the remaining blocks' trial halves.
+    fn drain(&mut self, submit: bool) -> io::Result<()> {
+        self.lend(true);
+        let result = self.drain_pending(submit);
+        self.lend(false);
+        result
+    }
+
+    fn drain_pending(&mut self, submit: bool) -> io::Result<()> {
+        if submit {
+            self.submit()?;
+        }
+        while !self.pending.is_empty() {
+            self.wait_first()?;
+        }
+        Ok(())
+    }
+
+    fn lend(&mut self, lending: bool) {
+        self.lending = lending;
+        if let Some(pool) = &self.pool {
+            pool.helpers.lending.store(lending, Ordering::Release);
+        }
     }
 
     /// Completes the stream, joins pending work and returns the flushed writer.
@@ -856,10 +893,7 @@ impl<W: Write> Encoder<W> {
     pub fn finish(mut self) -> io::Result<W> {
         self.guarded(|this| {
             this.emit_run();
-            this.submit()?;
-            while !this.pending.is_empty() {
-                this.wait_first()?;
-            }
+            this.drain(true)?;
             this.header()?;
             let crc = this.combined_crc.to_be_bytes();
             let footer = [
@@ -882,9 +916,7 @@ impl<W: Write> Write for Encoder<W> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.guarded(|this| {
-            while !this.pending.is_empty() {
-                this.wait_first()?;
-            }
+            this.drain(false)?;
             this.header()?;
             this.output.as_mut().unwrap().flush()
         })
@@ -1150,7 +1182,7 @@ mod tests {
             let passes: &[u32] = if index == 3 { &[2, 3, 10] } else { &[2, 7] };
             for &passes in passes {
                 for threads in [2, 16] {
-                    let helpers = Helpers::new(threads);
+                    let helpers = Helpers::new(threads, true);
                     serial.trial.reset();
                     serial.tree(input, passes, true, None).unwrap();
                     let mut helped = Scratch::new();
@@ -1173,7 +1205,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_helper_panic_fails_the_block_and_returns_the_thread() {
-        let helpers = Arc::new(Helpers::new(4));
+        let helpers = Arc::new(Helpers::new(4, true));
         let mut slot = job(0, &[0u8; 4]).slot;
         slot.input.clear();
         // A helped block encodes and returns every lent thread.
@@ -1192,6 +1224,54 @@ mod tests {
         bad.panic = true;
         assert!(execute(bad).result.is_err());
         assert_eq!(helpers.idle.load(Ordering::Acquire), 4);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn threads_are_lent_only_while_the_encoder_drains() {
+        // Closed lending lends nothing and leaves the count untouched.
+        let closed = Helpers::new(4, false);
+        assert!(closed.claim().is_none());
+        assert_eq!(closed.idle.load(Ordering::Acquire), 4);
+        // Blocks submitted while writing do not open it; a drain opens it
+        // and closes it again, also when it creates the pool itself.
+        let input: Vec<u8> = (0..450_000u32).map(|i| (i * 7 % 253) as u8).collect();
+        let options = EncoderOptions {
+            threads: 4,
+            block_size: Some(100_000),
+            passes: Some(3),
+            ..Default::default()
+        };
+        let mut writing = Encoder::new(Vec::new(), options.clone());
+        writing.write_all(&input).unwrap();
+        let lending = |encoder: &Encoder<Vec<u8>>| {
+            encoder
+                .pool
+                .as_ref()
+                .unwrap()
+                .helpers
+                .lending
+                .load(Ordering::Acquire)
+        };
+        assert!(!lending(&writing));
+        writing.flush().unwrap();
+        assert!(!writing.lending && !lending(&writing));
+        let mut small = Encoder::new(Vec::new(), options.clone());
+        small.write_all(&input[..60_000]).unwrap();
+        assert!(small.pool.is_none());
+        small.flush_block().unwrap();
+        assert!(!small.lending && !lending(&small));
+        // Lending changes no byte.
+        let serial = Encoder::new(
+            Vec::new(),
+            EncoderOptions {
+                threads: 1,
+                ..options
+            },
+        );
+        let mut serial = serial;
+        serial.write_all(&input).unwrap();
+        assert!(writing.finish().unwrap() == serial.finish().unwrap());
     }
 
     fn job(sequence: usize, input: &[u8]) -> Job {
@@ -1218,7 +1298,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let pool = Pool::new(2).unwrap();
+        let pool = Pool::new(2, false).unwrap();
         let gate = Arc::new(std::sync::Barrier::new(2));
         let mut first = job(0, b"first owned block");
         first.gate = Some(gate.clone());
@@ -1244,7 +1324,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn worker_and_caller_panics_report_sequence_and_cancel_queued_slots() {
-        let pool = Pool::new(2).unwrap();
+        let pool = Pool::new(2, false).unwrap();
         let mut bad = job(17, b"panic block");
         bad.panic = true;
         assert!(pool.jobs.as_ref().unwrap().send(bad).is_ok());
