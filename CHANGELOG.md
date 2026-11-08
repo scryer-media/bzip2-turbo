@@ -25,7 +25,7 @@
   time in stream order. Dropping or `into_inner` cancels and joins every
   worker.
 - Encode the two halves of a recursive optimisation trial (two passes by
-  default at levels 7 to 9, or any explicit `passes` above one) on a spare
+  default at levels 7 and 8, or any explicit `passes` above one) on a spare
   thread of the encoder's budget while the encoder drains its last blocks
   (`finish`, `flush`, `flush_block`) and fewer blocks than threads are in
   flight. Output bytes are unchanged.
@@ -37,13 +37,20 @@
   repetitions keep the previous sorter. The two sorters share one buffer, so
   sort memory is the larger of their needs: at a 900,000-byte block about
   7.5 MB on macOS ARM64 and 8.1 MB elsewhere.
-- Level 9 now runs two optimisation passes by default instead of seven.
-  `EncoderOptions { passes: Some(7), .. }` keeps the previous level-9 output,
-  which is 7-Zip's level 9 byte for byte; the new default matches 7-Zip's
-  `-mx=9 -mpass=2`. Measured on an Apple M5 Max: a 256 MiB JSON corpus
-  encodes to the same 37,919,682 bytes either way; a 96 MiB corpus of build
-  binaries grows from 39,501,755 to 40,118,359 bytes (+1.6%). Both stay below
-  `lbzip2 -9` (38,092,338 and 40,423,634 bytes).
+- Level 9 now runs one optimisation pass by default instead of seven, so its
+  default output equals level 5's. Any pass count above one also runs 7-Zip's
+  Huffman table optimisation, which made level 9 about four times slower than
+  `lbzip2 -9`. `EncoderOptions { passes: Some(7), .. }` keeps the previous
+  level-9 output, which is 7-Zip's level 9 byte for byte; the new default
+  matches 7-Zip's `-mx=9 -mpass=1`. Measured on an Apple M5 Max:
+
+  | Bytes | 1 pass (new default) | 2 passes | 7 passes (old default) | `lbzip2 -9` | `bzip2 -9` |
+  |---|---:|---:|---:|---:|---:|
+  | 256 MiB JSON | 37,924,470 | 37,919,682 | 37,919,682 | 38,092,338 | 37,924,937 |
+  | 96 MiB build binaries | 40,497,139 | 40,146,131 | 39,575,538 | 40,326,306 | 40,499,587 |
+
+  One pass grows the binaries by 2.3% over seven and leaves them 0.4% larger
+  than `lbzip2 -9`; JSON grows by 0.01% and stays smaller than both.
 - Encoder scratch (sort, entropy and trial buffers) now belongs to threads:
   each worker, the calling thread and each lent helper owns one. A block slot
   keeps only its input and its encoded output, and up to four slots per

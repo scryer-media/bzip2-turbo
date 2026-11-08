@@ -222,7 +222,7 @@ func (t tools) ours(s scenario, mode, in, out string) []string {
 	if s.API == "native" && t.settings != "sevenzip-level" && mode == "encode" {
 		argv = append(argv, strconv.Itoa(s.Level*100000), "1")
 	}
-	// Turbo's level nine defaults to two passes; 7-Zip's runs seven.
+	// Turbo's level nine defaults to one pass; 7-Zip's runs seven.
 	if s.API == "native" && t.settings == "sevenzip-level" && mode == "encode" && s.Level == 9 {
 		argv = append(argv, "-", "7")
 	}

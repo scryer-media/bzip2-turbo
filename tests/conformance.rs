@@ -80,11 +80,11 @@ fn corpus() -> Vec<Vec<u8>> {
 fn seven_zip_encoding_is_byte_exact_at_every_level() {
     for (case, input) in corpus().iter().enumerate() {
         for level in 1..=9 {
-            // Level nine defaults to two passes where 7-Zip runs seven, so
-            // the default is checked against 7-Zip's two-pass level nine and
+            // Level nine defaults to one pass where 7-Zip runs seven, so
+            // the default is checked against 7-Zip's one-pass level nine and
             // seven explicit passes against 7-Zip's own level nine.
             let variants: &[(Option<u32>, &[&str])] = if level == 9 {
-                &[(None, &["-mpass=2"]), (Some(7), &[])]
+                &[(None, &["-mpass=1"]), (Some(7), &[])]
             } else {
                 &[(None, &[])]
             };
@@ -373,6 +373,8 @@ fn encoder_matches_reference_on_periodic_and_run_block_boundaries() {
                     EncoderOptions {
                         level,
                         threads,
+                        // 7-Zip's level nine runs seven passes.
+                        passes: (level == 9).then_some(7),
                         ..Default::default()
                     },
                 );
