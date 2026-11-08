@@ -1,8 +1,9 @@
 //! Move-owned reusable worker slots for incremental BZip2 encoding.
 // Translation of BZip2Encoder.cpp from 7-Zip, LGPL-2.1-or-later.
 // https://github.com/ip7z/7zip/blob/9128b80e3a471108678e2b3ec3c985861c8d7b0f/CPP/7zip/Compress/BZip2Encoder.cpp
-// Changes: bounded owned slots, initialized typed storage, joined teardown and
-// helper threads for the independent halves of a recursive trial.
+// Changes: bounded owned slots, thread-owned scratch, initialized typed
+// storage, joined teardown and helper threads for the independent halves of a
+// recursive trial.
 
 use super::{
     EncoderOptions, block_crc, entropy::Entropy, induced_sort::Workspace, repeated_prefix,
@@ -227,11 +228,57 @@ impl Drop for Claim<'_> {
     }
 }
 
+/// The encoding scratch a thread owns: each worker, the caller and every
+/// helper keep one, allocated on its first block. A one-element vector gives
+/// fallible allocation, and fixed Huffman arrays never move between threads.
+fn owned_scratch(owned: &mut Vec<Scratch>) -> io::Result<&mut Scratch> {
+    if owned.is_empty() {
+        owned.try_reserve_exact(1).map_err(io::Error::other)?;
+        owned.push(Scratch::new());
+    }
+    Ok(&mut owned[0])
+}
+
+/// Open slots per thread of the budget. Slots hold only input and encoded
+/// output, so several per thread are cheap; they let workers run ahead of a
+/// slow block while the caller still delivers in input order.
+///
+/// Memory: each thread that encodes (N workers including the caller, plus
+/// at most N lent helpers) owns one `Scratch`, whose trial output stays below
+/// 4 MiB; each of the at most 4N slots holds a block of input and that
+/// block's selected output, at most 17n/8 + 6060 bytes for n input bytes.
+const SLOTS_PER_THREAD: usize = 4;
+
+/// A block's selected bits and CRCs, copied out of the encoding thread's
+/// trial scratch so that scratch can take the next block at once.
+#[derive(Default)]
+struct Encoded {
+    bytes: Vec<u8>,
+    bits: usize,
+    crcs: Vec<u32>,
+}
+
+impl Encoded {
+    fn copy_from(&mut self, trial: &TrialWriter) -> io::Result<()> {
+        let output = trial.output();
+        self.bytes.clear();
+        self.bytes
+            .try_reserve(output.len())
+            .map_err(io::Error::other)?;
+        self.bytes.extend_from_slice(output);
+        self.crcs.clear();
+        self.crcs
+            .try_reserve(trial.crcs().len())
+            .map_err(io::Error::other)?;
+        self.crcs.extend_from_slice(trial.crcs());
+        self.bits = trial.bit_len();
+        Ok(())
+    }
+}
+
 struct Slot {
     input: Vec<u8>,
-    // A one-element vector gives fallible allocation and cheap ownership
-    // transfer: fixed Huffman arrays are never copied through job channels.
-    scratch: Vec<Scratch>,
+    encoded: Encoded,
 }
 
 impl Slot {
@@ -240,16 +287,21 @@ impl Slot {
         input
             .try_reserve_exact(block_limit + 1)
             .map_err(io::Error::other)?;
-        let mut scratch = Vec::new();
-        scratch.try_reserve_exact(1).map_err(io::Error::other)?;
-        scratch.push(Scratch::new());
-        Ok(Self { input, scratch })
+        Ok(Self {
+            input,
+            encoded: Encoded::default(),
+        })
     }
 
-    fn encode(&mut self, passes: u32, helpers: Option<&Helpers>) -> io::Result<()> {
-        let scratch = &mut self.scratch[0];
+    fn encode(
+        &mut self,
+        scratch: &mut Scratch,
+        passes: u32,
+        helpers: Option<&Helpers>,
+    ) -> io::Result<()> {
         scratch.trial.reset();
-        scratch.tree(&self.input, passes, passes > 1, helpers)
+        scratch.tree(&self.input, passes, passes > 1, helpers)?;
+        self.encoded.copy_from(&scratch.trial)
     }
 }
 
@@ -270,7 +322,7 @@ struct Completed {
     result: io::Result<()>,
 }
 
-fn execute(mut job: Job) -> Completed {
+fn execute(mut job: Job, owned: &mut Vec<Scratch>) -> Completed {
     let helpers = job.helpers.take();
     if let Some(helpers) = &helpers {
         helpers.idle.fetch_sub(1, Ordering::AcqRel);
@@ -282,9 +334,14 @@ fn execute(mut job: Job) -> Completed {
         }
         #[cfg(test)]
         assert!(!job.panic, "injected encoder job panic");
-        job.slot.encode(job.passes, helpers.as_deref())
+        let scratch = owned_scratch(owned)?;
+        job.slot.encode(scratch, job.passes, helpers.as_deref())
     }))
-    .unwrap_or_else(|_| Err(io::Error::other("BZip2 worker panicked")));
+    .unwrap_or_else(|_| {
+        // Scratch interrupted by a panic is discarded rather than reused.
+        owned.clear();
+        Err(io::Error::other("BZip2 worker panicked"))
+    });
     if let Some(helpers) = &helpers {
         helpers.idle.fetch_add(1, Ordering::AcqRel);
     }
@@ -305,8 +362,9 @@ struct Pool {
 }
 
 impl Pool {
-    fn new(threads: usize, lending: bool) -> io::Result<Self> {
-        let (jobs, input) = mpsc::sync_channel::<Job>(threads);
+    fn new(threads: usize, slots: usize, lending: bool) -> io::Result<Self> {
+        // Every open slot can wait queued, so submitting never blocks.
+        let (jobs, input) = mpsc::sync_channel::<Job>(slots);
         let input = Arc::new(Mutex::new(input));
         let (output, results) = mpsc::channel();
         let mut pool = Self {
@@ -325,6 +383,7 @@ impl Pool {
             let output = output.clone();
             let cancelled = pool.cancelled.clone();
             let worker = thread::Builder::new().spawn(move || {
+                let mut scratch = Vec::new();
                 loop {
                     if cancelled.load(Ordering::Acquire) {
                         break;
@@ -339,7 +398,7 @@ impl Pool {
                     if cancelled.load(Ordering::Acquire) {
                         break;
                     }
-                    let completed = execute(job);
+                    let completed = execute(job, &mut scratch);
                     let failed = completed.result.is_err();
                     if output.send(completed).is_err() || failed {
                         break;
@@ -445,12 +504,17 @@ pub struct Encoder<W: Write> {
     block_limit: usize,
     // Every allocated slot is exactly one of free, filling, or pending. Queued,
     // executing and completed jobs all occupy their existing pending entry.
+    // At most `max_slots` are allocated: one serially, otherwise
+    // `SLOTS_PER_THREAD` per thread of the budget.
+    max_slots: usize,
     free: Vec<Slot>,
     filling: Option<Slot>,
     allocated: usize,
     pending: VecDeque<Option<Slot>>,
     output_sequence: usize,
     pool: Option<Pool>,
+    // The caller's own scratch, for serial blocks and queued jobs it runs.
+    scratch: Vec<Scratch>,
     // Whether the pool may lend threads to trial halves; see `drain`.
     lending: bool,
     failure: bool,
@@ -486,6 +550,11 @@ impl<W: Write> Encoder<W> {
                 })
                 .clamp(1, 10),
         );
+        let max_slots = if options.threads == 1 {
+            1
+        } else {
+            options.threads * SLOTS_PER_THREAD
+        };
         Self {
             output: Some(output),
             options,
@@ -496,12 +565,14 @@ impl<W: Write> Encoder<W> {
             run_byte: 0,
             run_count: 0,
             block_limit: multiplier * 100_000 - 1,
+            max_slots,
             free: Vec::new(),
             filling: None,
             allocated: 0,
             pending: VecDeque::new(),
             output_sequence: 0,
             pool: None,
+            scratch: Vec::new(),
             lending: false,
             failure: false,
         }
@@ -532,6 +603,7 @@ impl<W: Write> Encoder<W> {
         self.pending.clear();
         self.filling = None;
         self.free.clear();
+        self.scratch.clear();
         self.allocated = 0;
     }
 
@@ -558,7 +630,7 @@ impl<W: Write> Encoder<W> {
             self.allocated,
             self.free.len() + usize::from(self.filling.is_some()) + self.pending.len()
         );
-        debug_assert!(self.allocated <= self.options.threads);
+        debug_assert!(self.allocated <= self.max_slots);
     }
 
     fn acquire(&mut self) -> io::Result<()> {
@@ -566,17 +638,17 @@ impl<W: Write> Encoder<W> {
             return Ok(());
         }
         self.harvest()?;
-        while self.free.is_empty() && self.allocated == self.options.threads {
+        while self.free.is_empty() && self.allocated == self.max_slots {
             self.wait_first()?;
         }
         let mut slot = if let Some(slot) = self.free.pop() {
             slot
         } else {
             self.free
-                .try_reserve_exact(self.options.threads)
+                .try_reserve_exact(self.max_slots)
                 .map_err(io::Error::other)?;
             self.pending
-                .try_reserve(self.options.threads)
+                .try_reserve(self.max_slots)
                 .map_err(io::Error::other)?;
             let slot = Slot::new(self.block_limit)?;
             self.allocated += 1;
@@ -588,17 +660,19 @@ impl<W: Write> Encoder<W> {
         Ok(())
     }
 
-    fn accept(&mut self, mut slot: Slot) -> io::Result<()> {
+    fn emit(&mut self, bytes: &[u8], bits: usize, crcs: &[u32]) -> io::Result<()> {
         self.header()?;
-        let trial = &slot.scratch[0].trial;
-        self.stream.append(
-            trial.output(),
-            trial.bit_len(),
-            self.output.as_mut().unwrap(),
-        )?;
-        for &crc in trial.crcs() {
+        self.stream
+            .append(bytes, bits, self.output.as_mut().unwrap())?;
+        for &crc in crcs {
             self.combined_crc = self.combined_crc.rotate_left(1) ^ crc;
         }
+        Ok(())
+    }
+
+    fn accept(&mut self, mut slot: Slot) -> io::Result<()> {
+        let encoded = &slot.encoded;
+        self.emit(&encoded.bytes, encoded.bits, &encoded.crcs)?;
         slot.input.clear();
         self.free.push(slot);
         self.check_slots();
@@ -628,7 +702,8 @@ impl<W: Write> Encoder<W> {
         }
         while self.pending.front().is_some_and(Option::is_none) {
             if let Some(job) = self.pool.as_ref().unwrap().take_job() {
-                self.store(execute(job))?;
+                let completed = execute(job, &mut self.scratch);
+                self.store(completed)?;
                 continue;
             }
             let completed = self
@@ -689,12 +764,25 @@ impl<W: Write> Encoder<W> {
             return Ok(());
         }
         if self.options.threads == 1 {
+            // Serial blocks are written straight from the caller's trial.
             let mut slot = self.filling.take().unwrap();
-            slot.encode(self.options.passes.unwrap(), None)?;
-            self.accept(slot)?;
+            let mut owned = std::mem::take(&mut self.scratch);
+            let scratch = owned_scratch(&mut owned)?;
+            scratch.trial.reset();
+            let passes = self.options.passes.unwrap();
+            scratch.tree(&slot.input, passes, passes > 1, None)?;
+            let trial = &scratch.trial;
+            self.emit(trial.output(), trial.bit_len(), trial.crcs())?;
+            self.scratch = owned;
+            slot.input.clear();
+            self.free.push(slot);
         } else {
             if self.pool.is_none() {
-                self.pool = Some(Pool::new(self.options.threads, self.lending)?);
+                self.pool = Some(Pool::new(
+                    self.options.threads,
+                    self.max_slots,
+                    self.lending,
+                )?);
             }
             let sequence = self
                 .output_sequence
@@ -722,7 +810,10 @@ impl<W: Write> Encoder<W> {
                 .try_send(job)
             {
                 Ok(()) => {}
-                Err(TrySendError::Full(job)) => self.store(execute(job))?,
+                Err(TrySendError::Full(job)) => {
+                    let completed = execute(job, &mut self.scratch);
+                    self.store(completed)?;
+                }
                 Err(TrySendError::Disconnected(_)) => {
                     return Err(io::Error::other("BZip2 job channel closed"));
                 }
@@ -1043,14 +1134,18 @@ mod tests {
         }
     }
 
-    fn capacities(slot: &Slot) -> (usize, usize, usize, usize) {
-        let work = &slot.scratch[0];
-        (
-            slot.input.capacity(),
-            work.sort.capacity(),
-            work.entropy.capacity(),
-            work.trial.capacity(),
-        )
+    fn capacities(slot: &Slot) -> (usize, usize) {
+        (slot.input.capacity(), slot.encoded.bytes.capacity())
+    }
+
+    fn scratch_capacities(scratch: &[Scratch]) -> Option<(usize, usize, usize)> {
+        scratch.first().map(|work| {
+            (
+                work.sort.capacity(),
+                work.entropy.capacity(),
+                work.trial.capacity(),
+            )
+        })
     }
 
     #[test]
@@ -1070,7 +1165,7 @@ mod tests {
                     encoder.allocated,
                     encoder.free.len() + encoder.pending.len() + 1
                 );
-                assert!(encoder.allocated <= encoder.options.threads);
+                assert!(encoder.allocated <= encoder.max_slots);
                 let slot = encoder.filling.as_mut().unwrap();
                 slot.input.extend((0..size).map(|i| (i % 251) as u8));
                 encoder.submit().unwrap();
@@ -1082,11 +1177,21 @@ mod tests {
                 encoder.pool.as_ref().map_or(0, |p| p.workers.len()),
                 encoder.options.threads - 1
             );
+            let expected_slots = if budget == 1 {
+                1
+            } else {
+                budget * SLOTS_PER_THREAD
+            };
+            assert_eq!(encoder.max_slots, expected_slots);
+            // Threads own the scratch; slots keep only input and encoded
+            // output. The serial caller has encoded every block itself.
+            assert!(budget > 1 || !encoder.scratch.is_empty());
+            let scratch = scratch_capacities(&encoder.scratch);
             let slot = &encoder.free[0];
             let capacity = capacities(slot);
-            let identity = slot.scratch.as_ptr();
+            let identity = slot.input.as_ptr();
             encoder.acquire().unwrap();
-            assert_eq!(encoder.filling.as_ref().unwrap().scratch.as_ptr(), identity);
+            assert_eq!(encoder.filling.as_ref().unwrap().input.as_ptr(), identity);
             encoder
                 .filling
                 .as_mut()
@@ -1096,6 +1201,7 @@ mod tests {
             encoder.submit().unwrap();
             encoder.flush().unwrap();
             assert_eq!(capacities(&encoder.free[0]), capacity);
+            assert_eq!(scratch_capacities(&encoder.scratch), scratch);
             encoder.finish().unwrap();
         }
     }
@@ -1134,7 +1240,7 @@ mod tests {
                         new.allocated,
                         new.free.len() + new.pending.len() + usize::from(new.filling.is_some())
                     );
-                    assert!(new.allocated <= new.options.threads);
+                    assert!(new.allocated <= new.max_slots);
                     old.flush().unwrap();
                     new.flush().unwrap();
                     assert_eq!(new.write(&[]).unwrap(), 0);
@@ -1216,13 +1322,13 @@ mod tests {
             ..job(1, &[])
         };
         good.slot = slot;
-        let completed = execute(good);
+        let completed = execute(good, &mut Vec::new());
         assert!(completed.result.is_ok());
         assert_eq!(helpers.idle.load(Ordering::Acquire), 4);
         let mut bad = job(2, b"panicking block");
         bad.helpers = Some(Arc::clone(&helpers));
         bad.panic = true;
-        assert!(execute(bad).result.is_err());
+        assert!(execute(bad, &mut Vec::new()).result.is_err());
         assert_eq!(helpers.idle.load(Ordering::Acquire), 4);
     }
 
@@ -1298,7 +1404,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let pool = Pool::new(2, false).unwrap();
+        let pool = Pool::new(2, 2, false).unwrap();
         let gate = Arc::new(std::sync::Barrier::new(2));
         let mut first = job(0, b"first owned block");
         first.gate = Some(gate.clone());
@@ -1308,7 +1414,7 @@ mod tests {
         encoder.pending.push_back(None);
         encoder.allocated = 2;
         encoder
-            .store(execute(job(1, b"second owned block")))
+            .store(execute(job(1, b"second owned block"), &mut Vec::new()))
             .unwrap();
         assert!(encoder.get_ref().is_empty());
         assert!(encoder.pending[0].is_none());
@@ -1324,7 +1430,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn worker_and_caller_panics_report_sequence_and_cancel_queued_slots() {
-        let pool = Pool::new(2, false).unwrap();
+        let pool = Pool::new(2, 2, false).unwrap();
         let mut bad = job(17, b"panic block");
         bad.panic = true;
         assert!(pool.jobs.as_ref().unwrap().send(bad).is_ok());
@@ -1353,7 +1459,9 @@ mod tests {
         ));
         let mut bad = job(99, b"caller help panic");
         bad.panic = true;
-        let result = execute(bad);
+        let mut scratch = Vec::new();
+        let result = execute(bad, &mut scratch);
+        assert!(scratch.is_empty());
         assert_eq!(result.sequence, 99);
         assert!(result.result.is_err());
     }
@@ -1466,7 +1574,7 @@ mod tests {
     fn retirement_overflow_is_a_sticky_error_without_writing_the_slot() {
         let mut encoder = Encoder::new(Vec::new(), EncoderOptions::default());
         let mut slot = job(0, b"retirement overflow block").slot;
-        slot.encode(1, None).unwrap();
+        slot.encode(&mut Scratch::new(), 1, None).unwrap();
         encoder.allocated = 1;
         encoder.pending.push_back(Some(slot));
         encoder.output_sequence = usize::MAX;
