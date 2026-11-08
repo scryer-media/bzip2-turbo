@@ -203,7 +203,11 @@ func TestHistoricalPolicyIsExplicitAndCompatibilityStaysNormalized(t *testing.T)
 		if p.BlockBytes != 900000 || (level == 9 && p.OptimizationPasses != 7) {
 			t.Fatal(p)
 		}
-		if len(tools.ours(s, "encode", "in", "out")) != 8 {
+		ours := tools.ours(s, "encode", "in", "out")
+		if level == 9 && !slices.Equal(ours[8:], []string{"-", "7"}) {
+			t.Fatal("seven-pass level nine not explicit", ours)
+		}
+		if level != 9 && len(ours) != 8 {
 			t.Fatal("historical defaults overridden")
 		}
 		s.API = "compat"

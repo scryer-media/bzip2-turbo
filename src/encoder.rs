@@ -38,8 +38,9 @@ pub struct EncoderOptions {
     /// block, not necessarily the number of original input bytes.
     pub block_size: Option<u32>,
     /// Recursive block optimization passes, clamped to 1..=10.
-    /// `None` selects seven passes at level nine, two at seven/eight, and one
-    /// at all other levels.
+    /// `None` selects two passes at levels seven through nine and one at all
+    /// other levels. 7-Zip runs seven at level nine; `Some(7)` reproduces its
+    /// level-nine output.
     pub passes: Option<u32>,
 }
 

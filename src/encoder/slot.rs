@@ -480,7 +480,7 @@ impl<W: Write> Encoder<W> {
             options
                 .passes
                 .unwrap_or(match options.level {
-                    9 => 7,
+                    9 => 2,
                     7 | 8 => 2,
                     _ => 1,
                 })

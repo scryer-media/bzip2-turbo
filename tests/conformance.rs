@@ -80,25 +80,37 @@ fn corpus() -> Vec<Vec<u8>> {
 fn seven_zip_encoding_is_byte_exact_at_every_level() {
     for (case, input) in corpus().iter().enumerate() {
         for level in 1..=9 {
-            let expected = oracle(input, level, 1, true);
-            for threads in [1, 2, 4] {
-                let mut encoder = Encoder::new(
-                    Vec::new(),
-                    EncoderOptions {
-                        level,
-                        threads,
-                        ..Default::default()
-                    },
-                );
-                for chunk in input.chunks(137) {
-                    encoder.write_all(chunk).unwrap();
+            // Level nine defaults to two passes where 7-Zip runs seven, so
+            // the default is checked against 7-Zip's two-pass level nine and
+            // seven explicit passes against 7-Zip's own level nine.
+            let variants: &[(Option<u32>, &[&str])] = if level == 9 {
+                &[(None, &["-mpass=2"]), (Some(7), &[])]
+            } else {
+                &[(None, &[])]
+            };
+            for &(passes, options) in variants {
+                let options: Vec<_> = options.iter().map(|option| option.to_string()).collect();
+                let expected = oracle_with_options(input, level, 1, true, &options);
+                for threads in [1, 2, 4] {
+                    let mut encoder = Encoder::new(
+                        Vec::new(),
+                        EncoderOptions {
+                            level,
+                            threads,
+                            passes,
+                            ..Default::default()
+                        },
+                    );
+                    for chunk in input.chunks(137) {
+                        encoder.write_all(chunk).unwrap();
+                    }
+                    let actual = encoder.finish().unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "case={case}, level={level}, passes={passes:?}, threads={threads}"
+                    );
+                    assert_eq!(oracle(&actual, level, threads, false), *input);
                 }
-                let actual = encoder.finish().unwrap();
-                assert_eq!(
-                    actual, expected,
-                    "case={case}, level={level}, threads={threads}"
-                );
-                assert_eq!(oracle(&actual, level, threads, false), *input);
             }
         }
     }

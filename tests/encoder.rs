@@ -48,7 +48,7 @@ fn default_options_match_reference_default_and_differ_from_level_nine() {
     });
     assert!(
         actual != high,
-        "fixture must distinguish one-pass and seven-pass defaults"
+        "fixture must distinguish one-pass and two-pass defaults"
     );
     let executable = std::env::var_os("BZIP2_TURBO_7ZZ").unwrap_or_else(|| "7zz".into());
     let mut child = Command::new(executable)
