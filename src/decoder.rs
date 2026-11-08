@@ -1511,7 +1511,7 @@ impl<R: Read> Decoder<R> {
     /// are included. Thread budgets follow [`Self::with_threads`].
     ///
     /// With N threads above one, each of the N workers owns a compact TT and a
-    /// last column sized for the format maximum, up to 4N blocks are open with
+    /// last column sized for the format maximum, up to 2N blocks are open with
     /// at most 3 MiB of output each, and the retained input is bounded by the
     /// lookahead of every open block and worker; the bound grows linearly in N
     /// and is the same as [`Self::low_memory_usage`].

@@ -12,7 +12,7 @@
   header end, discarding magics that occur inside block data. Output order,
   concatenated streams, randomised blocks, block and stream CRCs and the
   error-not-panic behaviour are unchanged.
-- Bound multithreaded decoder memory by the budget: N workers, at most 4N open
+- Bound multithreaded decoder memory by the budget: N workers, at most 2N open
   blocks holding at most 2 MiB of undelivered output each, and input read no
   further than a fixed window past the oldest block still needed.
   `memory_usage` and `low_memory_usage` grow linearly with N and report this
@@ -20,7 +20,7 @@
   platform, so on macOS ARM64 `memory_usage(N)` equals `low_memory_usage(N)`
   for N above one. A block encoded beyond a worker's 1.25 MiB lookahead, which
   ordinary encoders never produce, is decoded serially from there on. At
-  N = 16 on macOS ARM64 the bound is 441.5 MiB.
+  N = 16 on macOS ARM64 the bound is 305.5 MiB.
 - With an output callback and several threads, workers call it one chunk at a
   time in stream order. Dropping or `into_inner` cancels and joins every
   worker.

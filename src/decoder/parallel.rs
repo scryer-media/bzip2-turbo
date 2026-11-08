@@ -12,7 +12,7 @@
 //! the rest. Block and stream CRCs are checked as in the serial decoder.
 //!
 //! Memory is bounded by the thread budget N: N workers each own one TT and one
-//! last column, at most 4N slots are open, each slot buffers at most
+//! last column, at most 2N slots are open, each slot buffers at most
 //! `OUTPUT_CAP` output bytes, and the caller stops reading `window` bytes past
 //! the oldest input it still needs (see `retained`); a worker's job holds at
 //! most one lookahead of input. A block whose encoding does not
@@ -42,7 +42,7 @@ pub(super) const OUTPUT_CAP: usize = 2 << 20;
 /// Output chunk size without a callback; callbacks keep their 64 KiB chunks.
 const UNOBSERVED_CHUNK: usize = 1 << 20;
 /// Open slots per worker.
-pub(super) const SLOTS_PER_WORKER: usize = 4;
+pub(super) const SLOTS_PER_WORKER: usize = 2;
 /// The largest worker count; larger budgets are clamped to it.
 pub(crate) const MAX_WORKERS: usize = 64;
 const MASK48: u64 = (1 << 48) - 1;
