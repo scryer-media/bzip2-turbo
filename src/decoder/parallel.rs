@@ -422,7 +422,10 @@ fn parse_job(
         if magic != BLOCK_MAGIC {
             return Err(invalid("invalid BZip2 block marker"));
         }
-        read_block(bits, workspace, column, MAX_BLOCK)
+        // A failed parse drops the column and the worker's next job allocates
+        // a fresh one. Only false-positive magics and blocks beyond the
+        // lookahead fail here, so ordinary streams reuse it every block.
+        read_block(bits, workspace, std::mem::take(column), MAX_BLOCK)
     })();
     let block = match result {
         Ok(block) => block,

@@ -808,6 +808,10 @@ impl<R: Read> Parser<R> {
         self.started = true;
         Ok(true)
     }
+    // Keep the entropy loop in its own frame, as before `next_output` lost its
+    // pipelined worker path. Inlined there, a single-thread decode retired 3
+    // to 4% more instructions.
+    #[inline(never)]
     fn next(&mut self) -> io::Result<Option<Block>> {
         if self.finished {
             return Ok(None);
@@ -835,8 +839,8 @@ impl<R: Read> Parser<R> {
             if magic != BLOCK_MAGIC {
                 return Err(invalid("invalid BZip2 block marker"));
             }
-            let mut column = self.columns.take();
-            let block = read_block(&mut self.bits, &mut self.workspace, &mut column, self.limit)?;
+            let column = self.columns.take();
+            let block = read_block(&mut self.bits, &mut self.workspace, column, self.limit)?;
             self.combined = self.combined.rotate_left(1) ^ block.crc;
             return Ok(Some(block));
         }
@@ -876,46 +880,18 @@ fn read_stream_header<R: Read>(bits: &mut Bits<R>, first: bool) -> io::Result<Op
 }
 
 /// ReadBlock2 from the block CRC through the end-of-block symbol; the block
-/// magic has been consumed. `column` is sized to `limit` and receives the last
-/// column; on success it is moved into the block and left empty, on error it
-/// stays with the caller for reuse.
+/// magic has been consumed. `column` is a recycled last-column owner; it is
+/// sized to `limit` and moved into the block, or dropped on error.
+///
+/// The column stays a by-value local sized after the Huffman tables, as it was
+/// when this loop lived in `Parser::next`. Taking it by reference and sizing it
+/// first cost the single-thread decoder 2 to 4% more instructions.
 fn read_block<R: Read>(
     bits: &mut Bits<R>,
     workspace: &mut ParserWorkspace,
-    column: &mut TtBuffer<u8>,
+    column: TtBuffer<u8>,
     limit: usize,
 ) -> io::Result<Block> {
-    // ReadBlock2 stores the column in place; a recycled owner already
-    // covers the declared limit, so each byte is one bounded indexed store.
-    *column = std::mem::take(column)
-        .with_capacity_at_least(limit)
-        .resized(limit);
-    let fields = read_block_fields(bits, workspace, &mut column[..limit])?;
-    Ok(Block {
-        // Only the logical extent shrinks; the owner keeps its capacity.
-        last: std::mem::take(column).resized(fields.length),
-        limit,
-        counts: fields.counts,
-        origin: fields.origin,
-        randomized: fields.randomized,
-        crc: fields.crc,
-    })
-}
-
-struct BlockFields {
-    length: usize,
-    counts: [usize; 256],
-    origin: usize,
-    randomized: bool,
-    crc: u32,
-}
-
-fn read_block_fields<R: Read>(
-    bits: &mut Bits<R>,
-    workspace: &mut ParserWorkspace,
-    last: &mut [u8],
-) -> io::Result<BlockFields> {
-    let limit = last.len();
     let crc = bits.take(32)?;
     let randomized = bits.take(1)? != 0;
     let origin = bits.take(24)? as usize;
@@ -988,6 +964,10 @@ fn read_block_fields<R: Read>(
             tables[table_index].rebuild(lengths)?;
         }
     }
+    // ReadBlock2 stores the column in place; a recycled owner already
+    // covers the declared limit, so each byte is one bounded indexed store.
+    let mut column = column.with_capacity_at_least(limit).resized(limit);
+    let last: &mut [u8] = &mut column[..limit];
     #[cfg(target_arch = "x86_64")]
     let mut mtf = {
         let mut bytes = [0u8; 256];
@@ -1099,8 +1079,10 @@ fn read_block_fields<R: Read>(
     if origin >= length {
         return Err(invalid("invalid BZip2 BWT origin"));
     }
-    Ok(BlockFields {
-        length,
+    Ok(Block {
+        // Only the logical extent shrinks; the owner keeps its capacity.
+        last: column.resized(length),
+        limit,
         counts,
         origin,
         randomized,
