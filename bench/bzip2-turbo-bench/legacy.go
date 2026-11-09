@@ -320,12 +320,7 @@ func legacyCompare(args []string) error {
 		if err = equal(decoded, *input); err != nil {
 			return fmt.Errorf("decoded bytes differ at %d threads: %w", threads, err)
 		}
-		for _, mode := range []string{"encode", "decode"} {
-			if mode == "decode" && threads > nativeDecodeThreadCap {
-				// The native decoder runs at most two threads; the bytes were
-				// still checked above at this thread count.
-				continue
-			}
+		for _, mode := range modes {
 			source := *input
 			reference := encode
 			if mode == "decode" {

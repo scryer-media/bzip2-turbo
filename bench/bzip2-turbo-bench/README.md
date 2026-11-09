@@ -8,9 +8,8 @@ The latter accepts the historical level, block-size, passes, runs, warmups,
 hardware, revision, profile, darwin-resources and require-parity options.
 Platform identity values use Go OS/architecture names. These legacy commands
 keep their candidate/reference ratio direction; four-contender reports use
-reference/ours. `legacy-compare` checks bytes at 1, 2, 4 and 8 threads but
-times decoding only at 1 and 2, the thread counts the 0.1 native decoder could
-use; the 0.2 decoder runs N block workers, so this is now a harness limit.
+reference/ours. `legacy-compare` checks bytes and times encoding and decoding
+at 1, 2, 4 and 8 threads.
 All raw outputs stay outside the checkout.
 Four contenders run in rotating order: 7zz, turbo, Rust bzip2 with its pure Rust
 backend, and Rust bzip2 with its C backend. Every encoded output is decoded by
@@ -130,12 +129,10 @@ See the reference-build README for explicit equivalent environment overrides.
 the source identity root. No tools are built or downloaded automatically.
 `--list` prints the matrix without requiring tools. Corpora are deterministic
 text, random, periodic and runs. Compatibility turbo is serial and skipped for
-thread counts above one. Native scenarios above two threads time encoding
-only; that cap is the harness's, left from 0.1, whose native decoder used at
-most two threads (the 0.2 decoder runs N block workers). Their decode mode,
-for turbo and 7zz alike, is listed in `Skipped` with `"mode": "decode"`. Every encoder's stream is
-still cross-decoded by every decoder at the scenario's thread count before
-timing. Pure Rust and C references always run one real thread;
+thread counts above one. Native scenarios time encoding and decoding at
+every thread count; since 0.2 a native decoder budget of N above one runs N
+block workers. Every encoder's stream is cross-decoded by every decoder at the
+scenario's thread count before timing. Pure Rust and C references always run one real thread;
 `reference_threads` records this even when native turbo and 7zz use more threads.
 
 Default `--settings block-size` gives the setting index an explicit meaning:
