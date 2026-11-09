@@ -25,21 +25,10 @@ type scenario struct {
 	Skip    string `json:"skip,omitempty"`
 }
 
-// nativeDecodeThreadCap is the most threads the native decoder uses: one
-// parser and one reconstruction worker. It mirrors the `threads.clamp(1, 2)`
-// in `Decoder::with_mode` (src/decoder.rs); a larger request runs the same
-// two-thread pipeline, so decode is not timed above it.
-const nativeDecodeThreadCap = 2
-
-// modes lists the timed modes for a runnable scenario. Native scenarios above
-// the decoder's thread cap time encoding only; their decode mode is recorded
-// as a skipped scenario by schedule.
-func modes(s scenario) []string {
-	if s.API == "native" && s.Threads > nativeDecodeThreadCap {
-		return []string{"encode"}
-	}
-	return []string{"encode", "decode"}
-}
+// modes lists the timed modes for a runnable scenario. Every scenario times
+// both: since 0.2 a native decoder thread budget of N above one runs N block
+// workers, so decode is timed at every budget encode is.
+var modes = []string{"encode", "decode"}
 
 func integers(text string, maximum int) ([]int, error) {
 	var result []int
@@ -77,12 +66,6 @@ func schedule(corpora []string, levels, threads []int, apis []string) ([]scenari
 						skipped = append(skipped, s)
 					} else {
 						ready = append(ready, s)
-						if api == "native" && n > nativeDecodeThreadCap {
-							d := s
-							d.Mode = "decode"
-							d.Skip = "native decoding uses at most two threads (parser and one worker); decode is measured at 1 and 2 threads"
-							skipped = append(skipped, d)
-						}
 					}
 				}
 			}
@@ -338,8 +321,8 @@ func (t tools) measure(s scenario, input, scratch string, repeats, warmups int) 
 		return nil, errors.New("generated ELF is not materially compressible: 7zz encoded/input fraction exceeds 0.90")
 	}
 	var rows []row
-	// 7zz decode is dropped with ours: every row pairs both at one budget.
-	for _, mode := range modes(s) {
+	// Every row pairs ours and 7zz at one budget.
+	for _, mode := range modes {
 		source := input
 		if mode == "decode" {
 			source = packed[0]

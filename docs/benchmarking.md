@@ -37,10 +37,8 @@ library backend feature or runtime dependency.
 
 Since 0.2, native turbo's encoder `threads = N` above one runs N compression
 workers plus the calling thread for input and output; one thread encodes on
-the calling thread alone. The suite times decode at 1 and 2 threads only;
-higher budgets time encoding and record decode as a skipped scenario. That cap
-is the harness's, left from 0.1, whose native decoder used at most two
-threads; the 0.2 decoder runs N block workers.
+the calling thread alone. Its decoder `threads = N` above one runs N block
+workers. The suite times encode and decode at every thread budget.
 
 The harness defaults to `--settings block-size`: indices 1, 5 and 9 mean
 100,000, 500,000 and 900,000-byte blocks for every contender. Native turbo and
@@ -108,9 +106,7 @@ main text workload. Run from
 `bench/bzip2-turbo-bench`: `go run . legacy-corpus DESTINATION --mib 32`
 and `go run . legacy-compare --codec EXE --oracle EXE --input FILE --results JSON`.
 The corpus bytes, CLI options, report keys, alternating order, Darwin resource
-counters and strict unrounded parity criterion match the historical tools,
-except that decode timings stop at two threads, the most the 0.1 native
-decoder used; bytes are still checked at every thread count.
+counters and strict unrounded parity criterion match the historical tools.
 Platform identity fields use Go OS/architecture names; supply `--hardware` for
 a precise machine description. Four 1 MiB corpus SHA-256 characterizations and
 a tiny comparison schema/identity smoke check verified the migration.
