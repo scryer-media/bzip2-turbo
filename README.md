@@ -109,11 +109,12 @@ The JSON decode cells at 1 and 16 threads were unstable on this busy
 machine: bzip2-turbo's single runs at one thread ranged from 3.85 to 6.74 s,
 and a nine-run recheck at 16 threads gave 0.54 s against lbzip2's 0.51 s.
 
-The [benchmark notes](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmark.md),
-[how to reproduce them](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmarking.md)
-and the [decoder compared with 7zz](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/decoder-performance.md)
-are older results for 0.1 from other hardware: its two-thread decoder, its
-encoder budget that included the calling thread, and its seven-pass level 9.
+The [benchmark notes](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmark.md)
+compare 0.2.0 with 7zz and the Rust and C bzip2 crates on AWS Graviton3 and
+Intel hosts at levels 1, 5 and 9 and 1 to 8 threads
+([how to reproduce them](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/benchmarking.md)).
+The [decoder compared with 7zz](https://github.com/scryer-media/bzip2-turbo/blob/main/docs/decoder-performance.md)
+holds older results for 0.1 and its two-thread decoder.
 
 ## Attribution
 
