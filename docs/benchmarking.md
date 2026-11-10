@@ -1,124 +1,251 @@
-# Benchmarking
+# Benchmarks
 
-Use `bench/bzip2-turbo-bench`, the same Go harness pattern as the other codec
-repositories. Build the Rust example in release mode and use the pinned 7-Zip
-reference built with `go run .github/scripts/tool.go oracle`. The four contenders are
-7zz, turbo, standard Rust bzip2 with its pure Rust backend, and standard Rust
-bzip2 with its bundled static C backend. See the harness README
-for commands. Keep generated inputs, JSON and profiles outside the checkout.
+Encode and decode speed for bzip2-turbo 0.2.0 against 7-Zip's `7zz` and the
+Rust `bzip2` crate, on one Intel and one ARM machine on AWS, measured on
+2026-11-08.
 
-The main `text` input is a valid randomized JSON payload: recurring record
-attributes contain varied seeded text, numbers, booleans, arrays and nested
-objects. Generation streams bounded records and produces the exact requested
-byte count; final padding is shorter than one record. The fixed xorshift64*
-seed makes output reproducible without repeating a global text block.
-From the harness directory, `go run . json-corpus --output /tmp/text.json
---bytes 33554432` retains a fixture outside the checkout. Inputs must contain
-at least 256 bytes. Earlier repeated-sentence measurements remain historical
-periodic stress results and do not represent this JSON text workload.
+All speeds are in MB/s of uncompressed data (1 MB = 1,000,000 bytes). Higher
+is better.
 
-Build the two reference drivers independently; never enable both features:
+## What was compared
 
-```sh
-cargo build --locked --release --manifest-path tools/bzip2-reference/Cargo.toml --features pure --target-dir target/reference-pure
-cargo build --locked --release --manifest-path tools/bzip2-reference/Cargo.toml --features c --target-dir target/reference-c
-cargo tree --locked --manifest-path tools/bzip2-reference/Cargo.toml --features pure
-cargo tree --locked --manifest-path tools/bzip2-reference/Cargo.toml --features c
-```
+| Engine | What it is |
+|---|---|
+| turbo | bzip2-turbo 0.2.0, native `Encoder` and `Decoder` |
+| 7zz | 7-Zip 26.04, built from source with GCC 13.3 |
+| bzip2 (C) | `bzip2` crate 0.6.1 on its C backend (libbz2 1.0.8) |
+| bzip2 (Rust) | `bzip2` crate 0.6.1 on its pure-Rust backend (libbz2-rs-sys 0.2.6) |
 
-The standalone workspace is excluded from the published crate. Its exact
-`bzip2` 0.6.1 dependency and lockfile resolve `libbz2-rs-sys` 0.2.6 for `pure`,
-and `bzip2-sys` 0.1.13+1.0.8 for `c`. The pure graph must exclude `bzip2-sys`;
-the C graph must exclude `libbz2-rs-sys`. Both drivers require one thread and
-use the same standard I/O buffering as the turbo compatibility driver. Native
-turbo and 7zz can use matching explicit worker counts; reports retain the
-serial reference thread count. This is benchmark-only isolation, not a
-library backend feature or runtime dependency.
+- **Level** is the block size: level 1, 5 and 9 mean 100 kB, 500 kB and
+  900 kB blocks for every engine. turbo and 7zz run one Huffman optimization
+  pass, which is turbo's default. At these settings turbo and 7zz produce
+  identical compressed bytes.
+- **Threads.** turbo and 7zz were run at 1, 2, 4 and 8 threads, each pinned to
+  that many CPUs. The `bzip2` crate is single-threaded, so it has one column.
+- **Decoding.** Every engine decodes the same stream, the one 7zz wrote.
+  Before timing, each engine's output was decoded by every engine and checked
+  against the input.
+- **Timing.** One warmup, then four rounds with the engines in rotating order.
+  Each figure is the median wall time of a whole process, including startup
+  and writing the output to `/dev/null`.
 
-Since 0.2, native turbo's encoder `threads = N` above one runs N compression
-workers plus the calling thread for input and output; one thread encodes on
-the calling thread alone. Its decoder `threads = N` above one runs N block
-workers. The suite times encode and decode at every thread budget.
+## Machines
 
-The harness defaults to `--settings block-size`: indices 1, 5 and 9 mean
-100,000, 500,000 and 900,000-byte blocks for every contender. Native turbo and
-7zz receive explicit block sizes and one optimization pass. Standard bzip2
-uses the corresponding compression setting and its standard pipeline. Every
-output header is checked against the declared block size. Equal block/pass
-counts do not make the encoder algorithms identical.
+| | Intel | ARM |
+|---|---|---|
+| Instance | AWS c7i.2xlarge | AWS c7g.2xlarge |
+| CPU | Xeon Platinum 8488C | Graviton3 |
+| Cores | 4 cores, 8 threads | 8 cores |
+| Memory | 16 GiB | 16 GiB |
+| OS | Ubuntu 24.04 | Ubuntu 24.04 |
 
-Optional `--settings sevenzip-level` preserves historical native defaults;
-numeric levels alone then differ in effective settings. Native level 5 uses a
-900,000-byte block versus standard bzip2's 500,000, and native level 9 uses
-seven recursive passes versus the standard pipeline's one. Turbo's own level 9
-default has been one pass since 0.2, so the harness passes seven to turbo
-explicitly at level 9 to keep this series comparable. Reports record
-per-contender block bytes, passes, policy and matching flags. Interpret these
-historical rows with those differences; they are not equal-setting comparisons.
-Compatibility turbo always uses standard block sizing and one pass, with 7zz
-aligned to it under either policy.
+The Intel machine has only four physical cores, so its 8-thread column runs
+two threads per core.
 
-Compare explicit block, pass and thread settings. Verify
-encoded bytes and cross-decoded output before timing. Run at least three
-alternating rounds and report medians; use reference/ours ratios, where greater
-than one means faster or smaller. Record source revision, binary hash, compiler,
-machine, input hash, thread count, elapsed time and RSS with platform-correct
-units. Instrumentation must be reported separately from uninstrumented timing.
-Use CPU sampling, instructions retired where supported, and assembly to diagnose
-costs before changing algorithms. Do not infer CRC throughput from fused decoder
-samples.
+## Inputs
 
-The initial baseline and the later ARM encoder and decoder measurements
-are recorded separately. The encoder follow-up starts from public base `f68b3ab`;
-[decoder notes](decoder-performance.md) describe the subsequent parsing and
-storage changes. Current timed commands all write to the operating-system
-null device, identified by `OutputSink` in new harness reports. Earlier
-measurements used the special Rust in-memory sink; do not combine their
-medians with the uniform-output follow-up.
-Full cross-platform 0% regression parity remains unachieved pending complete
-measurements. Selected passing rows do not establish that gate. Keep raw evidence
-for validated improvements and unsuccessful experiments outside the repository.
+| Input | Size | Content |
+|---|---:|---|
+| JSON | 16.8 MB | Generated JSON records with varied values |
+| Logs | 16.8 MB | Generated structured log lines |
+| Linux binary | 3.9 MB | A Linux executable built with Go 1.27 |
+| Video (MKV) | 16.4 MB | 150 seconds of H.264/AAC [Big Buck Bunny](https://peach.blender.org/about/) (© 2008 Blender Foundation, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)), remuxed to Matroska |
+| Repeated text | 16.8 MB | One 71-byte sentence repeated; a worst case for block sorting |
 
-Mac ARM64 sampling attributed 13.8% of JSON encoding samples to Huffman table
-fitting, concentrated in selector price sums. `Entropy::fit` now packs all six
-table costs into independent 10-bit lanes of one `u64`. A selector contains at
-most 50 symbols with code lengths at most 16, so each lane totals at most 800,
-below its 1,024 carry boundary; all six lanes fit in 60 bits. This replaces six
-indexed price loads per symbol with one. Table traversal and strict comparison
-preserve the earliest-table tie rule and encoded output. Scratch remains fixed
-on the stack, with no new heap allocations or API changes. Differential checks
-use the pinned [7-Zip 26.04 source](https://github.com/ip7z/7zip/tree/9128b80e3a471108678e2b3ec3c985861c8d7b0f).
+## Intel (c7i.2xlarge)
 
-Non-timing instrumentation of a 16 MiB repeated-sentence input with a 71-byte
-period, 500,000-byte blocks, one thread and one pass counted 1.857 billion of
-2.266 billion partition rank reads in empty midpoint passes. After the first
-empty partition, `SortGroup` now scans exact minimum and maximum ranks once.
-An empty partition has made no swaps or rank writes, so those bounds can skip
-the original binary midpoint decisions until the first midpoint that divides
-the keys. That midpoint uses the existing partition loop, preserving its order,
-ties, flags and subsequent rank writes. These operation counts identify wasted
-scanning; they are not elapsed-time results.
+### Encode
 
-The Go harness retains `legacy-corpus` and `legacy-compare` commands
-for the original two-process protocol. Its repeated-sentence text corpus
-is historical periodic stress, retained byte for byte rather than used as the
-main text workload. Run from
-`bench/bzip2-turbo-bench`: `go run . legacy-corpus DESTINATION --mib 32`
-and `go run . legacy-compare --codec EXE --oracle EXE --input FILE --results JSON`.
-The corpus bytes, CLI options, report keys, alternating order, Darwin resource
-counters and strict unrounded parity criterion match the historical tools.
-Platform identity fields use Go OS/architecture names; supply `--hardware` for
-a precise machine description. Four 1 MiB corpus SHA-256 characterizations and
-a tiny comparison schema/identity smoke check verified the migration.
+| MB/s | Level | bzip2 (C) | bzip2 (Rust) | 7zz 1T | 7zz 2T | 7zz 4T | 7zz 8T | turbo 1T | turbo 2T | turbo 4T | turbo 8T |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| JSON | 1 | 17 | 18 | 14 | 26 | 51 | 75 | 26 | 49 | 96 | 124 |
+| JSON | 5 | 15 | 16 | 12 | 22 | 42 | 59 | 26 | 50 | 92 | 110 |
+| JSON | 9 | 14 | 14 | 10 | 20 | 37 | 49 | 25 | 47 | 86 | 97 |
+| Logs | 1 | 16 | 17 | 15 | 28 | 55 | 81 | 32 | 61 | 119 | 153 |
+| Logs | 5 | 13 | 15 | 12 | 23 | 45 | 66 | 34 | 63 | 118 | 140 |
+| Logs | 9 | 11 | 13 | 11 | 21 | 38 | 53 | 31 | 60 | 107 | 113 |
+| Linux binary | 1 | 14 | 14 | 12 | 24 | 44 | 56 | 16 | 31 | 59 | 74 |
+| Linux binary | 5 | 15 | 16 | 12 | 21 | 39 | 47 | 17 | 31 | 51 | 58 |
+| Linux binary | 9 | 14 | 14 | 11 | 20 | 36 | 37 | 15 | 27 | 43 | 43 |
+| Video (MKV) | 1 | 11 | 12 | 12 | 23 | 46 | 55 | 13 | 26 | 50 | 63 |
+| Video (MKV) | 5 | 11 | 12 | 12 | 22 | 41 | 48 | 13 | 25 | 46 | 55 |
+| Video (MKV) | 9 | 10 | 11 | 10 | 20 | 36 | 42 | 12 | 23 | 42 | 47 |
+| Repeated text | 1 | 6.4 | 8.2 | 3.5 | 6.9 | 14 | 24 | 49 | 94 | 179 | 225 |
+| Repeated text | 5 | 5.6 | 6.6 | 5.8 | 9.2 | 16 | 18 | 51 | 96 | 173 | 199 |
+| Repeated text | 9 | 4.2 | 4.8 | 4.1 | 7.4 | 13 | 12 | 47 | 89 | 160 | 171 |
 
-## ARM CRC correction
+### Decode
 
-Seven alternating diagnostic rounds against the actual 7-Zip CRC source found
-crc-turbo 1.11.0 much faster for bulk updates: 64 KiB took approximately 1.23 us
-versus 116.52 us, and 4 KiB took 80.59 ns versus 7,296.62 ns. The scalar reference
-won tiny calls: one byte took 3.27 ns versus 11.34 ns. Both algorithms and carried
-states were checked; assembly showed scalar tables versus PMULL/EOR3 folding.
-Machine idleness was not established, so these are diagnostic figures. The
-reference fuses CRC into reconstruction; the earlier whole-decoder profile did
-not prove that its standalone CRC was faster. Raw artifacts and identities are
-preserved outside Git in the task's CRC audit bundle.
+| MB/s | Level | bzip2 (C) | bzip2 (Rust) | 7zz 1T | 7zz 2T | 7zz 4T | 7zz 8T | turbo 1T | turbo 2T | turbo 4T | turbo 8T |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| JSON | 1 | 54 | 58 | 92 | 122 | 121 | 123 | 90 | 161 | 289 | 395 |
+| JSON | 5 | 47 | 49 | 86 | 120 | 120 | 119 | 83 | 148 | 259 | 236 |
+| JSON | 9 | 32 | 33 | 43 | 50 | 48 | 49 | 43 | 80 | 142 | 170 |
+| Logs | 1 | 69 | 76 | 115 | 159 | 159 | 159 | 113 | 198 | 353 | 468 |
+| Logs | 5 | 65 | 71 | 116 | 144 | 147 | 149 | 115 | 195 | 342 | 371 |
+| Logs | 9 | 50 | 53 | 77 | 88 | 88 | 90 | 78 | 140 | 249 | 268 |
+| Linux binary | 1 | 28 | 28 | 49 | 54 | 54 | 53 | 57 | 98 | 163 | 188 |
+| Linux binary | 5 | 27 | 27 | 47 | 59 | 58 | 58 | 56 | 93 | 131 | 149 |
+| Linux binary | 9 | 23 | 23 | 37 | 47 | 46 | 46 | 42 | 65 | 99 | 88 |
+| Video (MKV) | 1 | 23 | 21 | 35 | 37 | 37 | 37 | 49 | 89 | 169 | 216 |
+| Video (MKV) | 5 | 21 | 19 | 33 | 41 | 41 | 41 | 43 | 79 | 146 | 154 |
+| Video (MKV) | 9 | 17 | 16 | 24 | 39 | 39 | 39 | 29 | 53 | 97 | 125 |
+| Repeated text | 1 | 174 | 191 | 245 | 250 | 244 | 245 | 380 | 587 | 914 | 861 |
+| Repeated text | 5 | 166 | 178 | 269 | 268 | 268 | 270 | 381 | 607 | 928 | 880 |
+| Repeated text | 9 | 168 | 181 | 237 | 249 | 238 | 239 | 314 | 493 | 750 | 728 |
+
+### Peak memory, JSON, level 9
+
+| MB | Encode 1T | Encode 8T | Decode 1T | Decode 8T |
+|---|---:|---:|---:|---:|
+| bzip2 (C) | 8.6 | 8.7 | 5.9 | 5.8 |
+| bzip2 (Rust) | 8.7 | 8.7 | 5.8 | 5.9 |
+| 7zz | 15 | 83 | 11 | 11 |
+| turbo | 12 | 85 | 10 | 64 |
+
+## ARM (c7g.2xlarge)
+
+### Encode
+
+| MB/s | Level | bzip2 (C) | bzip2 (Rust) | 7zz 1T | 7zz 2T | 7zz 4T | 7zz 8T | turbo 1T | turbo 2T | turbo 4T | turbo 8T |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| JSON | 1 | 16 | 17 | 14 | 27 | 53 | 104 | 24 | 48 | 94 | 179 |
+| JSON | 5 | 15 | 16 | 11 | 22 | 42 | 74 | 23 | 45 | 84 | 143 |
+| JSON | 9 | 14 | 14 | 10 | 20 | 38 | 60 | 21 | 40 | 74 | 116 |
+| Logs | 1 | 15 | 16 | 15 | 29 | 57 | 109 | 29 | 58 | 113 | 216 |
+| Logs | 5 | 12 | 14 | 12 | 24 | 47 | 85 | 28 | 55 | 103 | 177 |
+| Logs | 9 | 11 | 12 | 11 | 22 | 40 | 63 | 25 | 48 | 87 | 135 |
+| Linux binary | 1 | 13 | 12 | 12 | 24 | 44 | 80 | 16 | 31 | 59 | 101 |
+| Linux binary | 5 | 13 | 13 | 11 | 20 | 37 | 61 | 15 | 28 | 47 | 67 |
+| Linux binary | 9 | 13 | 12 | 10 | 20 | 36 | 36 | 14 | 25 | 39 | 39 |
+| Video (MKV) | 1 | 10.0 | 8.2 | 11 | 21 | 42 | 81 | 12 | 24 | 48 | 93 |
+| Video (MKV) | 5 | 10 | 8.4 | 9.9 | 19 | 36 | 67 | 11 | 22 | 42 | 75 |
+| Video (MKV) | 9 | 9.5 | 8.0 | 9.2 | 18 | 33 | 53 | 10 | 20 | 37 | 58 |
+| Repeated text | 1 | 5.9 | 7.2 | 4.3 | 8.5 | 17 | 33 | 44 | 86 | 169 | 314 |
+| Repeated text | 5 | 4.8 | 5.6 | 3.3 | 5.3 | 9.5 | 17 | 43 | 85 | 156 | 256 |
+| Repeated text | 9 | 4.4 | 5.2 | 2.4 | 3.7 | 6.1 | 10 | 43 | 83 | 148 | 222 |
+
+### Decode
+
+| MB/s | Level | bzip2 (C) | bzip2 (Rust) | 7zz 1T | 7zz 2T | 7zz 4T | 7zz 8T | turbo 1T | turbo 2T | turbo 4T | turbo 8T |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| JSON | 1 | 58 | 61 | 99 | 163 | 163 | 163 | 101 | 178 | 323 | 517 |
+| JSON | 5 | 34 | 34 | 44 | 53 | 54 | 54 | 45 | 84 | 157 | 252 |
+| JSON | 9 | 28 | 28 | 35 | 40 | 40 | 41 | 35 | 64 | 107 | 135 |
+| Logs | 1 | 73 | 81 | 122 | 181 | 182 | 182 | 124 | 218 | 388 | 607 |
+| Logs | 5 | 50 | 53 | 69 | 82 | 82 | 83 | 71 | 130 | 239 | 396 |
+| Logs | 9 | 39 | 41 | 48 | 60 | 55 | 54 | 47 | 99 | 153 | 211 |
+| Linux binary | 1 | 34 | 32 | 53 | 65 | 65 | 65 | 53 | 87 | 145 | 197 |
+| Linux binary | 5 | 27 | 26 | 38 | 55 | 55 | 57 | 39 | 60 | 92 | 126 |
+| Linux binary | 9 | 23 | 21 | 28 | 38 | 39 | 46 | 28 | 42 | 62 | 77 |
+| Video (MKV) | 1 | 29 | 24 | 38 | 45 | 45 | 45 | 37 | 65 | 126 | 216 |
+| Video (MKV) | 5 | 21 | 18 | 25 | 44 | 45 | 45 | 25 | 44 | 84 | 140 |
+| Video (MKV) | 9 | 16 | 15 | 18 | 36 | 34 | 37 | 17 | 29 | 51 | 78 |
+| Repeated text | 1 | 141 | 157 | 208 | 219 | 220 | 219 | 364 | 580 | 947 | 1225 |
+| Repeated text | 5 | 140 | 155 | 208 | 217 | 218 | 218 | 365 | 636 | 1022 | 1325 |
+| Repeated text | 9 | 139 | 155 | 208 | 216 | 216 | 217 | 367 | 649 | 1013 | 1270 |
+
+### Peak memory, JSON, level 9
+
+| MB | Encode 1T | Encode 8T | Decode 1T | Decode 8T |
+|---|---:|---:|---:|---:|
+| bzip2 (C) | 8.3 | 8.3 | 5.2 | 5.2 |
+| bzip2 (Rust) | 8.3 | 8.3 | 5.3 | 5.3 |
+| 7zz | 15 | 83 | 10 | 11 |
+| turbo | 11 | 84 | 9.4 | 65 |
+
+## Reading the results
+
+- **Single-threaded encoding.** turbo is the fastest encoder at one thread on
+  every input, level and machine. On JSON at level 9 it encodes at 25 MB/s on
+  Intel and 21 MB/s on ARM, where libbz2 manages 14.
+- **Threaded encoding.** turbo and 7zz both scale with threads. turbo stays
+  ahead at every thread count.
+- **Repeated text.** This input defeats the block sorters in 7zz and libbz2,
+  which drop to 2 to 8 MB/s. turbo's sorter keeps it at 43 to 51 MB/s on one
+  thread.
+- **Single-threaded decoding.** turbo and 7zz are level, except that turbo
+  is faster on repeated text on both machines and on the binary and video on
+  Intel.
+- **Threaded decoding.** 7zz gains little past two threads. turbo keeps
+  scaling: on ARM it decodes JSON at level 1 at 517 MB/s on 8 threads, against
+  163 MB/s for 7zz.
+- **Small inputs.** The Linux binary is 3.9 MB, only five blocks at level 9,
+  so there is little to split up: 4 and 8 threads encode it at the same
+  speed.
+- **Intel at 8 threads.** With two threads per core, some 8-thread figures
+  are slower than the 4-thread ones.
+- **Memory.** Threaded decoding uses about 8 MB per worker: turbo peaks at
+  about 65 MB on 8 threads, while 7zz stays near 11 MB. Encoding memory is
+  about the same for turbo and 7zz.
+
+## Running the benchmarks
+
+The harness is a Go program in
+[`bench/bzip2-turbo-bench`](../bench/bzip2-turbo-bench/README.md); its README
+has the full steps. In outline:
+
+1. Build turbo's `codec-bench` example in release mode. Build the two `bzip2`
+   crate drivers separately, never with both features in one build:
+
+   ```sh
+   cargo build --locked --release --example codec-bench
+   cargo build --locked --release --manifest-path tools/bzip2-reference/Cargo.toml --features pure --target-dir target/reference-pure
+   cargo build --locked --release --manifest-path tools/bzip2-reference/Cargo.toml --features c --target-dir target/reference-c
+   ```
+
+2. Build the pinned 7-Zip with `go run .github/scripts/tool.go oracle`.
+3. Generate the five inputs once with `go run . fixture`, and copy them with
+   their receipts to every machine you test, so each one compresses the same
+   bytes.
+4. Run `go run . suite` on an otherwise idle machine. Keep inputs, reports
+   and profiles outside the checkout.
+
+All three Rust programs use the same profile: optimization level 3, fat LTO,
+one codegen unit, stripped, and no `target-cpu` override.
+
+The harness defaults to the block-size settings used here. Its
+`--settings sevenzip-level` option reproduces older runs that used 7-Zip's
+own level defaults, where the same level number does not mean the same
+settings in every engine. Don't compare those runs with these.
+
+## Build and input identities
+
+Source: bzip2-turbo `3225e57cadfc266765e8f46d851373091c87de53`, Rust 1.97.1,
+Go 1.23.12 for the harness, 7-Zip source
+[`9128b80`](https://github.com/ip7z/7zip/tree/9128b80e3a471108678e2b3ec3c985861c8d7b0f)
+built with its stock `makefile.gcc`.
+
+| Input | Bytes | SHA-256 |
+|---|---:|---|
+| JSON | 16,777,216 | `f7858958c4a1f4a42ba26006a058fa41c657fcd7f2e2d321300d517398e9530e` |
+| Logs | 16,777,222 | `170a8ba5218e7c1f67a3ba9031daa904540196a8aa972425b19c03ae5931ecd1` |
+| Linux binary | 3,903,413 | `5d993bf86e336c2c54ee67c0c6be15fc1418e4e16d581a87d256823f467bfa97` |
+| Video (MKV) | 16,360,253 | `a88533696bc7ff1bb9847af06ccf37aafa7c781ea7d94eefbd7c8ff10d34525a` |
+| Repeated text | 16,777,216 | `8befb6b762230bc79630499c8086a8137f0a0078c688b51348115699180fbece` |
+
+| Executable | Intel SHA-256 | ARM SHA-256 |
+|---|---|---|
+| turbo | `ec8fa9c00151890b04c386451119bc76629d8a8dd67765a2da406b8c8849e1ab` | `ec91243ccd17bb1d514d88b6b8554cb08286c8742e7495e630c2939e2d668e1c` |
+| 7zz | `4d7d10d75af4e060adb57c20e40d24317914321c4d0e916f49897642383b61a2` | `765161e82b3e43a23a4fcd2492723a8154d640aa0b4abf5823787978b3368a1f` |
+| bzip2 (Rust) | `d967d4035a69cfbc7c4fdb5ffbe7637b6f6ee8ba979acd1475f5992db69ee753` | `1b827f8cbde07bcb328cca02d49144c02c659272fcd624c2c5dd1ce80dce794d` |
+| bzip2 (C) | `27c898b2c03e82face00e352d356e0b5ed5c58c87f7010ac2fe2eeb0f865aced` | `df9ac406e1ff49ddf95900534054b8ca6acbacb3ac1108c8344ffb9a42492ca1` |
+
+Raw per-round reports are kept outside the repository.
+
+## Profiling findings
+
+Notes from profiling turbo against the 7-Zip code it was translated from.
+They come from profiles and operation counts, not from the timings above.
+
+- **Huffman table selection.** On Apple silicon, 14% of JSON encoding
+  samples went to choosing which of six Huffman tables codes each group of 50
+  symbols. turbo now sums all six table costs at once, packed into one 64-bit
+  integer. It picks the same tables and writes the same bytes.
+- **Block sorting on repetitive input.** On the repeated-sentence input, 82%
+  of the sorter's rank reads were spent in partition passes that moved
+  nothing. The sorter now finds each group's rank range once and skips those
+  passes, with the same sort order.
+- **CRC.** turbo's checksums come from `crc-turbo`, whose vectorized CRC is
+  around 90 times faster than 7-Zip's table-driven loop on 4 KiB and larger
+  buffers. 7-Zip's loop is faster on single-byte calls.

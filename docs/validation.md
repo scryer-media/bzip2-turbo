@@ -24,8 +24,8 @@ passed five all-feature and two decoding-only doctests.
 Graviton native candidate checks and exact-output benchmarks supplement these
 local tests; they do not substitute for the full platform CI matrix. See the
 [decoder notes](decoder-performance.md) for retained changes and rejected
-experiments. The current full-suite benchmark method and source identity are
-recorded in the [detailed benchmark results](benchmark.md).
+experiments. The current benchmark method and source identity are in the
+[benchmarks](benchmarking.md).
 
 ## Current four-way benchmark validation (f6cb7d2)
 

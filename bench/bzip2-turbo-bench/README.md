@@ -113,7 +113,7 @@ cargo build --manifest-path ../../Cargo.toml --release --example codec-bench
 go run . toolchain --sevenzip 7zz
 go run . suite --sevenzip 7zz --size-kib 16 --levels 1,5,9 --threads 1,2 --api both --repeats 4 --out /tmp/bzip2-smoke.json
 # Full matrix, only when explicitly measuring performance on an idle host
-# (native 4T/8T time encoding only; decode is timed at 1T and 2T):
+# (encode and decode are timed at every thread count):
 go run . suite --sevenzip 7zz --size-kib 32768 --levels 1,5,9 --threads 1,2,4,8 --api both --repeats 4 --out /tmp/bzip2-matrix.json
 go run . run --sevenzip 7zz --input /tmp/corpus.bin --threads 1 --out /tmp/bzip2-run.json
 ```
