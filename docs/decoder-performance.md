@@ -5,9 +5,8 @@
 > and come from other hardware; they have not been re-measured for 0.2. In
 > 0.2, a thread budget of N above one runs N block workers instead of 0.1's
 > parser plus one reconstruction worker (see
-> [Follow the complete stream](#follow-the-complete-stream)). The only 0.2
-> decode measurements are the README's, taken on one Apple M5 Max against
-> lbzip2.
+> [Follow the complete stream](#follow-the-complete-stream)). The 0.2 measurements are in
+> [the benchmarks](benchmarking.md).
 
 The native `Decoder` changes in runtime commit `8a2188e6b667` were selected
 from paired measurements against the pinned 7-Zip 26.04 reference. The
@@ -276,8 +275,8 @@ win; the last failed its intended assembly check because per-symbol state
 traffic moved to the stack instead of registers. Their patches and raw evidence
 remain preserved outside Git.
 
-See the [detailed measurements](benchmark.md) for the source identities,
-output method and remaining workload-specific gaps. Earlier diagnostic runs
+See the [0.2.0 benchmarks](benchmarking.md) for current results and build
+identities. Earlier diagnostic runs
 used Rust's in-memory sink while 7zz wrote to the null device. The `8a2188e`
 decoder-only follow-up used the operating-system null device for every engine.
 The current `f6cb7d2` full-suite results are reported separately; samples from
