@@ -937,7 +937,16 @@ impl Pool {
                 }
                 match std::mem::replace(&mut front.output, Progress::Pending) {
                     Progress::Pending => break,
-                    Progress::Failed(error) => return Err(error),
+                    Progress::Failed(error) => {
+                        // The decode ends here. The slot's failure was just
+                        // taken out of it, so the workers are stopped under
+                        // this same lock: one still producing this slot must
+                        // not find it pending again and show the callback a
+                        // chunk past the one that failed.
+                        state.cancelled = true;
+                        self.shared.work.notify_all();
+                        return Err(error);
+                    }
                     Progress::Done => {
                         let after = front.after.take();
                         state.slots.pop_front();
