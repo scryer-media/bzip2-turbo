@@ -1369,13 +1369,48 @@ impl BlockOutput {
     }
 }
 
-type OutputCallback = Arc<Mutex<Box<dyn FnMut(&[u8]) + Send>>>;
-fn observe_output(callback: &Option<OutputCallback>, bytes: &[u8]) -> io::Result<()> {
+type BytesCallback = Box<dyn FnMut(&[u8]) + Send>;
+type Crc32Callback = Box<dyn FnMut(&[u8], u32) -> io::Result<()> + Send>;
+/// What an output callback is given with each chunk.
+enum Observer {
+    Bytes(BytesCallback),
+    /// The chunk and its CRC-32/ISO-HDLC, taken where the chunk was produced.
+    Crc32(Crc32Callback),
+}
+type OutputCallback = Arc<Mutex<Observer>>;
+
+/// Whether the callback wants each chunk's CRC-32.
+fn wants_crc32(callback: &Option<OutputCallback>) -> bool {
+    callback.as_ref().is_some_and(|callback| {
+        callback
+            .lock()
+            .is_ok_and(|observer| matches!(*observer, Observer::Crc32(_)))
+    })
+}
+
+/// The CRC-32/ISO-HDLC of `bytes`.
+fn chunk_crc32(bytes: &[u8]) -> u32 {
+    crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
+}
+
+/// Hands one chunk to the callback. `crc` is the chunk's CRC-32 when its
+/// producer took it; a callback that wants one and was given none computes it
+/// here.
+fn observe_output(
+    callback: &Option<OutputCallback>,
+    bytes: &[u8],
+    crc: Option<u32>,
+) -> io::Result<()> {
     if let Some(callback) = callback {
         let mut callback = callback
             .lock()
             .map_err(|_| io::Error::other("BZip2 output callback poisoned"))?;
-        callback(bytes);
+        match &mut *callback {
+            Observer::Bytes(callback) => callback(bytes),
+            Observer::Crc32(callback) => {
+                callback(bytes, crc.unwrap_or_else(|| chunk_crc32(bytes)))?;
+            }
+        }
     }
     Ok(())
 }
@@ -1463,8 +1498,13 @@ impl<R: Read> Decoder<R> {
     /// Observes each reconstructed output chunk before it is queued for delivery.
     ///
     /// With multiple threads the callback runs on the decode workers, one call
-    /// at a time and in stream order; a block's output is produced only after
-    /// every earlier block's, so a callback serializes that final stage.
+    /// at a time and in stream order. Every worker reconstructs its own block's
+    /// output as soon as it can, whether or not earlier blocks are done; only
+    /// the calls are ordered, made by whichever worker holds the next
+    /// undelivered chunk in stream order. At most a bounded number of
+    /// reconstructed chunks wait for their call: each open block holds at most
+    /// the output that the multithreaded memory bound already counts, and its
+    /// worker waits for delivery beyond that.
     /// Single-threaded decoding invokes it on the caller. It may observe
     /// read-ahead bytes before they are delivered, including bytes discarded on
     /// early drop. Callback chunks contain at most 65,536 bytes and preserve
@@ -1480,7 +1520,7 @@ impl<R: Read> Decoder<R> {
         callback: impl FnMut(&[u8]) + Send + 'static,
     ) -> Self {
         let mut decoder = Self::with_threads(reader, threads);
-        decoder.callback = Some(Arc::new(Mutex::new(Box::new(callback))));
+        decoder.callback = Some(Arc::new(Mutex::new(Observer::Bytes(Box::new(callback)))));
         decoder
     }
     /// Combines the compact memory mode with producer-side output observation.
@@ -1491,7 +1531,40 @@ impl<R: Read> Decoder<R> {
         callback: impl FnMut(&[u8]) + Send + 'static,
     ) -> Self {
         let mut decoder = Self::with_low_memory(reader, threads);
-        decoder.callback = Some(Arc::new(Mutex::new(Box::new(callback))));
+        decoder.callback = Some(Arc::new(Mutex::new(Observer::Bytes(Box::new(callback)))));
+        decoder
+    }
+    /// Observes each output chunk with its CRC-32 (ISO-HDLC, the checksum
+    /// zlib, gzip and 7z use), computed where the chunk was reconstructed.
+    ///
+    /// Calls follow [`Self::with_output_callback`]: in stream order, one at a
+    /// time, before the chunk is queued for delivery. With multiple threads the
+    /// checksum is taken by the worker that reconstructed the chunk, before and
+    /// independently of the call, so a consumer that folds the checksums of
+    /// whole chunks (for example with a CRC-32 combine) computes none in the
+    /// ordered calls. Single-threaded decoding takes it on the caller.
+    ///
+    /// An `Err` from the callback stops decoding: the chunk it was given is not
+    /// delivered, no later chunk is observed, and the read that reaches that
+    /// chunk returns the error.
+    pub fn with_crc32_output_callback(
+        reader: R,
+        threads: usize,
+        callback: impl FnMut(&[u8], u32) -> io::Result<()> + Send + 'static,
+    ) -> Self {
+        let mut decoder = Self::with_threads(reader, threads);
+        decoder.callback = Some(Arc::new(Mutex::new(Observer::Crc32(Box::new(callback)))));
+        decoder
+    }
+    /// Combines the compact memory mode with
+    /// [`Self::with_crc32_output_callback`].
+    pub fn with_low_memory_crc32_output_callback(
+        reader: R,
+        threads: usize,
+        callback: impl FnMut(&[u8], u32) -> io::Result<()> + Send + 'static,
+    ) -> Self {
+        let mut decoder = Self::with_low_memory(reader, threads);
+        decoder.callback = Some(Arc::new(Mutex::new(Observer::Crc32(Box::new(callback)))));
         decoder
     }
     /// Selects whether concatenated streams are decoded (enabled by default).
@@ -1664,7 +1737,7 @@ impl<R: Read> Decoder<R> {
             // A callback panic may be caught by the caller. Keep that decoder
             // failed so its unobserved buffered bytes cannot then be delivered.
             self.failed = true;
-            observe_output(&self.callback, &self.output[..n])?;
+            observe_output(&self.callback, &self.output[..n], None)?;
             self.failed = false;
         }
         self.position = 0;

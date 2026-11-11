@@ -659,3 +659,158 @@ fn one_byte_reads_match_bulk_reads_across_blocks() {
         }
     }
 }
+
+/// CRC-32/ISO-HDLC, bit by bit.
+fn crc32_oracle(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// Decodes through a CRC-32 callback and returns what was delivered, what was
+/// observed, and whether every chunk's checksum matched its bytes.
+fn decode_crc32(encoded: &[u8], threads: usize, low_memory: bool) -> (Vec<u8>, Vec<u8>, usize) {
+    use std::sync::{Arc, Mutex};
+    let observed = Arc::new(Mutex::new((Vec::new(), 0usize)));
+    let state = Arc::clone(&observed);
+    let callback = move |bytes: &[u8], crc: u32| {
+        assert!(bytes.len() <= 65536);
+        assert_eq!(crc, crc32_oracle(bytes));
+        let mut state = state.lock().unwrap();
+        state.0.extend_from_slice(bytes);
+        state.1 += 1;
+        Ok(())
+    };
+    let mut decoder = if low_memory {
+        Decoder::with_low_memory_crc32_output_callback(encoded, threads, callback)
+    } else {
+        Decoder::with_crc32_output_callback(encoded, threads, callback)
+    };
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).unwrap();
+    drop(decoder);
+    let (bytes, calls) = std::mem::take(&mut *observed.lock().unwrap());
+    (decoded, bytes, calls)
+}
+
+#[test]
+fn crc32_callbacks_see_every_chunk_in_order_with_its_checksum() {
+    let blocks = random_bytes(1_250_000, 0x1357_9bdf);
+    let mut streams = Vec::new();
+    let mut plain = Vec::new();
+    for part in [&blocks[..700_000], b"x".as_slice(), &[], &blocks[700_000..]] {
+        streams.extend(compress_level(part, 1));
+        plain.extend_from_slice(part);
+    }
+    let single = b"one block, one stream".to_vec();
+    for (encoded, data) in [
+        (compress_level(&blocks, 1), blocks.clone()),
+        (streams, plain),
+        (compress(&single), single),
+        (compress(b"a"), b"a".to_vec()),
+        (compress(&[]), Vec::new()),
+    ] {
+        for threads in [1, 2, 3, 7, 16, 64] {
+            for low_memory in [false, true] {
+                let (decoded, observed, calls) = decode_crc32(&encoded, threads, low_memory);
+                assert!(decoded == data, "threads {threads}");
+                assert!(observed == data, "threads {threads}");
+                assert_eq!(calls == 0, data.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_damaged_middle_block_is_observed_up_to_its_start_then_fails() {
+    use std::sync::{Arc, Mutex};
+    let data = random_bytes(600_000, 0x2468_1357);
+    let encoded = compress_level(&data, 1);
+    let blocks = block_lengths(&encoded);
+    assert!(blocks.len() >= 5);
+    // A broken third block marker: nothing of it is decoded.
+    let prefix = blocks[0] + blocks[1];
+    let mut marker = encoded.clone();
+    let bit = after_block_magic(&marker, 3) - 1;
+    flip_bit(&mut marker, bit);
+    // A broken third block CRC: its bytes are produced, then refused.
+    let mut crc = encoded.clone();
+    let bit = after_block_magic(&crc, 3) + 7;
+    flip_bit(&mut crc, bit);
+    for threads in [1, 2, 4, 16] {
+        for (corrupt, exact) in [(&marker, true), (&crc, false)] {
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let state = Arc::clone(&observed);
+            let mut decoder =
+                Decoder::with_crc32_output_callback(corrupt.as_slice(), threads, move |b, c| {
+                    assert_eq!(c, crc32_oracle(b));
+                    state.lock().unwrap().extend_from_slice(b);
+                    Ok(())
+                });
+            let (decoded, error) = read_until_error(&mut decoder, 4096);
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(decoder.read(&mut [0; 1]).is_err());
+            drop(decoder);
+            let observed = observed.lock().unwrap();
+            // The callback saw exactly what was delivered, nothing after it.
+            assert!(*observed == decoded, "threads {threads}");
+            if exact {
+                assert_eq!(decoded.len(), prefix, "threads {threads}");
+            } else {
+                assert!(error.to_string().contains("block CRC"), "{error}");
+                assert!(decoded.len() >= prefix && decoded.len() < prefix + blocks[2]);
+            }
+            assert!(decoded == data[..decoded.len()]);
+        }
+    }
+}
+
+#[test]
+fn a_crc32_callback_error_stops_the_decode_at_that_chunk() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let data = random_bytes(900_000, 0x0f1e_2d3c);
+    let encoded = compress_level(&data, 1);
+    for threads in [1, 2, 4, 16] {
+        for accept in [0usize, 1, 3, 11] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let (counter, total) = (Arc::clone(&calls), Arc::clone(&accepted));
+            let mut decoder =
+                Decoder::with_crc32_output_callback(encoded.as_slice(), threads, move |b, _| {
+                    if counter.fetch_add(1, Ordering::SeqCst) == accept {
+                        return Err(std::io::Error::other("refused by the consumer"));
+                    }
+                    total.fetch_add(b.len(), Ordering::SeqCst);
+                    Ok(())
+                });
+            let (decoded, error) = read_until_error(&mut decoder, 7777);
+            assert_eq!(error.to_string(), "refused by the consumer");
+            assert!(decoder.read(&mut [0; 1]).is_err());
+            drop(decoder);
+            // The refused chunk and everything after it are neither delivered
+            // nor observed.
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                accept + 1,
+                "threads {threads}"
+            );
+            assert_eq!(decoded.len(), accepted.load(Ordering::SeqCst));
+            assert!(decoded == data[..decoded.len()]);
+            if accept > 0 {
+                assert!(!decoded.is_empty());
+            }
+        }
+    }
+}

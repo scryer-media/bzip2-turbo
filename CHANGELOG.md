@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.1
+
+- With an output callback and several threads, every worker now reconstructs
+  its own block's output as soon as it can, as it does without a callback,
+  instead of waiting until every earlier block's output was produced. Only the
+  calls are ordered: one at a time, in stream order, on a worker, before each
+  chunk is queued. Output, chunk sizes, the bytes the callback sees, and where
+  a damaged block, a block or stream CRC mismatch or a callback panic stops
+  decoding are unchanged. Each open block still holds at most 2 MiB of output
+  waiting for its call or its delivery, so `memory_usage` and
+  `low_memory_usage` are unchanged.
+- Add `Decoder::with_crc32_output_callback` and
+  `Decoder::with_low_memory_crc32_output_callback`. The callback receives each
+  chunk with its CRC-32 (ISO-HDLC), taken by the worker that reconstructed the
+  chunk, so a consumer that folds per-chunk checksums computes none in the
+  ordered calls. It returns `io::Result<()>`: an error stops decoding at that
+  chunk, which is neither delivered nor followed by any further call.
+
 ## 0.2.0
 
 - Decode with every thread of the budget. `Decoder::with_threads(reader, N)`

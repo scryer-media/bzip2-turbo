@@ -414,3 +414,102 @@ fn corrupt_streams_fail_at_every_thread_count() {
         }
     }
 }
+
+/// Starts a pool with `observer` as its callback and decodes `encoded` on a
+/// thread of its own, returning the pool's shared state and the decode.
+fn spawn_pool(
+    encoded: Vec<u8>,
+    threads: usize,
+    observer: super::super::Observer,
+) -> (
+    Arc<super::Shared>,
+    std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) {
+    let mut pool = Pool::new(
+        threads,
+        Mode::Compact,
+        Some(Arc::new(Mutex::new(observer))),
+        true,
+    );
+    let shared = Arc::clone(&pool.shared);
+    let decode = std::thread::spawn(move || {
+        let mut reader = encoded.as_slice();
+        let mut decoded = Vec::new();
+        let mut recycled = Vec::new();
+        loop {
+            match pool.next(&mut reader, recycled)? {
+                super::Step::Chunk(chunk) => {
+                    decoded.extend_from_slice(&chunk);
+                    recycled = chunk;
+                }
+                super::Step::End => return Ok(decoded),
+                super::Step::Serial(_) => panic!("no block exceeds the lookahead"),
+            }
+        }
+    });
+    (shared, decode)
+}
+
+#[test]
+fn workers_produce_later_blocks_while_the_callback_is_held() {
+    use super::super::Observer;
+    use super::{Progress, Verdict};
+    use std::sync::mpsc;
+    let alphabet: Vec<u8> = (0..64).collect();
+    let plain = noise(2_000_000, 0x5150_1234, &alphabet);
+    let encoded = reference(&plain, 1);
+    for threads in [2, 3, 8] {
+        for crc32 in [false, true] {
+            // The first call waits for the test; every later call passes.
+            let (release, gate) = mpsc::channel::<()>();
+            let (signal, held) = mpsc::channel::<()>();
+            let gate = Mutex::new(Some((gate, signal)));
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&observed);
+            let hold = move || {
+                if let Some((gate, signal)) = gate.lock().unwrap().take() {
+                    signal.send(()).unwrap();
+                    gate.recv().unwrap();
+                }
+            };
+            let observer = if crc32 {
+                Observer::Crc32(Box::new(move |bytes, crc| {
+                    hold();
+                    assert_eq!(crc, super::chunk_crc32(bytes));
+                    sink.lock().unwrap().extend_from_slice(bytes);
+                    Ok(())
+                }))
+            } else {
+                Observer::Bytes(Box::new(move |bytes| {
+                    hold();
+                    sink.lock().unwrap().extend_from_slice(bytes);
+                }))
+            };
+            let (shared, decode) = spawn_pool(encoded.clone(), threads, observer);
+            held.recv().unwrap();
+            {
+                // With the first call held, other workers still reconstruct
+                // whole later blocks; they wait unobserved, within the cap.
+                let state = shared.lock();
+                let state = shared
+                    .ready
+                    .wait_while(state, |state| {
+                        !state.slots.iter().skip(1).any(|slot| {
+                            slot.verdict != Verdict::Discarded
+                                && matches!(slot.output, Progress::Done)
+                                && !slot.unobserved.is_empty()
+                        })
+                    })
+                    .unwrap();
+                assert!(state.observer, "the first call is still held");
+                for slot in &state.slots {
+                    assert!(slot.buffered < OUTPUT_CAP + (1 << 20));
+                }
+            }
+            release.send(()).unwrap();
+            let decoded = decode.join().unwrap().unwrap();
+            assert!(decoded == plain, "threads {threads}");
+            assert!(*observed.lock().unwrap() == plain, "threads {threads}");
+        }
+    }
+}

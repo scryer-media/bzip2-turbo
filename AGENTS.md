@@ -43,4 +43,3 @@ required legal notices intact.
   Preserve required copyright and license text; do not erase legal attribution.
 - Do not commit generated binaries, fixtures, fuzz corpora or benchmark outputs.
   Store raw measurements outside the repository and commit concise summaries.
-- Delegated reviewers must explicitly use gpt-6.1-sol.
