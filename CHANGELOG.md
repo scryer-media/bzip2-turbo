@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0
+## 0.2.1
 
 - With an output callback and several threads, every worker now reconstructs
   its own block's output as soon as it can, as it does without a callback,
