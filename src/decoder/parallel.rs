@@ -22,7 +22,8 @@
 use super::super::tt_storage::TtBuffer;
 use super::{
     BLOCK_MAGIC, Bits, Block, BlockOutput, Links, MAX_BLOCK, Mode, OutputCallback, ParserWorkspace,
-    STREAM_END_MAGIC, invalid, observe_output, read_block, read_stream_header,
+    STREAM_END_MAGIC, chunk_crc32, invalid, observe_output, read_block, read_stream_header,
+    wants_crc32,
 };
 use std::collections::VecDeque;
 use std::io::{self, Read};
@@ -74,9 +75,24 @@ struct Slot {
     before: Option<Stop>,
     /// Set by the chain on a real slot after which decoding stops.
     after: Option<Stop>,
+    /// Observed output, ready for delivery in order.
     chunks: VecDeque<Vec<u8>>,
+    /// With a callback: output produced but not yet observed, oldest first,
+    /// each with its CRC-32 when the callback wants one.
+    unobserved: VecDeque<(Vec<u8>, Option<u32>)>,
+    /// A chunk of this slot is with the callback right now.
+    observing: bool,
+    /// Bytes in `chunks` and `unobserved`; the worker waits at `OUTPUT_CAP`.
     buffered: usize,
     output: Progress,
+}
+
+impl Slot {
+    /// Whether every byte this slot will deliver has been produced and
+    /// observed: the next slot's output is the next the callback may see.
+    fn observed(&self) -> bool {
+        matches!(self.output, Progress::Done) && self.unobserved.is_empty() && !self.observing
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -136,8 +152,8 @@ struct Chain {
     combined: u32,
     /// Sequence number of the next slot to resolve.
     resolve: u64,
-    /// The lowest slot whose output is incomplete; with a callback only that
-    /// slot's worker may produce output.
+    /// The lowest slot whose output is not yet wholly produced and observed;
+    /// with a callback only that slot's chunks may be observed.
     open: u64,
     /// The chain has ended, failed or fallen back; later slots are discarded.
     stopped: bool,
@@ -154,6 +170,8 @@ struct State {
     cancelled: bool,
     /// Workers waiting for a job.
     idle: usize,
+    /// A worker is handing chunks to the callback; the others leave it to it.
+    observer: bool,
     spare: Vec<Vec<u8>>,
 }
 
@@ -266,7 +284,7 @@ impl State {
         while let Some(slot) = self.slot(self.chain.open) {
             let complete = match slot.verdict {
                 Verdict::Discarded => true,
-                Verdict::Real => slot.before.is_none() && matches!(slot.output, Progress::Done),
+                Verdict::Real => slot.before.is_none() && slot.observed(),
                 Verdict::Pending => false,
             };
             if !complete {
@@ -660,6 +678,8 @@ pub(super) enum Step {
 struct Config {
     mode: Mode,
     callback: Option<OutputCallback>,
+    /// Producers take each chunk's CRC-32 for the callback.
+    crc32: bool,
     multistream: bool,
     chunk: usize,
 }
@@ -705,6 +725,7 @@ impl Pool {
                     },
                     cancelled: false,
                     idle: 0,
+                    observer: false,
                     spare: Vec::new(),
                 }),
                 work: Condvar::new(),
@@ -715,6 +736,7 @@ impl Pool {
             max_slots: max_workers * SLOTS_PER_WORKER,
             config: Config {
                 mode,
+                crc32: wants_crc32(&callback),
                 callback,
                 multistream,
                 chunk,
@@ -827,6 +849,8 @@ impl Pool {
                 before: None,
                 after: None,
                 chunks: VecDeque::new(),
+                unobserved: VecDeque::new(),
+                observing: false,
                 buffered: 0,
                 output: Progress::Pending,
             });
@@ -906,6 +930,10 @@ impl Pool {
                     front.buffered -= chunk.len();
                     self.shared.work.notify_all();
                     return Ok(Step::Chunk(chunk));
+                }
+                if !front.unobserved.is_empty() || front.observing {
+                    // A worker is observing them; the chunks come next.
+                    break;
                 }
                 match std::mem::replace(&mut front.output, Progress::Pending) {
                     Progress::Pending => break,
@@ -1047,6 +1075,8 @@ fn worker(shared: &Shared, config: &Config) {
                 shared.work.notify_all();
             }
             shared.ready.notify_all();
+            // The chain may have moved onto chunks waiting to be observed.
+            drop(observe(shared, config, state));
         }
     }
 }
@@ -1079,6 +1109,9 @@ fn run_job(shared: &Shared, config: &Config, scratch: &mut Scratch, seq: u64, jo
             shared.work.notify_all();
         }
         shared.ready.notify_all();
+        // Resolving the chain can make chunks other workers produced
+        // observable.
+        drop(observe(shared, config, state));
     }
     let Some(block) = block else {
         return;
@@ -1090,7 +1123,10 @@ fn run_job(shared: &Shared, config: &Config, scratch: &mut Scratch, seq: u64, jo
     scratch.links = output.into_links();
 }
 
-/// Writes one slot's output chunks, observing each before it is queued.
+/// Writes one slot's output chunks. Every worker produces as soon as its slot
+/// has room, callback or not; with a callback the chunks wait in the slot,
+/// with their CRC-32 when it is wanted, until `observe` hands them over in
+/// stream order.
 fn produce(shared: &Shared, config: &Config, seq: u64, output: &mut BlockOutput) {
     loop {
         let mut chunk = {
@@ -1099,18 +1135,14 @@ fn produce(shared: &Shared, config: &Config, seq: u64, output: &mut BlockOutput)
                 if state.cancelled {
                     return;
                 }
-                let open = state.chain.open;
                 let Some(slot) = state.slot(seq) else {
                     return;
                 };
-                match slot.verdict {
-                    Verdict::Discarded => return,
-                    // A real slot that failed before output never reaches here.
-                    Verdict::Real | Verdict::Pending => {}
+                if slot.verdict == Verdict::Discarded || !matches!(slot.output, Progress::Pending) {
+                    // Discarded, or stopped by a callback error.
+                    return;
                 }
-                let permitted =
-                    config.callback.is_none() || (slot.verdict == Verdict::Real && open == seq);
-                if permitted && slot.buffered < OUTPUT_CAP {
+                if slot.buffered < OUTPUT_CAP {
                     break;
                 }
                 state = shared
@@ -1121,20 +1153,29 @@ fn produce(shared: &Shared, config: &Config, seq: u64, output: &mut BlockOutput)
             state.spare.pop().unwrap_or_default()
         };
         chunk.resize(config.chunk, 0);
-        let result = output.read(&mut chunk).and_then(|count| {
+        let result = output.read(&mut chunk).map(|count| {
             chunk.truncate(count);
-            observe_output(&config.callback, &chunk)?;
-            Ok(count)
+            // Taken here, on the worker that produced the bytes, so the
+            // ordered calls compute no checksum.
+            (count, config.crc32.then(|| chunk_crc32(&chunk)))
         });
         let mut state = shared.lock();
         let finished = output.finished();
         let Some(slot) = state.slot(seq) else {
             return;
         };
+        if !matches!(slot.output, Progress::Pending) {
+            // A callback error failed this slot while the chunk was made.
+            return;
+        }
         match result {
-            Ok(count) => {
+            Ok((count, crc)) => {
                 slot.buffered += count;
-                slot.chunks.push_back(chunk);
+                if config.callback.is_some() {
+                    slot.unobserved.push_back((chunk, crc));
+                } else {
+                    slot.chunks.push_back(chunk);
+                }
                 if finished {
                     slot.output = Progress::Done;
                 } else if count == 0 {
@@ -1144,14 +1185,82 @@ fn produce(shared: &Shared, config: &Config, seq: u64, output: &mut BlockOutput)
             Err(error) => slot.output = Progress::Failed(error),
         }
         let done = !matches!(slot.output, Progress::Pending);
-        if done && state.advance_open() {
+        if config.callback.is_some() {
+            state = observe(shared, config, state);
+        } else if done && state.advance_open() {
             shared.work.notify_all();
         }
         shared.ready.notify_all();
+        drop(state);
         if done {
             return;
         }
     }
+}
+
+/// Hands produced chunks to the callback in stream order, from the open slot
+/// onward, until the open slot has none waiting. One worker does this at a
+/// time; any other finds the token taken and leaves its chunks to that
+/// worker, which looks again under the lock before it lets the token go.
+fn observe<'a>(
+    shared: &'a Shared,
+    config: &Config,
+    mut state: MutexGuard<'a, State>,
+) -> MutexGuard<'a, State> {
+    if config.callback.is_none() || state.observer {
+        return state;
+    }
+    state.observer = true;
+    loop {
+        if state.cancelled {
+            break;
+        }
+        if state.advance_open() {
+            shared.work.notify_all();
+        }
+        let open = state.chain.open;
+        let Some(slot) = state.slot(open) else {
+            break;
+        };
+        // Only a slot the chain has resolved as real is observed: a false
+        // positive's output is never shown, and nothing after a failed block.
+        if slot.verdict != Verdict::Real || slot.before.is_some() {
+            break;
+        }
+        let Some((chunk, crc)) = slot.unobserved.pop_front() else {
+            // Not yet produced; its producer looks again when it adds one.
+            break;
+        };
+        slot.observing = true;
+        drop(state);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observe_output(&config.callback, &chunk, crc)
+        }))
+        .unwrap_or_else(|_| Err(io::Error::other("BZip2 worker panicked")));
+        state = shared.lock();
+        let Some(slot) = state.slot(open) else {
+            // Delivery never removes a slot that is being observed.
+            break;
+        };
+        slot.observing = false;
+        match result {
+            Ok(()) => slot.chunks.push_back(chunk),
+            Err(error) => {
+                // Nothing after this chunk is observed or delivered; the
+                // producer stops at its next chunk.
+                slot.buffered -= chunk.len();
+                slot.buffered -= slot.unobserved.iter().map(|(c, _)| c.len()).sum::<usize>();
+                slot.unobserved.clear();
+                slot.output = Progress::Failed(error);
+                shared.work.notify_all();
+                shared.ready.notify_all();
+                break;
+            }
+        }
+        shared.ready.notify_all();
+    }
+    state.observer = false;
+    state
 }
 
 #[cfg(test)]

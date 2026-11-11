@@ -18,7 +18,7 @@ Replace the `bzip2` dependency and keep the `bzip2::...` imports:
 
 ```toml
 [dependencies]
-bzip2 = { package = "bzip2-turbo", version = "0.2" }
+bzip2 = { package = "bzip2-turbo", version = "0.3" }
 ```
 
 ```rust
