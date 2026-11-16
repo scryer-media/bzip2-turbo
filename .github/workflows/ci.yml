@@ -139,6 +139,109 @@ jobs:
           targets: wasm32-unknown-unknown
       - run: cargo check --locked --target wasm32-unknown-unknown --all-features
       - run: cargo check --locked --target wasm32-unknown-unknown --no-default-features
+  # The tests compiled for WebAssembly and run there: WASI 0.1 and 0.2 under
+  # wasmtime, Emscripten under Node. The codec is single-threaded on wasm.
+  # Left out: tests/conformance.rs and tests/decoder.rs and one encoder test,
+  # which start the 7-Zip oracle as a process; unit tests that spawn threads or
+  # assert multi-worker behaviour; and on WASI, where a panic aborts, the three
+  # unit tests that catch an expected panic.
+  wasm-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-wasip1, wasm32-wasip2, wasm32-unknown-emscripten]
+    runs-on: ubuntu-24.04
+    env:
+      TARGET: ${{ matrix.target }}
+      WASMTIME_VERSION: 50.0.1
+      # Bump the emsdk release and the commit its tag names together.
+      EMSDK_VERSION: 7.0.0
+      EMSDK_COMMIT: 1693ce7359fc9694f198694f902a2cc061239b86
+      CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime run --dir .
+      CARGO_TARGET_WASM32_WASIP2_RUNNER: wasmtime run --dir .
+      CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUNNER: node
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - name: Set up wasmtime
+        if: matrix.target != 'wasm32-unknown-emscripten'
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
+        with:
+          version: ${{ env.WASMTIME_VERSION }}
+      - name: Verify the pinned wasmtime is the one on PATH
+        if: matrix.target != 'wasm32-unknown-emscripten'
+        run: |
+          set -euo pipefail
+          wasmtime --version
+          wasmtime --version | grep -qF "wasmtime $WASMTIME_VERSION"
+      - name: Set up Emscripten
+        if: matrix.target == 'wasm32-unknown-emscripten'
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/emsdk"
+          # Fetched by commit, not by tag: a tag can be moved, a commit cannot.
+          git init -q "$root"
+          git -C "$root" fetch -q --depth 1 \
+            https://github.com/emscripten-core/emsdk.git "$EMSDK_COMMIT"
+          git -C "$root" checkout -q FETCH_HEAD
+          "$root/emsdk" install "$EMSDK_VERSION"
+          "$root/emsdk" activate "$EMSDK_VERSION"
+          # emsdk_env.sh reads variables that may be unset.
+          set +u
+          # shellcheck disable=SC1091
+          source "$root/emsdk_env.sh"
+          set -u
+          emcc --version | head -n 1 | grep -qF "$EMSDK_VERSION"
+          node --version
+          {
+            echo "$EMSDK/upstream/emscripten"
+            dirname "$EMSDK_NODE"
+          } >> "$GITHUB_PATH"
+          {
+            echo "EMSDK=$EMSDK"
+            echo "EM_CONFIG=$EMSDK/.emscripten"
+            # The host filesystem through Node, a heap that grows past the
+            # fixed 16 MiB default, and a 1 MiB stack in place of the 64 KiB
+            # default.
+            echo "RUSTFLAGS=-C link-arg=-sNODERAWFS=1 -C link-arg=-sALLOW_MEMORY_GROWTH=1 -C link-arg=-sSTACK_SIZE=1MB"
+          } >> "$GITHUB_ENV"
+      - name: Test both feature configurations
+        run: |
+          set -euo pipefail
+          skips=(
+            decoder::parallel::tests::a_block_encoded_beyond_the_lookahead_falls_back_to_serial_decoding
+            decoder::parallel::tests::dropping_a_busy_decoder_cancels_and_joins_every_worker
+            decoder::parallel::tests::workers_produce_later_blocks_while_the_callback_is_held
+            decoder::pool_tests::last_column_owners_never_exceed_their_bound_and_are_reused
+            encoder::slot::tests::errors_and_sink_unwind_join_and_poison_all_slots
+            encoder::slot::tests::slots_include_filling_and_reuse_the_same_storage_large_to_small
+            tt_storage::tests::storage_reuses_dirty_capacity_and_moves_between_threads
+            tt_storage::word_tests::every_word_width_preserves_dirty_prefix_and_independent_threaded_owners
+            default_options_match_reference_default_and_level_nine_but_not_level_eight
+          )
+          if [ "$TARGET" != wasm32-unknown-emscripten ]; then
+            skips+=(
+              tt_storage::tests::aligned_allocation_refusal_uses_a_normal_initialized_buffer
+              tt_storage::tests::declared_limit_capacity_is_never_shrunk_or_reallocated
+              tt_storage::word_tests::every_word_width_falls_back_to_initialized_storage_after_refusal
+            )
+          fi
+          skip_args=()
+          for name in "${skips[@]}"; do
+            skip_args+=(--skip "$name")
+          done
+          for features in --all-features --no-default-features; do
+            cargo test --locked --target "$TARGET" "$features" --no-fail-fast \
+              --lib --test adversarial --test encoder --test raw_compat \
+              --test review_compat --test stream_compat \
+              -- --exact "${skip_args[@]}"
+            cargo test --locked --target "$TARGET" "$features" --doc --no-fail-fast
+          done
   portable-miri:
     runs-on: ubuntu-24.04
     env:
@@ -209,7 +312,7 @@ jobs:
       - run: cargo build --locked --manifest-path tools/bzip2-reference/Cargo.toml --release --no-default-features --features "$REFERENCE_BACKEND"
   ci-complete:
     if: always()
-    needs: [hygiene, fmt, native, docs-package, msrv, wasm, portable-miri, fuzz, benchmark-tool, reference-tools]
+    needs: [hygiene, fmt, native, docs-package, msrv, wasm, wasm-test, portable-miri, fuzz, benchmark-tool, reference-tools]
     runs-on: ubuntu-24.04
     steps:
       - env:

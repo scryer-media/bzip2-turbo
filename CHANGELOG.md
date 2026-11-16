@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2
+
+- CI now runs the tests on WebAssembly, not only compiles for it: the unit,
+  integration and doc tests, in both feature configurations, on
+  `wasm32-wasip1` and `wasm32-wasip2` under wasmtime and on
+  `wasm32-unknown-emscripten` under Node. The tests that start the 7-Zip
+  oracle as a process (`tests/conformance.rs`, `tests/decoder.rs` and one
+  encoder test), the unit tests that need worker threads, and on WASI, where a
+  panic aborts, the three unit tests that catch an expected panic run only
+  natively. The library is unchanged.
+
 ## 0.2.1
 
 - With an output callback and several threads, every worker now reconstructs
