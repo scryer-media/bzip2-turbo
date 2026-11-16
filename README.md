@@ -58,6 +58,15 @@ leaves decoding only. The library requires `std`. API details, memory policy
 and the decoder's design are in the crate documentation and under
 [docs](https://github.com/scryer-media/bzip2-turbo/tree/main/docs).
 
+### WebAssembly
+
+On WebAssembly the encoder and decoder run on the calling thread whatever the
+thread budget. CI compiles both feature configurations for
+`wasm32-unknown-unknown`, and runs the unit, integration and doc tests on
+`wasm32-wasip1` and `wasm32-wasip2` under wasmtime and on
+`wasm32-unknown-emscripten` under Node. Tests that start the 7-Zip oracle or
+need worker threads run only natively.
+
 ## Performance
 
 Speed in MB/s of uncompressed data, compressing and decompressing 16.8 MB of
