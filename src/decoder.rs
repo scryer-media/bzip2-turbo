@@ -169,9 +169,8 @@ const TABLE_SYMBOLS_LEN: usize = TABLE_LEN + MAX_SYMBOLS - (TABLE_BITS as usize 
 
 /// One canonical BZip2 Huffman table.
 ///
-/// `first`/`counts`/`offsets`/`symbols` are the canonical code description the
-/// suspendable bit-serial decoder in `incremental` walks. `limits`, `poses`,
-/// `lens` and `table_symbols` are the lookup structure of 7-Zip's
+/// `first`/`counts`/`offsets`/`symbols` describe the canonical codes.
+/// `limits`, `poses`, `lens` and `table_symbols` are the lookup structure of 7-Zip's
 /// `NHuffman::CDecoder` (HuffmanDecoder.h, `Build` and `Z7_HUFF_DECODE_BASE`)
 /// used by `symbol`: codes of at most `TABLE_BITS` bits resolve through a
 /// direct table, and longer codes are found by comparing one 20-bit window
@@ -302,6 +301,14 @@ impl Huffman {
     #[inline(always)]
     fn symbol<R: Read, const BYTEWISE: bool>(&self, bits: &mut Bits<R>) -> io::Result<usize> {
         let window = bits.peek::<BYTEWISE>(MAX_CODE_BITS)?;
+        let (symbol, len) = self
+            .lookup(window)
+            .ok_or_else(|| invalid("invalid Huffman code"))?;
+        bits.consume(len);
+        Ok(symbol)
+    }
+    #[inline(always)]
+    fn lookup(&self, window: u32) -> Option<(usize, u32)> {
         let prefix = window >> (MAX_CODE_BITS - TABLE_BITS);
         if prefix >= self.limits[0] {
             let mut len = TABLE_BITS + 1;
@@ -315,7 +322,7 @@ impl Huffman {
                     }
                 }
                 if len > MAX_CODE_BITS {
-                    return Err(invalid("invalid Huffman code"));
+                    return None;
                 }
             }
             // The window is at or above the previous length's limit, so the
@@ -323,12 +330,13 @@ impl Huffman {
             // in this length's run of `table_symbols`.
             let code = window >> (MAX_CODE_BITS - len);
             let index = code - self.poses[(len - TABLE_BITS - 1) as usize];
-            bits.consume(len);
-            return Ok(usize::from(self.table_symbols[index as usize]));
+            return Some((usize::from(self.table_symbols[index as usize]), len));
         }
         let prefix = prefix as usize;
-        bits.consume(u32::from(self.lens[prefix]));
-        Ok(usize::from(self.table_symbols[prefix]))
+        Some((
+            usize::from(self.table_symbols[prefix]),
+            u32::from(self.lens[prefix]),
+        ))
     }
 }
 
@@ -725,9 +733,11 @@ mod high_reservoir_tests {
     }
 }
 
-struct Block {
-    // ReadBlock2's BZIP2_BYTE_MODE column; a recycled column-pool owner.
-    last: TtBuffer<u8>,
+mod block;
+
+struct Block<C = TtBuffer<u8>> {
+    // ReadBlock2's BZIP2_BYTE_MODE column.
+    last: C,
     // The stream's declared block-size limit, which sizes the TT once.
     limit: usize,
     counts: [usize; 256],
@@ -879,215 +889,58 @@ fn read_stream_header<R: Read>(bits: &mut Bits<R>, first: bool) -> io::Result<Op
     Ok(Some((digit as usize - 48) * 100_000))
 }
 
-/// ReadBlock2 from the block CRC through the end-of-block symbol; the block
-/// magic has been consumed. `column` is a recycled last-column owner; it is
-/// sized to `limit` and moved into the block, or dropped on error.
-///
-/// The column stays a by-value local sized after the Huffman tables, as it was
-/// when this loop lived in `Parser::next`. Taking it by reference and sizing it
-/// first cost the single-thread decoder 2 to 4% more instructions.
+impl<R: Read> block::BlockInput for Bits<R> {
+    #[inline]
+    fn take(&mut self, count: u32) -> io::Result<Option<u32>> {
+        Bits::take(self, count).map(Some)
+    }
+
+    #[inline(always)]
+    fn symbol<const BYTEWISE: bool>(&mut self, table: &Huffman) -> io::Result<Option<usize>> {
+        table.symbol::<R, BYTEWISE>(self).map(Some)
+    }
+}
+
+/// Reads a block after its magic. Reader-backed input reports exhaustion as
+/// an I/O error, so the shared header and body parser cannot suspend here.
+/// Size the by-value column owner after the Huffman tables, as in ReadBlock2.
 fn read_block<R: Read>(
     bits: &mut Bits<R>,
     workspace: &mut ParserWorkspace,
     column: TtBuffer<u8>,
     limit: usize,
 ) -> io::Result<Block> {
-    let crc = bits.take(32)?;
-    let randomized = bits.take(1)? != 0;
-    let origin = bits.take(24)? as usize;
-    let groups = bits.take(16)?;
-    let alphabet = &mut workspace.alphabet;
-    alphabet.clear();
-    alphabet.reserve_exact(256);
-    for group in 0..16 {
-        if groups & (1 << (15 - group)) != 0 {
-            let mask = bits.take(16)?;
-            for low in 0..16 {
-                if mask & (1 << (15 - low)) != 0 {
-                    alphabet.push((group * 16 + low) as u8);
-                }
-            }
-        }
-    }
-    if alphabet.is_empty() {
-        return Err(invalid("empty BZip2 alphabet"));
-    }
-    let alphabet_size = alphabet.len() + 2;
-    let table_count = bits.take(3)? as usize;
-    let selector_count = bits.take(15)? as usize;
-    if !(2..=6).contains(&table_count) || selector_count == 0 {
-        return Err(invalid("invalid BZip2 Huffman groups"));
-    }
-    let mut selector_mtf = [0u8, 1, 2, 3, 4, 5];
-    let selectors = &mut workspace.selectors;
-    selectors.clear();
-    selectors.reserve_exact(selector_count.min(18002));
-    for _ in 0..selector_count {
-        let mut index = 0;
-        while bits.take(1)? != 0 {
-            index += 1;
-            if index >= table_count {
-                return Err(invalid("invalid BZip2 selector"));
-            }
-        }
-        let selected = selector_mtf[index];
-        selector_mtf[..=index].rotate_right(1);
-        if selectors.len() < 18002 {
-            selectors.push(selected);
-        }
-    }
-    let tables = &mut workspace.tables;
-    tables.reserve_exact(table_count.saturating_sub(tables.len()));
-    for table_index in 0..table_count {
-        let mut length = bits.take(5)? as i32;
-        if !(1..=20).contains(&length) {
-            return Err(invalid("invalid Huffman length"));
-        }
-        let lengths = &mut workspace.lengths;
-        lengths.clear();
-        lengths.reserve_exact(alphabet_size);
-        for _ in 0..alphabet_size {
-            while bits.take(1)? != 0 {
-                length += if bits.take(1)? == 0 { 1 } else { -1 };
-                if !(1..=20).contains(&length) {
-                    return Err(invalid("invalid Huffman length delta"));
-                }
-            }
-            if !(1..=20).contains(&length) {
-                return Err(invalid("invalid Huffman length"));
-            }
-            lengths.push(length as u8);
-        }
-        if table_index == tables.len() {
-            append_huffman(tables, lengths)?;
-        } else {
-            tables[table_index].rebuild(lengths)?;
-        }
-    }
-    // ReadBlock2 stores the column in place; a recycled owner already
-    // covers the declared limit, so each byte is one bounded indexed store.
+    let mut header = block::BlockHeader::default();
+    let ready = header.read(bits, workspace)?;
+    debug_assert!(ready);
     let mut column = column.with_capacity_at_least(limit).resized(limit);
     let last: &mut [u8] = &mut column[..limit];
-    #[cfg(target_arch = "x86_64")]
-    let mut mtf = {
-        let mut bytes = [0u8; 256];
-        bytes[..alphabet.len()].copy_from_slice(alphabet);
-        bytes
-    };
-    #[cfg(not(target_arch = "x86_64"))]
-    let mut mtf = {
-        let mut words = [0u64; 32];
-        for (index, &byte) in alphabet.iter().enumerate() {
-            words[index / 8] |= u64::from(byte) << ((index & 7) * 8);
-        }
-        words
-    };
-    let mut counts = [0usize; 256];
-    let mut length = 0usize;
-    let mut selector_index = 0;
-    let mut group_left = 0;
-    let mut huffman = &tables[0];
-    let mut run = 0usize;
-    let mut weight = 1usize;
-    // Linux ARM64 refills byte-wise on blocks whose selectors weight
-    // the tables to at least six expected bits per code, where the
-    // word refill's branch mispredicts; text blocks sit near three
-    // bits and keep the word refill, which is faster there.
+    let mut body = block::BlockBody::new(&workspace.alphabet);
+
+    // On Linux ARM64 the bytewise refill avoids the word-refill branch
+    // mispredicts on high-entropy blocks. Text blocks retain the word refill.
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     let bytewise = {
         let mut weights = [0u32; 6];
-        for &selector in selectors.iter() {
+        for &selector in &workspace.selectors {
             weights[usize::from(selector)] += 1;
         }
         let mut total = 0u64;
-        for (table, &weight) in tables.iter().zip(&weights) {
+        for (table, &weight) in workspace.tables.iter().zip(&weights) {
             total += u64::from(table.expected_code_bits_q8()) * u64::from(weight);
         }
-        total >= 6 * 256 * selectors.len() as u64
+        total >= 6 * 256 * workspace.selectors.len() as u64
     };
     #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
     let bytewise = false;
-    macro_rules! symbols {
-        ($bytewise:expr) => {
-            loop {
-                if group_left == 0 {
-                    let selector = *selectors
-                        .get(selector_index)
-                        .ok_or_else(|| invalid("missing BZip2 selector"))?;
-                    huffman = &tables[usize::from(selector)];
-                    selector_index += 1;
-                    group_left = 50;
-                }
-                let symbol = huffman.symbol::<R, $bytewise>(bits)?;
-                group_left -= 1;
-                if symbol <= 1 {
-                    run = run
-                        .checked_add(weight * (symbol + 1))
-                        .ok_or_else(|| invalid("BZip2 run overflow"))?;
-                    if run > limit - length {
-                        return Err(invalid("BZip2 block exceeds declared size"));
-                    }
-                    weight = weight
-                        .checked_mul(2)
-                        .ok_or_else(|| invalid("BZip2 run overflow"))?;
-                    continue;
-                }
-                if run != 0 {
-                    #[cfg(target_arch = "x86_64")]
-                    let byte = mtf[0];
-                    #[cfg(not(target_arch = "x86_64"))]
-                    let byte = mtf[0] as u8;
-                    counts[byte as usize] += run;
-                    last[length..length + run].fill(byte);
-                    length += run;
-                    run = 0;
-                    weight = 1;
-                }
-                if symbol == alphabet_size - 1 {
-                    break;
-                }
-                let index = symbol - 1;
-                if index >= alphabet.len() {
-                    return Err(invalid("invalid BZip2 MTF index"));
-                }
-                #[cfg(target_arch = "x86_64")]
-                let byte = mtf[index];
-                #[cfg(not(target_arch = "x86_64"))]
-                let (next, byte) = {
-                    let next = mtf[index / 8];
-                    (next, (next >> ((index & 7) * 8)) as u8)
-                };
-                if length == limit {
-                    return Err(invalid("BZip2 block exceeds declared size"));
-                }
-                // ReadBlock2 publishes the byte and histogram before moving MTF words.
-                last[length] = byte;
-                length += 1;
-                counts[byte as usize] += 1;
-                #[cfg(target_arch = "x86_64")]
-                move_mtf_bytes(&mut mtf, index, byte);
-                #[cfg(not(target_arch = "x86_64"))]
-                move_mtf(&mut mtf, index, next, byte);
-            }
-        };
-    }
-    if bytewise {
-        symbols!(true);
+
+    let length = if bytewise {
+        body.read::<true>(bits, workspace, last, limit)?
     } else {
-        symbols!(false);
+        body.read::<false>(bits, workspace, last, limit)?
     }
-    if origin >= length {
-        return Err(invalid("invalid BZip2 BWT origin"));
-    }
-    Ok(Block {
-        // Only the logical extent shrinks; the owner keeps its capacity.
-        last: column.resized(length),
-        limit,
-        counts,
-        origin,
-        randomized,
-        crc,
-    })
+    .expect("reader input cannot suspend");
+    header.finish(body, column.resized(length), limit)
 }
 
 // CMtf8Decoder::GetAndMove with byte storage: short prefixes use paired word
@@ -1329,7 +1182,7 @@ enum BlockOutput {
 impl BlockOutput {
     /// Builds the block's TT; the caller keeps the last column, which this
     /// output never reads again, and returns it to its pool.
-    fn new(block: &Block, links: Links) -> Self {
+    fn new<C: std::ops::Deref<Target = [u8]>>(block: &Block<C>, links: Links) -> Self {
         // Size the TT once at the declared limit, as CDecoder sizes `_counters`
         // once, so later shorter or equal blocks never regrow it.
         match links {

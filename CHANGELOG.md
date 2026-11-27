@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2
+
+- Speed up the bzip2-compatible decoders. The native reader, parallel workers,
+  and incremental adapters now share one block parser and its Huffman and
+  move-to-front routines. The incremental API can still suspend within a code
+  and reports the exact input consumed at each block and member boundary.
+
 ## 0.2.1
 
 - With an output callback and several threads, every worker now reconstructs

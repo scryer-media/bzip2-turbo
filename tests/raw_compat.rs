@@ -1,6 +1,5 @@
-use bzip2_turbo::{Decompress, Error, Status};
-#[cfg(feature = "compress")]
-use std::io::Read;
+use bzip2_turbo::{Decoder, Decompress, Error, Status};
+use std::io::{ErrorKind, Read};
 use std::{io::Write, mem::MaybeUninit};
 
 fn input(size: usize) -> Vec<u8> {
@@ -204,6 +203,10 @@ fn crc(data: &[u8]) -> u32 {
 }
 
 fn partial_huffman_stream(length: u32) -> Vec<u8> {
+    partial_huffman_member(&[length])
+}
+
+fn partial_huffman_member(lengths: &[u32]) -> Vec<u8> {
     let mut stream = Vec::new();
     let mut position = 0usize;
     let mut put = |value: u32, count: usize| {
@@ -218,26 +221,192 @@ fn partial_huffman_stream(length: u32) -> Vec<u8> {
     for byte in b"BZh1" {
         put(u32::from(*byte), 8);
     }
-    put(0x314159, 24);
-    put(0x265359, 24);
-    put(crc(b"A"), 32);
-    put(0, 1);
-    put(0, 24); // Not randomized, BWT origin zero.
-    put(1 << 11, 16);
-    put(1 << 14, 16); // Alphabet contains only 'A'.
-    put(2, 3);
-    put(1, 15);
-    put(0, 1); // Two tables, one selector, table zero.
-    put(length, 5);
-    put(0, 3); // Three equally long codes.
-    put(20, 5);
-    put(0, 3); // An unused partial tree (lbzip2 compatibility).
-    put(0, 2);
-    put(2, 2); // RUNA (one 'A') then EOB with length two.
+    let block_crc = crc(b"A");
+    let mut combined = 0u32;
+    for &length in lengths {
+        put(0x314159, 24);
+        put(0x265359, 24);
+        put(block_crc, 32);
+        put(0, 1);
+        put(0, 24); // Not randomized, BWT origin zero.
+        put(1 << 11, 16);
+        put(1 << 14, 16); // Alphabet contains only 'A'.
+        put(2, 3);
+        put(1, 15);
+        put(0, 1); // Two tables, one selector, table zero.
+        put(length, 5);
+        put(0, 3); // Three equally long codes.
+        put(20, 5);
+        put(0, 3); // An unused partial tree (lbzip2 compatibility).
+        put(0, length as usize); // RUNA (one 'A').
+        put(2, length as usize); // EOB.
+        combined = combined.rotate_left(1) ^ block_crc;
+    }
     put(0x177245, 24);
     put(0x385090, 24);
-    put(crc(b"A"), 32);
+    put(combined, 32);
     stream
+}
+
+#[test]
+fn incomplete_huffman_blocks_share_non_aligned_boundaries() {
+    const FIRST_SYMBOL: usize = 204;
+    const FIRST_END: usize = FIRST_SYMBOL + 2 * 20;
+    const SECOND_SYMBOL: usize = FIRST_END + FIRST_SYMBOL - 32;
+    const SECOND_END: usize = SECOND_SYMBOL + 2 * 2;
+    let encoded = partial_huffman_member(&[20, 2]);
+
+    let mut reference = Vec::new();
+    bzip2::read::BzDecoder::new(encoded.as_slice())
+        .read_to_end(&mut reference)
+        .unwrap();
+    assert_eq!(reference, b"AA");
+
+    for chunk in [1, 3] {
+        decode_chunks(&encoded, &reference, chunk, false);
+    }
+    for threads in [1, 4] {
+        let mut actual = Vec::new();
+        Decoder::with_threads(encoded.as_slice(), threads)
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(actual, reference);
+    }
+
+    let mut decoder = Decompress::new(false);
+    for end in [FIRST_END, SECOND_END] {
+        let consumed = decoder.total_in() as usize;
+        let mut byte = [0];
+        assert_eq!(
+            decoder.decompress(&encoded[consumed..], &mut byte),
+            Ok(Status::Ok)
+        );
+        assert_eq!(byte, [b'A']);
+        assert_eq!(decoder.total_in() as usize, end.div_ceil(8));
+    }
+    assert_eq!(decoder.total_out(), 2);
+    assert_eq!(
+        decoder.decompress(&encoded[decoder.total_in() as usize..], &mut [0; 1]),
+        Ok(Status::StreamEnd)
+    );
+    assert_eq!(decoder.total_in() as usize, encoded.len());
+
+    // Leave the second tree intact and replace its first encoded symbol with
+    // an unassigned prefix. The first block can still be delivered.
+    let corrupt = replace_bits(&encoded, SECOND_SYMBOL, 20, (1 << 20) - 1);
+    let mut decoder = Decompress::new(false);
+    let mut actual = [0; 3];
+    assert_eq!(decoder.decompress(&corrupt, &mut actual), Err(Error::Data));
+    assert_eq!(
+        decoder.total_in() as usize,
+        (SECOND_SYMBOL + 20).div_ceil(8)
+    );
+    assert_eq!(decoder.total_out(), 1);
+    assert_eq!(actual[0], b'A');
+
+    for threads in [1, 4] {
+        let mut decoder = Decoder::with_threads(corrupt.as_slice(), threads);
+        let mut actual = Vec::new();
+        assert_eq!(
+            decoder.read_to_end(&mut actual).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(actual, b"A");
+    }
+}
+
+#[test]
+fn invalid_huffman_table_count_is_rejected_before_reading_selectors() {
+    const TABLE_COUNT: usize = 169;
+    const TABLE_COUNT_END: usize = (TABLE_COUNT + 3).div_ceil(8);
+    let encoded = partial_huffman_stream(2);
+
+    for count in [0, 1, 7] {
+        let invalid = replace_bits(&encoded, TABLE_COUNT, 3, count);
+        // The last byte of the table count carries only the first four
+        // selector-count bits. The decoder must reject the count immediately.
+        for available in [TABLE_COUNT_END, invalid.len()] {
+            let split = TABLE_COUNT_END - 1;
+            let mut decoder = Decompress::new(false);
+            let mut output = [0; 1];
+            assert_eq!(
+                decoder.decompress(&invalid[..split], &mut output),
+                Ok(Status::Ok)
+            );
+            assert_eq!(decoder.total_in() as usize, split);
+            assert_eq!(
+                decoder.decompress(&invalid[split..available], &mut output),
+                Err(Error::Data)
+            );
+            assert_eq!(decoder.total_in() as usize, TABLE_COUNT_END);
+            assert_eq!(decoder.total_out(), 0);
+        }
+    }
+}
+
+#[test]
+fn incremental_huffman_lookahead_commits_only_block_bytes() {
+    const SYMBOL_START: usize = 204; // After both Huffman tables, in bits.
+    for length in [2, 20] {
+        let encoded = partial_huffman_stream(length);
+        let block_end = (SYMBOL_START + 2 * length as usize).div_ceil(8);
+        let joined = [encoded.as_slice(), b"trailing bytes"].concat();
+
+        for split in SYMBOL_START / 8..block_end {
+            let mut decoder = Decompress::new(false);
+            assert_eq!(
+                decoder.decompress(&joined[..split], &mut []),
+                Ok(Status::Ok)
+            );
+            assert_eq!(decoder.total_in(), split as u64);
+            assert_eq!(
+                decoder.decompress(&joined[split..], &mut []),
+                Ok(Status::Ok)
+            );
+            assert_eq!(decoder.total_in(), block_end as u64);
+            assert_eq!(decoder.total_out(), 0);
+
+            let mut decoded = [0u8; 2];
+            assert_eq!(
+                decoder.decompress(&joined[block_end..], &mut decoded),
+                Ok(Status::StreamEnd)
+            );
+            assert_eq!(decoder.total_in(), encoded.len() as u64);
+            assert_eq!(decoder.total_out(), 1);
+            assert_eq!(decoded[0], b'A');
+        }
+    }
+}
+
+#[test]
+fn incremental_huffman_invalid_code_counts_only_the_complete_window() {
+    const SYMBOL_START: usize = 204;
+    const WINDOW: usize = 20;
+    let error_end = (SYMBOL_START + WINDOW).div_ceil(8);
+    for length in [2, 20] {
+        let invalid = replace_bits(
+            &partial_huffman_stream(length),
+            SYMBOL_START,
+            WINDOW,
+            (1 << WINDOW) - 1,
+        );
+
+        for split in SYMBOL_START / 8..error_end {
+            let mut decoder = Decompress::new(false);
+            let mut output = [0u8; 2];
+            assert_eq!(
+                decoder.decompress(&invalid[..split], &mut output),
+                Ok(Status::Ok)
+            );
+            assert_eq!(decoder.total_in(), split as u64);
+            assert_eq!(
+                decoder.decompress(&invalid[split..], &mut output),
+                Err(Error::Data)
+            );
+            assert_eq!(decoder.total_in(), error_end as u64);
+            assert_eq!(decoder.total_out(), 0);
+        }
+    }
 }
 
 #[test]
