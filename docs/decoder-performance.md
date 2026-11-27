@@ -14,8 +14,36 @@ decode-parity follow-up measured below brings native decoding to 7zz's time or
 better on every Intel case and on every Graviton3 case except film at one
 thread, within 2 percent, and three two-thread cases within 4 percent. Parity
 here means 7zz's time or better; every case still behind is listed under the
-measured results. The compatibility adapters retain their
-separate incremental parser; native-parser timings do not measure that API.
+measured results. Those historical measurements exercised the native reader.
+The compatibility reader is measured separately below.
+
+## Shared block parser
+
+The native reader, parallel workers, and compatibility adapters use one parser
+from the block CRC through the Huffman end-of-block symbol. It builds the
+alphabet and tables, decodes runs and move-to-front symbols, and constructs the
+last column. The adapters supply buffers differently. A native reader can
+refill while reading a symbol. The compatibility API can suspend in a header
+field or a Huffman code and resume with the caller's next slice.
+
+The following measurements compare 0.2.1 with the shared parser. The previous
+compatibility decoder walked Huffman codes one bit at a time and rotated a byte
+slice for each move-to-front symbol.
+
+| Silesia decode, MB/s | libbz2-rs | Adapter before → after | Native 1 thread before → after | Native 4 workers before → after |
+|---|---:|---:|---:|---:|
+| Apple M5 Max | 59.6 | 57.0 → 94.5 | 96.7 → 96.7 | 286.3 → 282.4 |
+| Intel Core i5-1240P | 39.1 | 39.3 → 60.6 | 61.8 → 61.7 | 144.9 → 145.3 |
+
+Each row combines Silesia `dickens`, `ooffice`, and `osdb` at levels 5 and 9.
+Every decoder received the same in-memory frames from `bzip2` 0.6.1 with
+`libbz2-rs-sys` 0.2.7. Every decode was checked against the original bytes.
+Both release builds used thin LTO and one codegen unit. After warmup, the
+single-threaded decoders ran ten interleaved trials per case and the
+four-worker decoders ran twenty. Aggregate throughput divides total
+uncompressed bytes by the sum of the six median times. The Intel runs used
+one or four performance cores. The Mac was shared. A separate Mac run using
+one binary per revision also measured a small four-worker slowdown (2.8%).
 
 ## Follow the complete stream
 
@@ -71,10 +99,12 @@ flow, table construction and storage lifetime together.
   the table region. There are no bit-serial reads. All arrays are fixed-size and
   rebuilt in place per block. A window past the last code of an incomplete tree
   is rejected as invalid; oversubscribed trees are still rejected at build time.
-  Every symbol needs 20 available bits, which a valid stream always has because
-  the end-of-stream footer follows the last block; a stream cut closer than that
-  is a truncation error. The suspendable incremental decoder keeps its
-  bit-serial canonical walk.
+  The native parser can look ahead 20 bits because the end-of-stream footer
+  follows the last block. The compatibility decoder uses the same lookup on
+  caller-owned input slices. Near the end of a slice, it accepts a symbol
+  only if all bits of its code are present. It carries an unfinished code
+  across calls and returns any whole lookahead bytes beyond the block to the
+  caller. This keeps member boundaries and input counters exact.
 - Use the reference's forward word-at-a-time MTF carry loop on Linux ARM64,
   laid out as GCC compiles `ReadBlock2`: two words per iteration with an exit
   test after each word and no remainder loop. Against the one-word loop this
@@ -166,7 +196,7 @@ before.
 
 The bzip2-compatible API (`Decompress`, the `read`, `bufread` and `write`
 decoders, and `MultiBzDecoder`) gets the mapped TT only: it still builds each
-block's last column in a plain `Vec`.
+block's last column in a plain `Vec`, reused across blocks within the stream.
 
 Other targets keep exact-size `Vec` storage, and the recycled column is a
 `Vec` there. Each `Vec`-backed buffer tracks its logical length separately
